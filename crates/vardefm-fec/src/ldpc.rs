@@ -417,8 +417,9 @@ mod curve {
     const TARGET_FER: f32 = 0.01;
     /// The gate measures this far either side of the recorded point, dB.
     const GATE_MARGIN_DB: f32 = 0.25;
-    /// Frames per point of the gate. At 1 % FER, sigma is 0.16 %, and the curves
-    /// fall by about a factor of 3 over the margin on either side.
+    /// Frames per point of the gate. At 1 % FER, sigma is 0.16 %. Over the margin on
+    /// either side, the header code's FER changes by about a factor of 3 and the
+    /// payload codes' by an order of magnitude or more.
     const GATE_TRIALS: u32 = 4000;
     /// Frames per point of the fine grid that `fer_curve` records.
     const RECORD_TRIALS: u32 = 4000;
@@ -476,7 +477,9 @@ mod curve {
 
     /// Where `rates` (falling with `grid`) cross `target`, by interpolation of
     /// log10 of the rate between the bracketing points, or linearly when one of
-    /// them is 0. `None` when the grid does not bracket the target.
+    /// them is 0. `None` when the grid does not bracket the target. A waterfall bends
+    /// down in log scale, so the chord lies below it and the crossing comes out
+    /// slightly low; on the recorded grids the bias is well inside the gate's margin.
     fn crossing(grid: &[f32], rates: &[f32], target: f32) -> Option<f32> {
         let i = rates.windows(2).position(|w| w[0] >= target && w[1] < target)?;
         let (x0, x1, y0, y1) = (grid[i], grid[i + 1], rates[i], rates[i + 1]);
@@ -528,6 +531,8 @@ mod curve {
     fn fer_curve() {
         let trials = env_or("TRIALS", 200);
         let write = std::env::var("WRITE").is_ok_and(|v| v == "1");
+        // The tree as measured, not as it is when the run ends.
+        let commit = commit();
         let mut total = 0.0;
         let mut points = Vec::new();
         for (name, n, k, seed) in CODES {
@@ -569,7 +574,7 @@ mod curve {
             let b = Baseline {
                 source: Source {
                     what: "Eb/N0 at 1 % FER, BPSK over AWGN, layered offset min-sum, 50 iterations".into(),
-                    commit: commit(),
+                    commit,
                     command: format!(
                         "WRITE=1 TRIALS={trials} cargo test --release -p vardefm-fec fer_curve -- --ignored"
                     ),
@@ -621,15 +626,28 @@ mod curve {
         assert!((x - 1.75).abs() < 1e-3, "{x}");
         assert_eq!(crossing(&grid, &[0.3, 0.2, 0.0], 0.1), Some(1.75));
         assert_eq!(crossing(&grid, &[0.05, 0.02, 0.0], 0.1), None);
+        // A rate exactly at the target, as a measured one can be, is not yet below it.
+        assert_eq!(crossing(&[1.0, 1.5, 2.0, 2.5], &[0.2, 0.1, 0.1, 0.05], 0.1), Some(2.0));
     }
 
+    /// The committed baseline holds one consistent point per code: the crossing of
+    /// its own grid, with the gate's two points on that grid.
     #[test]
     fn baseline_covers_every_code() {
         let base = load();
+        assert_eq!(base.code.len(), CODES.len(), "{BASELINE}: entries for unknown codes");
         for (name, n, k, _) in CODES {
             let p = base.point(n, k);
-            assert_eq!(p.name, name, "{BASELINE}: ({n},{k}) is named {:?}", p.name);
-            assert_eq!(p.grid_db.len(), p.fer.len());
+            let at = format!("{BASELINE}: ({n},{k})");
+            assert_eq!(p.name, name, "{at} is named {:?}", p.name);
+            let (grid, rates) = (&p.grid_db, &p.fer);
+            assert_eq!(grid.len(), rates.len(), "{at}: grid and rates differ in length");
+            assert!(grid.windows(2).all(|w| w[0] < w[1]), "{at}: grid is not increasing");
+            let x = crossing(grid, rates, TARGET_FER).unwrap_or_else(|| panic!("{at}: the grid does not cross 1 %"));
+            let point = p.ebn0_db;
+            assert!(((x * 100.0).round() / 100.0 - point).abs() < 1e-3, "{at}: recorded {point}, grid crosses at {x}");
+            let (lo, hi) = (point - GATE_MARGIN_DB, point + GATE_MARGIN_DB);
+            assert!(grid[0] <= lo && hi <= grid[grid.len() - 1], "{at}: gate points off the grid");
         }
     }
 }

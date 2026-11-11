@@ -9,7 +9,8 @@ run the same minor version.
 ### Added
 - **Performance gates.** `level_gate` and `fer_gate` are ignored tests, run by hand in
   release mode, that fail when decoding performance moves. Per mode and level, the CNR
-  at which 10 % of codewords fail is recorded in `crates/vardefm-modem/perf/levels.toml`;
+  at which 10 % of codewords fail, and per mode the CNR at which 10 % of headers fail,
+  are recorded in `crates/vardefm-modem/perf/levels.toml`;
   per LDPC code, the Eb/N0 of 1 % FER in `crates/vardefm-fec/perf/ldpc.toml`.
   `level_sweep` and `fer_curve` with `WRITE=1` record them again. The figures in
   `docs/PROTOCOL.md` §2.2 and §2.4 now refer to these files.

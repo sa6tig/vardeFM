@@ -64,7 +64,7 @@ pub(crate) fn burst(level: u8, ncw: usize, seed: u32) -> Burst {
 }
 
 /// The header of the burst whose preamble B starts at `b`, if it decodes.
-fn header_at(m: &Modem, rx: &[f32], b: usize) -> Option<Header> {
+pub(crate) fn header_at(m: &Modem, rx: &[f32], b: usize) -> Option<Header> {
     m.ofdm.demodulate(rx, b, m.header_symbols()).and_then(|f| m.decode_header(&f))
 }
 
@@ -129,7 +129,7 @@ pub(crate) fn payload_seed(t: u32) -> u32 {
 /// Channel seed of trial `t` at `cnr` dB: every trial and every CNR point gets its
 /// own noise, so the points of a curve do not share noise realisations. All
 /// detectors still see the same recording within a trial, which keeps them paired.
-pub(crate) fn channel_seed(cnr: f32, t: u32) -> u64 {
+fn channel_seed(cnr: f32, t: u32) -> u64 {
     (((cnr * 100.0).round() as i64 as u64) << 32) | t as u64
 }
 
@@ -366,6 +366,12 @@ fn detector_eval() {
 /// The harness itself: on a strong signal every detector and the genie decode every
 /// burst, and no detector raises a false header on a carrier at -10 dB CNR. `hit` is
 /// a diagnostic, so it is not required here.
+#[test]
+fn on_every_core_keeps_trial_order() {
+    assert_eq!(on_every_core(37, |t| t), (0..37).collect::<Vec<_>>());
+    assert!(on_every_core(0, |t| t).is_empty());
+}
+
 #[test]
 fn harness_sees_strong_bursts_and_no_false_headers() {
     for mode in ["narrow", "wide"] {
