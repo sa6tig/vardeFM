@@ -229,7 +229,6 @@ enum Cmd {
         /// Flat fading: rayleigh:<doppler Hz> or rician:<doppler Hz>:<K dB> (CNR is then the mean; each transmission fades independently)
         #[arg(long)]
         fading: Option<Fading>,
-
         /// Simulated seconds per real second (0 = as fast as possible)
         #[arg(long, default_value_t = 1.0)]
         speed: f64,
