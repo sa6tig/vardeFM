@@ -19,7 +19,7 @@ run the same minor version.
   Rician flat fading (sum-of-sinusoids, Clarke spectrum, seeded like the noise) to the
   carrier before the IF filter. `vardefm sim`, `sweep` and `sim-pair` take
   `--fading rayleigh:<Doppler Hz>` or `--fading rician:<Doppler Hz>:<K dB>`, and the
-  `level_table_fading` benchmark runs the level table at 5, 20 and 80 Hz Doppler.
+  `fading_table` benchmark runs the level table at 5, 20 and 80 Hz Doppler.
 
 ### Changed
 - **Busy detection measures only the carrier band** (422–2672 Hz narrow, 400–6000 Hz wide).

@@ -102,11 +102,11 @@ fn level_table() {
 
 /// The level table on Rayleigh fading channels (mobile or portable "picket fencing"),
 /// CNR being the mean CNR. Compare with `level_table`.
-/// `cargo test --release -p vardefm-modem level_table_fading -- --ignored --nocapture`
+/// `cargo test --release -p vardefm-modem fading_table -- --ignored --nocapture`
 /// `VARDEFM_FADING=rician:20:6` runs one fading spec instead of Rayleigh at 5, 20 and 80 Hz.
 #[test]
 #[ignore]
-fn level_table_fading() {
+fn fading_table() {
     let specs: Vec<Fading> = match std::env::var("VARDEFM_FADING") {
         Ok(s) => vec![s.parse().unwrap()],
         Err(_) => [5.0, 20.0, 80.0].map(Fading::rayleigh).to_vec(),

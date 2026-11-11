@@ -276,11 +276,16 @@ mod tests {
         assert!((peak - 0.3).abs() < 0.05, "peak {peak}");
     }
 
+    // The fading statistics depend only on Doppler / sample rate, so the statistics
+    // tests run at 4.8 kHz: 10 s per seed for a tenth of the work.
+    const STAT_FS: f32 = 4_800.0;
+    const STAT_LEN: usize = 48_000;
+
     /// Mean power and the fraction of time more than 10 dB below it.
     fn fade_stats(f: Fading, seeds: std::ops::Range<u64>) -> (f32, f32) {
         let (mut power, mut deep, mut n) = (0.0, 0, 0);
         for seed in seeds {
-            for g in f.gains(48_000.0, 480_000, seed) {
+            for g in f.gains(STAT_FS, STAT_LEN, seed) {
                 let p = g.norm_sqr();
                 power += p;
                 deep += (p < 0.1) as usize;
@@ -291,17 +296,21 @@ mod tests {
     }
 
     #[test]
-    fn rayleigh_fading_statistics() {
-        // 10 s at 20 Hz: 200 Doppler periods per seed.
-        let (power, deep) = fade_stats(Fading::rayleigh(20.0), 0..8);
-        assert!((power - 1.0).abs() < 0.1, "mean power {power}");
-        // Rayleigh: P(|g|^2 < 0.1) = 1 - exp(-0.1) = 9.5%.
-        assert!((deep - 0.095).abs() < 0.02, "deep fades {deep}");
-
-        // A strong direct path (K = 10 dB) almost never fades 10 dB.
-        let (power, deep) = fade_stats(Fading::rician(20.0, 10.0), 0..8);
-        assert!((power - 1.0).abs() < 0.1, "mean power {power}");
-        assert!(deep < 0.01, "deep fades {deep}");
+    fn rayleigh_and_rician_fade_depth() {
+        // 10 s at 20 Hz: 200 Doppler periods per seed. P(|g|^2 < 0.1) is
+        // 1 - exp(-0.1) = 9.5% for Rayleigh; for Rician it is the noncentral
+        // chi-square CDF: 7.3% at K = 0 dB, 1.6% at 6 dB, 0.07% at 10 dB. The
+        // tolerances separate each K from its neighbours (3 dB: 4.6%).
+        for (f, want, tol) in [
+            (Fading::rayleigh(20.0), 0.095, 0.015),
+            (Fading::rician(20.0, 0.0), 0.073, 0.012),
+            (Fading::rician(20.0, 6.0), 0.0165, 0.006),
+            (Fading::rician(20.0, 10.0), 0.0007, 0.002),
+        ] {
+            let (power, deep) = fade_stats(f, 0..8);
+            assert!((power - 1.0).abs() < 0.1, "{f}: mean power {power}");
+            assert!((deep - want).abs() < tol, "{f}: deep fades {deep}, want {want}");
+        }
     }
 
     #[test]
@@ -310,7 +319,7 @@ mod tests {
         for fd in [5.0, 80.0] {
             let mut ups = 0;
             for seed in 0..8 {
-                let g = Fading::rayleigh(fd).gains(48_000.0, 480_000, seed);
+                let g = Fading::rayleigh(fd).gains(STAT_FS, STAT_LEN, seed);
                 ups += g.windows(2).filter(|w| w[0].norm_sqr() < 1.0 && w[1].norm_sqr() >= 1.0).count();
             }
             let rate = ups as f32 / 80.0;
@@ -319,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn fading_is_seeded_and_keeps_noise() {
+    fn fading_is_seeded_and_static_at_zero_doppler() {
         let tone: Vec<f32> = (0..48_000).map(|i| 0.3 * (2.0 * PI * 1000.0 * i as f32 / 48_000.0).sin()).collect();
         let cfg =
             FmChannelConfig { cnr_db: Some(15.0), fading: Some(Fading::rayleigh(20.0)), ..FmChannelConfig::narrow() };
