@@ -151,8 +151,8 @@ Performance gates (ignored by default, run by hand in release mode). They fail w
 level's 10 % codeword error point (`crates/vardefm-modem/perf/levels.toml`) or a code's
 1 % FER point (`crates/vardefm-fec/perf/ldpc.toml`) has moved:
 ```sh
-cargo test --release -p vardefm-modem level_gate -- --ignored --nocapture   # about 1 min
-cargo test --release -p vardefm-fec fer_gate -- --ignored --nocapture       # a few s
+cargo test --release -p vardefm-modem level_gate -- --ignored --nocapture   # about 15 s
+cargo test --release -p vardefm-fec fer_gate -- --ignored --nocapture       # about 5 s
 ```
 A deliberate change records new points in the same commit. Commit the code first, so
 the files name the commit measured, then run:

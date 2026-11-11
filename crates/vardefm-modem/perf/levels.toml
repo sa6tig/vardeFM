@@ -1,6 +1,6 @@
 [source]
 what = "CNR at 10 % codeword error rate, decoded from the known burst position"
-commit = "a82d592-dirty"
+commit = "fd91ee7"
 command = "WRITE=1 TRIALS=200 cargo test --release -p vardefm-modem level_sweep -- --ignored"
 bursts = 200
 codewords = 4
