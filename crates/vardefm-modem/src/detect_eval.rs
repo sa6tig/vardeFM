@@ -47,14 +47,14 @@ pub(crate) const DETECTORS: &[(&str, DetectFn)] = &[("sc", |m, rx, from| m.ofdm.
 /// Leader length used by the evaluation, seconds (the `vardefm modem` default).
 const TXDELAY: f32 = 0.15;
 
-fn modem(mode: &str) -> Arc<Modem> {
+pub(crate) fn modem(mode: &str) -> Arc<Modem> {
     let mut m = Modem::new(OfdmParams::by_name(mode).unwrap(), TXDELAY);
     // Trials already run on every core.
     m.decode_threads = 1;
     Arc::new(m)
 }
 
-fn burst(level: u8, ncw: usize, seed: u32) -> Burst {
+pub(crate) fn burst(level: u8, ncw: usize, seed: u32) -> Burst {
     let mut rng = Prng::new(seed);
     let n = Modem::payload_bytes(level);
     Burst {
@@ -122,14 +122,14 @@ struct Trial {
 }
 
 /// Payload seed of trial `t`: every trial sends its own data, the same at every CNR.
-fn payload_seed(t: u32) -> u32 {
+pub(crate) fn payload_seed(t: u32) -> u32 {
     1 + t
 }
 
 /// Channel seed of trial `t` at `cnr` dB: every trial and every CNR point gets its
 /// own noise, so the points of a curve do not share noise realisations. All
 /// detectors still see the same recording within a trial, which keeps them paired.
-fn channel_seed(cnr: f32, t: u32) -> u64 {
+pub(crate) fn channel_seed(cnr: f32, t: u32) -> u64 {
     (((cnr * 100.0).round() as i64 as u64) << 32) | t as u64
 }
 
@@ -153,7 +153,7 @@ fn trial(m: &Modem, mode: &str, cnr: f32, level: u8, ncw: usize, truth: usize, t
 /// Where preamble B of a `level` burst of `ncw` codewords lands after the channel.
 /// The channel's delays depend neither on its noise nor on the payload (the burst
 /// layout is fixed by level and size), so one noiseless copy gives it for every trial.
-fn true_position(m: &Modem, mode: &str, level: u8, ncw: usize) -> usize {
+pub(crate) fn true_position(m: &Modem, mode: &str, level: u8, ncw: usize) -> usize {
     let clean = FmChannelConfig { cnr_db: None, ..FmChannelConfig::by_name(mode).unwrap() };
     let tx = m.modulate(&burst(level, ncw, payload_seed(0)));
     m.ofdm.detect(&transmit(&clean, &tx), 0).expect("burst not found on a clean channel")
@@ -198,7 +198,7 @@ fn mcnemar(b: u32, c: u32) -> f64 {
 
 /// Environment variable `name` parsed as `T`, or `default` when unset. A value that
 /// does not parse stops the run: falling back would quietly run something else.
-fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
+pub(crate) fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
     match std::env::var(name) {
         Ok(v) => v.trim().parse().unwrap_or_else(|_| panic!("{name}={v:?} does not parse")),
         Err(_) => default,

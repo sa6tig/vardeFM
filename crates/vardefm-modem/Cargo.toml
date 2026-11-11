@@ -11,3 +11,5 @@ vardefm-fec.workspace = true
 
 [dev-dependencies]
 vardefm-sim.workspace = true
+serde.workspace = true
+toml.workspace = true

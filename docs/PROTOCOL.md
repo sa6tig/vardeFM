@@ -115,10 +115,11 @@ carries `k/8 − 4` data bytes followed by a big-endian CRC-32.
 | 6 | 64QAM | 5/6 | 2000 | 246 | 7.4 kbit/s | 18.7 kbit/s |
 
 Net rate = data bytes of a full burst ÷ its airtime (leader, preambles and header
-included), before link-layer overhead. In the FM channel simulator, level 6 decodes
-error-free from about 16.5 dB carrier-to-noise in narrow mode and 24.5 dB in wide mode.
-Level 1 decodes every burst it detects from 4.5 dB (narrow) and 6.5 dB (wide); below
-about 8 dB (narrow) and 11 dB (wide) some bursts are not detected at all.
+included), before link-layer overhead. For each mode and level, the carrier-to-noise
+ratio in the FM channel simulator at which 10 % of codewords fail, decoded from the
+known burst position, is recorded in `crates/vardefm-modem/perf/levels.toml` and checked
+by the `level_gate` test. Detection is not part of it: below about 8 dB (narrow) and
+11 dB (wide) some level 1 bursts are not detected at all.
 
 ### 2.3 Header (96 bits before coding)
 80 bits of fields, MSB first, then a CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF) over
@@ -180,9 +181,9 @@ Informative: none of the graphs has a 4-cycle. The header and rate-1/2 graphs ha
 girth 8; the denser high-rate graphs have girth 6. Check degrees differ by at most 2
 within a code. The reference decoder is layered offset min-sum: every
 check-to-variable magnitude is `max(0, min − 0.5)`, with no scaling, for at most 50
-iterations, and input LLRs are clamped to ±40. On BPSK/AWGN with it, frame error rate
-1% is reached at Eb/N0 ≈ 1.5 dB (rate 1/2), 2.1 dB (2/3), 2.6 dB (3/4), 3.3 dB (5/6)
-and 2.2 dB (header).
+iterations, and input LLRs are clamped to ±40. The Eb/N0 at which each code reaches 1 %
+frame error rate with it on BPSK/AWGN is recorded in `crates/vardefm-fec/perf/ldpc.toml`
+and checked by the `fer_gate` test.
 
 ### 2.5 Scrambling and interleaving
 - Information bits are XORed with xorshift32 bits before encoding. The seed is
