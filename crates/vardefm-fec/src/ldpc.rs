@@ -258,12 +258,12 @@ fn peg(m: usize, degrees: &[usize], seed: u32) -> Vec<Vec<u32>> {
 
 /// The codes the modem uses (`vardefm-modem`): header, then payload k = 1200..2000.
 #[cfg(test)]
-const CODES: [(usize, usize, u32); 5] = [
-    (400, 96, 0x1d9c_1000),
-    (2400, 1200, 0x1d9c_0000 + 1200),
-    (2400, 1600, 0x1d9c_0000 + 1600),
-    (2400, 1800, 0x1d9c_0000 + 1800),
-    (2400, 2000, 0x1d9c_0000 + 2000),
+const CODES: [(&str, usize, usize, u32); 5] = [
+    ("header", 400, 96, 0x1d9c_1000),
+    ("r1/2", 2400, 1200, 0x1d9c_0000 + 1200),
+    ("r2/3", 2400, 1600, 0x1d9c_0000 + 1600),
+    ("r3/4", 2400, 1800, 0x1d9c_0000 + 1800),
+    ("r5/6", 2400, 2000, 0x1d9c_0000 + 2000),
 ];
 
 #[cfg(test)]
@@ -314,7 +314,7 @@ mod tests {
 
     #[test]
     fn graph_has_profile_and_no_4_cycles() {
-        for (n, k, seed) in CODES {
+        for (_, n, k, seed) in CODES {
             let code = Ldpc::new(n, k, seed);
             let m = code.m();
             let mut checks_of = vec![Vec::new(); k];
@@ -349,7 +349,7 @@ mod tests {
     #[test]
     fn construction_is_stable() {
         let mut got = Vec::new();
-        for (n, k, seed) in CODES {
+        for (_, n, k, seed) in CODES {
             let code = Ldpc::new(n, k, seed);
             let mut h: u64 = 0xcbf2_9ce4_8422_2325;
             for v in code.check_ptr.iter().map(|&p| p as u32).chain(code.check_vars.iter().copied()) {
@@ -462,20 +462,16 @@ mod curve {
         fer: Vec<f32>,
     }
 
-    fn name(n: usize, k: usize) -> &'static str {
-        match (n, k) {
-            (400, 96) => "header",
-            (2400, 1200) => "r1/2",
-            (2400, 1600) => "r2/3",
-            (2400, 1800) => "r3/4",
-            (2400, 2000) => "r5/6",
-            _ => panic!("no name for ({n},{k})"),
-        }
-    }
-
     fn load() -> Baseline {
         let text = std::fs::read_to_string(BASELINE).unwrap_or_else(|e| panic!("{BASELINE}: {e}"));
         toml::from_str(&text).unwrap_or_else(|e| panic!("{BASELINE}: {e}"))
+    }
+
+    impl Baseline {
+        fn point(&self, n: usize, k: usize) -> &Point {
+            let p = self.code.iter().find(|p| (p.n, p.k) == (n, k));
+            p.unwrap_or_else(|| panic!("{BASELINE} has no ({n},{k}) code"))
+        }
     }
 
     /// Where `rates` (falling with `grid`) cross `target`, by interpolation of
@@ -517,7 +513,8 @@ mod curve {
     }
 
     fn env_or(name: &str, default: u32) -> u32 {
-        std::env::var(name).map_or(default, |v| v.parse().unwrap_or_else(|_| panic!("{name}={v:?} does not parse")))
+        std::env::var(name)
+            .map_or(default, |v| v.trim().parse().unwrap_or_else(|_| panic!("{name}={v:?} does not parse")))
     }
 
     /// Prints build time and frame error rate vs Eb/N0 for every code (BPSK, AWGN),
@@ -533,7 +530,7 @@ mod curve {
         let write = std::env::var("WRITE").is_ok_and(|v| v == "1");
         let mut total = 0.0;
         let mut points = Vec::new();
-        for (n, k, seed) in CODES {
+        for (name, n, k, seed) in CODES {
             let t0 = Instant::now();
             let code = Ldpc::new(n, k, seed);
             let built = t0.elapsed().as_secs_f64() * 1e3;
@@ -565,7 +562,7 @@ mod curve {
             let ebn0_db = crossing(&grid, &rates, TARGET_FER).expect("the fine grid does not cross 1 % FER");
             let ebn0_db = (ebn0_db * 100.0).round() / 100.0;
             println!("  1 % FER at {ebn0_db:.2} dB");
-            points.push(Point { name: name(n, k).into(), n, k, ebn0_db, grid_db: grid, fer: rates });
+            points.push(Point { name: name.into(), n, k, ebn0_db, grid_db: grid, fer: rates });
         }
         println!("all codes built in {total:.1} ms");
         if write {
@@ -597,25 +594,20 @@ mod curve {
         let base = load();
         println!("baseline {} ({})", base.source.commit, base.source.command);
         let mut failed = Vec::new();
-        for (n, k, seed) in CODES {
-            let p = base
-                .code
-                .iter()
-                .find(|p| p.name == name(n, k))
-                .unwrap_or_else(|| panic!("{BASELINE} has no {}", name(n, k)));
-            assert_eq!((p.n, p.k), (n, k), "{BASELINE}: {} is not ({n},{k})", p.name);
+        for (name, n, k, seed) in CODES {
+            let p = base.point(n, k);
             let code = Ldpc::new(n, k, seed);
             let above = fer(&code, p.ebn0_db + GATE_MARGIN_DB, trials);
             let below = fer(&code, p.ebn0_db - GATE_MARGIN_DB, trials);
             let ok = above < TARGET_FER && below > TARGET_FER;
             println!(
                 "{:>6} at {:.2} dB: FER {below:.4} at -{GATE_MARGIN_DB} dB, {above:.4} at +{GATE_MARGIN_DB} dB {}",
-                p.name,
+                name,
                 p.ebn0_db,
                 if ok { "ok" } else { "FAIL" }
             );
             if !ok {
-                failed.push(p.name.clone());
+                failed.push(name);
             }
         }
         assert!(failed.is_empty(), "1 % FER point moved for {failed:?}");
@@ -634,9 +626,9 @@ mod curve {
     #[test]
     fn baseline_covers_every_code() {
         let base = load();
-        for (n, k, _) in CODES {
-            let p = base.code.iter().find(|p| p.name == name(n, k)).unwrap();
-            assert_eq!((p.n, p.k), (n, k));
+        for (name, n, k, _) in CODES {
+            let p = base.point(n, k);
+            assert_eq!(p.name, name, "{BASELINE}: ({n},{k}) is named {:?}", p.name);
             assert_eq!(p.grid_db.len(), p.fer.len());
         }
     }

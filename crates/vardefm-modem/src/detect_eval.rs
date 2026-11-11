@@ -133,11 +133,18 @@ pub(crate) fn channel_seed(cnr: f32, t: u32) -> u64 {
     (((cnr * 100.0).round() as i64 as u64) << 32) | t as u64
 }
 
-fn trial(m: &Modem, mode: &str, cnr: f32, level: u8, ncw: usize, truth: usize, t: u32) -> Trial {
+/// The `level` burst of `ncw` codewords that trial `t` sends, and the audio the
+/// receiver gets from the `mode` channel at `cnr` dB.
+pub(crate) fn received(m: &Modem, mode: &str, cnr: f32, level: u8, ncw: usize, t: u32) -> (Burst, Vec<f32>) {
     let sent = burst(level, ncw, payload_seed(t));
     let cfg =
         FmChannelConfig { cnr_db: Some(cnr), seed: channel_seed(cnr, t), ..FmChannelConfig::by_name(mode).unwrap() };
     let rx = transmit(&cfg, &m.modulate(&sent));
+    (sent, rx)
+}
+
+fn trial(m: &Modem, mode: &str, cnr: f32, level: u8, ncw: usize, truth: usize, t: u32) -> Trial {
+    let (sent, rx) = received(m, mode, cnr, level, ncw, t);
     let tol = m.ofdm.p.ncp / 4;
     let det = DETECTORS
         .iter()
@@ -159,25 +166,25 @@ pub(crate) fn true_position(m: &Modem, mode: &str, level: u8, ncw: usize) -> usi
     m.ofdm.detect(&transmit(&clean, &tx), 0).expect("burst not found on a clean channel")
 }
 
-/// Run `trials` trials of a `level` burst of `ncw` codewords on every core.
-fn run_trials(m: &Modem, mode: &str, cnr: f32, level: u8, ncw: usize, trials: u32) -> Vec<Trial> {
-    let truth = true_position(m, mode, level, ncw);
+/// `f(t)` for every trial `t` in `0..trials`, spread over every core, in trial
+/// order. Each trial seeds itself, so the result does not depend on the threads.
+pub(crate) fn on_every_core<R: Send>(trials: u32, f: impl Fn(u32) -> R + Sync) -> Vec<R> {
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get()) as u32;
-    let mut out: Vec<(u32, Trial)> = std::thread::scope(|s| {
+    let f = &f;
+    let mut out: Vec<(u32, R)> = std::thread::scope(|s| {
         let workers: Vec<_> = (0..threads)
-            .map(|th| {
-                s.spawn(move || {
-                    (th..trials)
-                        .step_by(threads as usize)
-                        .map(|t| (t, trial(m, mode, cnr, level, ncw, truth, t)))
-                        .collect::<Vec<_>>()
-                })
-            })
+            .map(|th| s.spawn(move || (th..trials).step_by(threads as usize).map(|t| (t, f(t))).collect::<Vec<_>>()))
             .collect();
         workers.into_iter().flat_map(|w| w.join().unwrap()).collect()
     });
     out.sort_by_key(|(t, _)| *t);
     out.into_iter().map(|(_, r)| r).collect()
+}
+
+/// Run `trials` trials of a `level` burst of `ncw` codewords on every core.
+fn run_trials(m: &Modem, mode: &str, cnr: f32, level: u8, ncw: usize, trials: u32) -> Vec<Trial> {
+    let truth = true_position(m, mode, level, ncw);
+    on_every_core(trials, |t| trial(m, mode, cnr, level, ncw, truth, t))
 }
 
 /// Two-sided exact McNemar p-value for `b` and `c` discordant pairs.
@@ -203,6 +210,13 @@ pub(crate) fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
         Ok(v) => v.trim().parse().unwrap_or_else(|_| panic!("{name}={v:?} does not parse")),
         Err(_) => default,
     }
+}
+
+/// Environment variable `name` as a comma-separated list of `T`, or `default` when
+/// unset. As with [`env_or`], an item that does not parse stops the run.
+pub(crate) fn env_list<T: std::str::FromStr>(name: &str, default: &str) -> Vec<T> {
+    let v = std::env::var(name).unwrap_or_else(|_| default.to_string());
+    v.split(',').map(|s| s.trim().parse().unwrap_or_else(|_| panic!("{name}: {s:?} does not parse"))).collect()
 }
 
 /// The kinds of audio without a burst in the false-detection pass, for [`noise_case`].
@@ -288,8 +302,7 @@ fn detector_eval() {
     }
     let cnr_list = |mode: &str| -> Vec<f32> {
         let default = if mode == "narrow" { "3,4,5,6,7,8,10" } else { "5,6,7,8,9,10,12" };
-        let cnrs: String = env_or("CNRS", default.to_string());
-        cnrs.split(',').map(|c| c.trim().parse().unwrap_or_else(|_| panic!("CNRS: {c:?} is not a number"))).collect()
+        env_list("CNRS", default)
     };
     for mode in &modes {
         cnr_list(mode);

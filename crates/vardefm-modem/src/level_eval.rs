@@ -26,8 +26,7 @@
 //! point: 100 for the gate, 200 for the sweep's fine grid), `WRITE` (sweep only).
 
 use super::*;
-use crate::detect_eval::{burst, channel_seed, env_or, modem, payload_seed, true_position};
-use vardefm_sim::{transmit, FmChannelConfig};
+use crate::detect_eval::{burst, env_list, env_or, modem, on_every_core, payload_seed, received, true_position};
 
 /// Codeword error rate at which a level's point is recorded and gated.
 const TARGET_CER: f32 = 0.1;
@@ -45,6 +44,11 @@ const COARSE_BURSTS: u32 = 25;
 /// The sweep's search gives up above this CNR, dB: a level that still fails there
 /// has an error floor.
 const MAX_CNR_DB: i32 = 40;
+/// ... and below this one, where nothing decodes.
+const MIN_CNR_DB: i32 = -10;
+/// The modes and levels a recorded baseline covers.
+const ALL_MODES: &str = "narrow,wide";
+const ALL_LEVELS: &str = "0,1,2,3,4,5,6";
 /// Codewords per burst, or fewer where a level's burst holds fewer.
 const CODEWORDS: usize = 4;
 
@@ -90,52 +94,51 @@ fn load() -> Baseline {
     toml::from_str(&text).unwrap_or_else(|e| panic!("{BASELINE}: {e}"))
 }
 
-/// A comma-separated list from the environment, or `default` when unset.
-fn env_list<T: std::str::FromStr>(name: &str, default: &str) -> Vec<T> {
-    env_or(name, default.to_string()).split(',').map(|s| env_or_parse(name, s)).collect()
+impl Baseline {
+    fn point(&self, mode: &str, level: u8) -> &Point {
+        let p = self.level.iter().find(|p| p.mode == mode && p.level == level);
+        p.unwrap_or_else(|| panic!("{BASELINE} has no {mode} level {level}"))
+    }
 }
 
-fn env_or_parse<T: std::str::FromStr>(name: &str, s: &str) -> T {
-    s.trim().parse().unwrap_or_else(|_| panic!("{name}: {s:?} does not parse"))
+/// One mode and level under test, with what all its trials share.
+struct Case<'a> {
+    m: &'a Modem,
+    mode: &'a str,
+    level: u8,
+    /// Codewords per burst: `CODEWORDS`, or fewer where the level's burst holds fewer.
+    ncw: usize,
+    /// Where preamble B lands, the same in every trial.
+    truth: usize,
+    /// The header's carriers, the channel training; every trial sends the same header.
+    training: Vec<Vec<Complex32>>,
 }
 
-fn codewords(m: &Modem, level: u8) -> usize {
-    m.max_ncw(level).min(CODEWORDS)
-}
+impl<'a> Case<'a> {
+    fn new(m: &'a Modem, mode: &'a str, level: u8) -> Self {
+        let ncw = m.max_ncw(level).min(CODEWORDS);
+        let truth = true_position(m, mode, level, ncw);
+        let training = m.header_carriers(&burst(level, ncw, payload_seed(0)).header);
+        Case { m, mode, level, ncw, truth, training }
+    }
 
-/// Codewords of trial `t` that fail to decode, from the true position `truth`.
-fn cw_errors(m: &Modem, mode: &str, cnr: f32, level: u8, truth: usize, t: u32) -> u32 {
-    let ncw = codewords(m, level);
-    let sent = burst(level, ncw, payload_seed(t));
-    let cfg =
-        FmChannelConfig { cnr_db: Some(cnr), seed: channel_seed(cnr, t), ..FmChannelConfig::by_name(mode).unwrap() };
-    let rx = transmit(&cfg, &m.modulate(&sent));
-    let nsym = m.header_symbols() + ncw * m.symbols_per_codeword(level);
-    let Some(frame) = m.ofdm.demodulate_known(&rx, truth, nsym, &m.header_carriers(&sent.header)) else {
-        return ncw as u32;
-    };
-    let got = m.decode_payload(&sent.header, &frame);
-    got.iter().zip(&sent.payload).filter(|(g, w)| g.as_ref() != Some(*w)).count() as u32
-}
+    /// Codewords of trial `t` at `cnr` dB that fail to decode from the true position.
+    fn errors(&self, cnr: f32, t: u32) -> u32 {
+        let (m, ncw) = (self.m, self.ncw);
+        let (sent, rx) = received(m, self.mode, cnr, self.level, ncw, t);
+        let nsym = m.header_symbols() + ncw * m.symbols_per_codeword(self.level);
+        let Some(frame) = m.ofdm.demodulate_known(&rx, self.truth, nsym, &self.training) else {
+            return ncw as u32;
+        };
+        let got = m.decode_payload(&sent.header, &frame);
+        got.iter().zip(&sent.payload).filter(|(g, w)| g.as_ref() != Some(*w)).count() as u32
+    }
 
-/// Codeword error rate over `bursts` bursts at `cnr` dB, on every core.
-fn cer(m: &Modem, mode: &str, level: u8, cnr: f32, bursts: u32) -> f32 {
-    let truth = true_position(m, mode, level, codewords(m, level));
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()) as u32;
-    let errors: u32 = std::thread::scope(|s| {
-        let workers: Vec<_> = (0..threads)
-            .map(|th| {
-                s.spawn(move || {
-                    (th..bursts)
-                        .step_by(threads as usize)
-                        .map(|t| cw_errors(m, mode, cnr, level, truth, t))
-                        .sum::<u32>()
-                })
-            })
-            .collect();
-        workers.into_iter().map(|w| w.join().unwrap()).sum()
-    });
-    errors as f32 / (bursts as usize * codewords(m, level)) as f32
+    /// Codeword error rate over `bursts` bursts at `cnr` dB, on every core.
+    fn cer(&self, cnr: f32, bursts: u32) -> f32 {
+        let errors: u32 = on_every_core(bursts, |t| self.errors(cnr, t)).iter().sum();
+        errors as f32 / (bursts as usize * self.ncw) as f32
+    }
 }
 
 /// Where `rates` (falling with `grid`) cross `target`, by interpolation of log10 of
@@ -192,30 +195,39 @@ fn commit() -> String {
 #[test]
 #[ignore]
 fn level_sweep() {
-    let modes: Vec<String> = env_list("MODES", "narrow,wide");
-    let levels: Vec<u8> = env_list("LEVELS", "0,1,2,3,4,5,6");
+    let modes: Vec<String> = env_list("MODES", ALL_MODES);
+    let levels: Vec<u8> = env_list("LEVELS", ALL_LEVELS);
     let bursts = env_or("TRIALS", RECORD_BURSTS);
     let write = std::env::var("WRITE").is_ok_and(|v| v == "1");
+    // The file holds every mode and level from one run; a partial run would drop the rest.
+    assert!(
+        !write || (std::env::var("MODES").is_err() && std::env::var("LEVELS").is_err()),
+        "WRITE=1 records every mode and level: unset MODES and LEVELS"
+    );
     let mut points = Vec::new();
     for mode in &modes {
         let m = modem(mode);
-        // The crossing rises with the level; start the search a little below the last.
+        // The crossing mostly rises with the level; start each search at the last.
         let mut start = 0i32;
         for &level in &levels {
-            let at = |c: i32| cer(&m, mode, level, c as f32, COARSE_BURSTS);
+            let case = Case::new(&m, mode, level);
+            let mut seen = std::collections::BTreeMap::new();
+            let mut at = |c: i32| *seen.entry(c).or_insert_with(|| case.cer(c as f32, COARSE_BURSTS));
+            // c ends as the last whole dB at which CER is still 10 % or more.
             let mut c = start;
             while at(c) < TARGET_CER {
                 c -= 1;
+                assert!(c > MIN_CNR_DB, "{mode} L{level}: CER is below 10 % even at {MIN_CNR_DB} dB");
             }
             while at(c + 1) >= TARGET_CER {
                 c += 1;
                 assert!(c < MAX_CNR_DB, "{mode} L{level}: CER is still 10 % or more at {MAX_CNR_DB} dB");
             }
-            start = c - 2;
+            start = c;
             // Whole quarter dB steps, so the recorded grid reads as written.
             let centre = c * 4 + 2;
             let grid: Vec<f32> = (centre - 4..=centre + 4).map(|i| i as f32 / 4.0).collect();
-            let rates: Vec<f32> = grid.iter().map(|&g| cer(&m, mode, level, g, bursts)).collect();
+            let rates: Vec<f32> = grid.iter().map(|&g| case.cer(g, bursts)).collect();
             let Some(x) = crossing(&grid, &rates, TARGET_CER) else {
                 panic!("{mode} L{level}: the grid {grid:?} does not cross 10 % CER: {rates:?}");
             };
@@ -223,7 +235,7 @@ fn level_sweep() {
             let line: String = grid.iter().zip(&rates).map(|(g, r)| format!(" {g:.2}:{r:.3}")).collect();
             println!("{mode} L{level} {}: 10 % CER at {cnr_db:.2} dB;{line}", LEVELS[level as usize].name);
             // CER the gate would see on either side, interpolated on the grid.
-            let sigma = (TARGET_CER * (1.0 - TARGET_CER) / (GATE_BURSTS as usize * codewords(&m, level)) as f32).sqrt();
+            let sigma = (TARGET_CER * (1.0 - TARGET_CER) / (GATE_BURSTS as usize * case.ncw) as f32).sqrt();
             for d in [-GATE_MARGIN_DB, GATE_MARGIN_DB] {
                 let r = rate_at(&grid, &rates, x + d);
                 if (r - TARGET_CER).abs() < 3.0 * sigma {
@@ -264,8 +276,8 @@ fn level_sweep() {
 #[test]
 #[ignore]
 fn level_gate() {
-    let modes: Vec<String> = env_list("MODES", "narrow,wide");
-    let levels: Vec<u8> = env_list("LEVELS", "0,1,2,3,4,5,6");
+    let modes: Vec<String> = env_list("MODES", ALL_MODES);
+    let levels: Vec<u8> = env_list("LEVELS", ALL_LEVELS);
     let bursts = env_or("TRIALS", GATE_BURSTS);
     let base = load();
     println!("baseline {} ({})", base.source.commit, base.source.command);
@@ -273,13 +285,10 @@ fn level_gate() {
     for mode in &modes {
         let m = modem(mode);
         for &level in &levels {
-            let p = base
-                .level
-                .iter()
-                .find(|p| p.mode == *mode && p.level == level)
-                .unwrap_or_else(|| panic!("{BASELINE} has no {mode} level {level}"));
-            let below = cer(&m, mode, level, p.cnr_db - GATE_MARGIN_DB, bursts);
-            let above = cer(&m, mode, level, p.cnr_db + GATE_MARGIN_DB, bursts);
+            let p = base.point(mode, level);
+            let case = Case::new(&m, mode, level);
+            let below = case.cer(p.cnr_db - GATE_MARGIN_DB, bursts);
+            let above = case.cer(p.cnr_db + GATE_MARGIN_DB, bursts);
             let ok = above < TARGET_CER && below > TARGET_CER;
             println!(
                 "{mode} L{level} at {:.2} dB: CER {below:.3} at -{GATE_MARGIN_DB} dB, {above:.3} at +{GATE_MARGIN_DB} dB {}",
@@ -316,10 +325,9 @@ fn rate_at_interpolates_in_log_and_clamps() {
 #[test]
 fn baseline_covers_every_mode_and_level() {
     let base = load();
-    for mode in ["narrow", "wide"] {
+    for mode in ALL_MODES.split(',') {
         for level in 0..LEVELS.len() as u8 {
-            let p = base.level.iter().find(|p| p.mode == mode && p.level == level);
-            let p = p.unwrap_or_else(|| panic!("no {mode} level {level}"));
+            let p = base.point(mode, level);
             assert_eq!(p.grid_db.len(), p.cer.len());
         }
     }
