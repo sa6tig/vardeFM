@@ -15,6 +15,11 @@ run the same minor version.
   `crates/vardefm-fec/perf/ldpc.toml`. `level_sweep` and `fer_curve` with `WRITE=1`
   record them again. The figures in `docs/PROTOCOL.md` §2.2 and §2.4 now refer to these
   files.
+- **Fading in the FM channel simulator.** `FmChannelConfig::fading` applies Rayleigh or
+  Rician flat fading (sum-of-sinusoids, Clarke spectrum, seeded like the noise) to the
+  carrier before the IF filter. `vardefm sim`, `sweep` and `sim-pair` take
+  `--fading rayleigh:<Doppler Hz>` or `--fading rician:<Doppler Hz>:<K dB>`, and the
+  `level_table_fading` benchmark runs the level table at 5, 20 and 80 Hz Doppler.
 
 ### Changed
 - **Busy detection measures only the carrier band** (422–2672 Hz narrow, 400–6000 Hz wide).
