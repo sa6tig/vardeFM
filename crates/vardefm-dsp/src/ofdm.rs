@@ -53,13 +53,28 @@ pub struct Frame {
     /// Estimated noise variance after equalization, per data carrier.
     pub noise_var: Vec<f32>,
     /// Noise scale per OFDM symbol (at least 1). The noise variance of symbol `i`,
-    /// data carrier `j` is `noise_var[j] * symbol_noise_scale[i]`; it is large for a
-    /// symbol hit by an FM click, a squelch pop or a short fade.
+    /// data carrier `j` is `noise_var[j] * symbol_noise_scale[i]` unless
+    /// `carrier_noise_scale[i]` overrides it (see [`Frame::noise_at`]); it is large for
+    /// a symbol hit by an FM click, a squelch pop or a short fade.
     pub symbol_noise_scale: Vec<f32>,
+    /// Per symbol: empty when `symbol_noise_scale[i]` applies to every carrier, else
+    /// one scale per data carrier that replaces it. An FM click's noise is far from
+    /// flat across the band (on a fast-fading wide channel, up to 800 times the normal
+    /// level mid-band and little extra on the lowest carriers, where the normal noise
+    /// is already high), so a hit symbol gets its own noise profile from its pilots.
+    pub carrier_noise_scale: Vec<Vec<f32>>,
     /// Average SNR per symbol (Es/N0) in dB.
     pub snr_db: f32,
     /// Sample index just past the end of the frame.
     pub end: usize,
+}
+
+impl Frame {
+    /// Noise variance of symbol `i`, data carrier `j`.
+    pub fn noise_at(&self, i: usize, j: usize) -> f32 {
+        let s = self.carrier_noise_scale.get(i).and_then(|c| c.get(j)).copied();
+        self.noise_var[j] * s.unwrap_or(self.symbol_noise_scale[i])
+    }
 }
 
 impl Ofdm {
@@ -259,17 +274,22 @@ impl Ofdm {
             return None;
         }
         let x = |i: usize| sc[i] as f64;
+        // Normalized by the energy of both halves (not the second half squared): a burst
+        // of FM noise from a fade in one half then lowers the metric by its energy ratio
+        // instead of that ratio squared.
         let mut p = 0f64;
         let mut r = 0f64;
+        let mut r1 = 0f64;
         for m in 0..h {
             p += x(m) * x(m + h);
             r += x(m + h).powi(2);
+            r1 += x(m).powi(2);
         }
         let energy_floor = 1e-7 * h as f64;
         let mut plateau: Option<(usize, usize)> = None;
         let mut d = 0;
         while d + n + 2 * l < sc.len() {
-            let metric = if r > energy_floor && p > 0.0 { p * p / (r * r) } else { 0.0 };
+            let metric = if r > energy_floor && r1 > energy_floor && p > 0.0 { p * p / (r * r1) } else { 0.0 };
             match (&mut plateau, metric > DETECT_THRESHOLD) {
                 (None, true) => plateau = Some((d, d)),
                 (Some((_, end)), true) => *end = d,
@@ -277,8 +297,11 @@ impl Ofdm {
                     let (start, end) = (*start, *end);
                     plateau = None;
                     if end - start >= ncp / 4 {
+                        // Noise in part of preamble A skews the plateau, so its centre
+                        // can miss by more than the cyclic prefix: search all of it.
                         let a0 = from + ((start + end) / 2).saturating_sub(ncp / 2);
-                        if let Some(b) = self.fine_timing(rx, a0 + l + ncp) {
+                        let span = ncp.max((end - start) / 2 + ncp / 2);
+                        if let Some(b) = self.fine_timing(rx, a0 + l + ncp, span) {
                             return Some(b);
                         }
                     }
@@ -287,15 +310,17 @@ impl Ofdm {
             }
             p += x(d + h) * x(d + n) - x(d) * x(d + h);
             r += x(d + n).powi(2) - x(d + h).powi(2);
+            r1 += x(d + h).powi(2) - x(d).powi(2);
             d += 1;
         }
         None
     }
 
-    /// Cross-correlate with preamble B around `expected` and return the best start.
-    fn fine_timing(&self, rx: &[f32], expected: usize) -> Option<usize> {
+    /// Cross-correlate with preamble B within `span` samples of `expected` and return
+    /// the best start.
+    fn fine_timing(&self, rx: &[f32], expected: usize, span: usize) -> Option<usize> {
         let n = self.p.nfft;
-        let span = self.p.ncp as isize;
+        let span = span as isize;
         let mut best = (0.0f32, 0usize);
         for off in -span..=span {
             let s = expected as isize + off;
@@ -418,6 +443,29 @@ impl Ofdm {
             })
             .collect();
         let noise_var: Vec<f32> = raw_var.iter().map(|v| v.max(1e-6)).collect();
+        // A symbol with its own noise scale: per pilot, its deviation over the pilot's
+        // usual level, smoothed [1 2 1]/4 across pilots (one pilot's deviation is a
+        // single noisy sample) and never below the symbol's scale, so that a carrier is
+        // at worst treated as before. Interpolated to the data carriers.
+        let np = pilot_var.len();
+        let carrier_noise_scale: Vec<Vec<f32>> = (0..nsym)
+            .map(|i| {
+                if scale[i] <= 1.0 {
+                    return Vec::new();
+                }
+                let r: Vec<f32> = dev[i].iter().zip(&pilot_var).map(|(d, v)| d / v.max(1e-12)).collect();
+                let s: Vec<f32> = (0..np)
+                    .map(|m| ((r[m.saturating_sub(1)] + 2.0 * r[m] + r[(m + 1).min(np - 1)]) * 0.25).max(scale[i]))
+                    .collect();
+                self.data_idx
+                    .iter()
+                    .map(|&k| {
+                        let (m, t) = self.pilot_pos(k);
+                        s[m] * (1.0 - t) + s[m + 1] * t
+                    })
+                    .collect()
+            })
+            .collect();
         // The reported SNR averages the noise over all symbols, click-hit ones included,
         // as it did before there was a per-symbol scale. Scale the unclamped variance:
         // on a nearly noiseless frame the floor would otherwise be multiplied too.
@@ -428,6 +476,7 @@ impl Ofdm {
             symbols,
             noise_var,
             symbol_noise_scale: scale,
+            carrier_noise_scale,
             snr_db: -10.0 * (mean_var * mean_scale.max(1.0)).max(1e-6).log10(),
             end: (base + (nsym as isize + 1) * l + n as isize) as usize,
         })

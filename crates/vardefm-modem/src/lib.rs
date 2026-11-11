@@ -248,9 +248,9 @@ impl Modem {
     fn llrs(m: Modulation, f: &Frame, from: usize) -> Vec<f32> {
         let symbols = &f.symbols[from..];
         let mut out = Vec::with_capacity(symbols.len() * f.noise_var.len() * m.bits_per_symbol());
-        for (sym, &scale) in symbols.iter().zip(&f.symbol_noise_scale[from..]) {
-            for (y, &nv) in sym.iter().zip(&f.noise_var) {
-                m.demap_llr(*y, nv * scale, &mut out);
+        for (i, sym) in symbols.iter().enumerate() {
+            for (j, y) in sym.iter().enumerate() {
+                m.demap_llr(*y, f.noise_at(from + i, j), &mut out);
             }
         }
         out

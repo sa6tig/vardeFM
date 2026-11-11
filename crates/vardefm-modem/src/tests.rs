@@ -260,6 +260,7 @@ fn survives_a_click() {
     assert_eq!(ok, ncw);
     // Without the scale the click symbol's LLRs are far too confident.
     frame.symbol_noise_scale.iter_mut().for_each(|s| *s = 1.0);
+    frame.carrier_noise_scale.iter_mut().for_each(Vec::clear);
     let ok_flat = m.decode_payload(&b.header, &frame).iter().filter(|p| p.is_some()).count();
     assert!(ok_flat < ncw, "{ok_flat} codewords decode even without the per-symbol scale");
 
@@ -468,6 +469,147 @@ fn a_non_finite_sample_does_not_hide_a_burst() {
                 let got = receive(&mut Receiver::new(m.clone()), &audio);
                 assert_eq!(got.len(), 1, "{mode}, {bad} at {at}");
                 assert!(got[0].payload.iter().all(|p| p.is_some()), "{mode}, {bad} at {at}");
+            }
+        }
+    }
+}
+
+/// Diagnostic: how much of the fading impairment is in the audio itself (genie SNR:
+/// received audio minus the same burst through a clean channel), and how impulsive.
+#[test]
+#[ignore]
+fn fading_diag() {
+    for mode in ["narrow", "wide"] {
+        let m = modem(mode);
+        let level = 6;
+        for dop in [5.0f32, 20.0, 80.0] {
+            for cnr in [24.0f32, 60.0] {
+                let mut line = format!("{mode} dop {dop} cnr {cnr}:");
+                for t in 0..4u32 {
+                    let b = burst(level, m.max_ncw(level).min(4), 100 + t);
+                    let audio = m.modulate(&b);
+                    let base = FmChannelConfig { seed: t as u64 + 1, ..FmChannelConfig::by_name(mode).unwrap() };
+                    let clean = transmit(&FmChannelConfig { cnr_db: None, ..base.clone() }, &audio);
+                    let rx = transmit(
+                        &FmChannelConfig { cnr_db: Some(cnr), fading: Some(Fading::rayleigh(dop)), ..base.clone() },
+                        &audio,
+                    );
+                    let l = m.ofdm.p.symbol_len();
+                    let lead = (base.lead_silence_s * m.fs()) as usize + (base.keyup_delay_s * m.fs()) as usize + l;
+                    let end = (base.lead_silence_s * m.fs()) as usize + audio.len();
+                    let mut ratios: Vec<f32> = clean[lead..end]
+                        .chunks(l)
+                        .zip(rx[lead..end].chunks(l))
+                        .map(|(c, r)| {
+                            let s: f32 = c.iter().map(|x| x * x).sum();
+                            let e: f32 = c.iter().zip(r).map(|(a, b)| (a - b).powi(2)).sum();
+                            e / s
+                        })
+                        .collect();
+                    let mean = ratios.iter().sum::<f32>() / ratios.len() as f32;
+                    ratios.sort_by(f32::total_cmp);
+                    let med = ratios[ratios.len() / 2];
+                    let got = receive(&mut Receiver::new(m.clone()), &rx);
+                    let (rep, ok) = got
+                        .first()
+                        .map_or((f32::NAN, 0), |g| (g.snr_db, g.payload.iter().filter(|p| p.is_some()).count()));
+                    line += &format!(
+                        " [genie mean {:.1} med {:.1} rep {:.1} ok {}/{}]",
+                        -10.0 * mean.log10(),
+                        -10.0 * med.log10(),
+                        rep,
+                        ok,
+                        b.payload.len()
+                    );
+                }
+                println!("{line}");
+            }
+        }
+    }
+}
+
+/// Diagnostic: for bursts lost on fading channels, which stage failed: detection
+/// (Schmidl-Cox plateau), fine timing (preamble B) or the header.
+#[test]
+#[ignore]
+fn fading_loss_stages() {
+    let trials: u32 = std::env::var("TRIALS").ok().and_then(|s| s.parse().ok()).unwrap_or(64);
+    let only_mode = std::env::var("MODE").ok();
+    for mode in ["narrow", "wide"] {
+        if only_mode.as_deref().is_some_and(|o| o != mode) {
+            continue;
+        }
+        let m = modem(mode);
+        let hdr = m.header_symbols();
+        for dop in [5.0f32, 20.0] {
+            for cnr in [14.0f32, 17.0, 20.0, 24.0] {
+                let (mut lost, mut no_detect, mut bad_timing, mut no_header, mut late) = (0, 0, 0, 0, 0);
+                let mut genie_ok = 0;
+                for t in 0..trials {
+                    let b = burst(0, 1, 100 + t);
+                    let base = FmChannelConfig { seed: t as u64 + 1, ..FmChannelConfig::by_name(mode).unwrap() };
+                    let audio = m.modulate(&b);
+                    let truth =
+                        m.ofdm.detect(&transmit(&FmChannelConfig { cnr_db: None, ..base.clone() }, &audio), 0).unwrap();
+                    let rx = transmit(
+                        &FmChannelConfig { cnr_db: Some(cnr), fading: Some(Fading::rayleigh(dop)), ..base.clone() },
+                        &audio,
+                    );
+                    let got = receive(&mut Receiver::new(m.clone()), &rx);
+                    if !got.is_empty() {
+                        continue;
+                    }
+                    lost += 1;
+                    // Which stage? Walk the detector like the receiver does.
+                    let mut from = 0;
+                    let mut found = false;
+                    let mut stage = 0;
+                    while let Some(d) = m.ofdm.detect(&rx, from) {
+                        if (d as isize - truth as isize).abs() <= 2 {
+                            found = true;
+                            let f = m.ofdm.demodulate(&rx, d, hdr).unwrap();
+                            stage = if m.decode_header(&f).is_some() { 3 } else { 2 };
+                            break;
+                        }
+                        if d > truth + m.ofdm.p.symbol_len() {
+                            stage = 4;
+                            break;
+                        }
+                        from = d;
+                    }
+                    if !found {
+                        if stage == 4 {
+                            late += 1;
+                        } else {
+                            no_detect += 1;
+                            let p = &m.ofdm.p;
+                            let g = Fading::rayleigh(dop).gains(m.fs(), rx.len(), t as u64 + 1);
+                            let pw = |a: usize, b: usize| {
+                                10.0 * (g[a..b].iter().map(|x| x.norm_sqr()).sum::<f32>() / (b - a) as f32).log10()
+                            };
+                            let a0 = truth - p.ncp - p.symbol_len();
+                            let minp = g[a0..truth + p.nfft].iter().map(|x| x.norm_sqr()).fold(f32::MAX, f32::min);
+                            let gh = m.ofdm.demodulate(&rx, truth, hdr).and_then(|f| m.decode_header(&f));
+                            if gh.is_some() {
+                                genie_ok += 1;
+                            }
+                            println!(
+                                "   lost t{t} truth {truth} genie header {}: fade A {:.1} dB, B {:.1} dB, min {:.1} dB",
+                                gh.is_some(),
+                                pw(a0, truth - p.ncp),
+                                pw(truth - p.ncp, truth + p.nfft),
+                                10.0 * minp.log10()
+                            );
+                        }
+                    } else if stage == 2 {
+                        no_header += 1;
+                    } else {
+                        bad_timing += 1;
+                    }
+                }
+                println!(
+                    "{mode} rayleigh:{dop} cnr {cnr}: lost {lost}/{trials}: not detected {no_detect} (genie-timed header ok {genie_ok}), detected elsewhere/late {late}, header failed {no_header}, other {bad_timing}"
+                );
             }
         }
     }
