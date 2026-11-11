@@ -3,11 +3,11 @@ use std::sync::Arc;
 use vardefm_dsp::prng::Prng;
 use vardefm_sim::{transmit, Fading, FmChannelConfig};
 
-fn modem(mode: &str) -> Arc<Modem> {
+pub(crate) fn modem(mode: &str) -> Arc<Modem> {
     Arc::new(Modem::new(OfdmParams::by_name(mode).unwrap(), 0.1))
 }
 
-fn burst(level: u8, ncw: usize, seed: u32) -> Burst {
+pub(crate) fn burst(level: u8, ncw: usize, seed: u32) -> Burst {
     let mut rng = Prng::new(seed);
     let n = Modem::payload_bytes(level);
     Burst {
@@ -28,7 +28,7 @@ fn burst(level: u8, ncw: usize, seed: u32) -> Burst {
 }
 
 /// Push audio in 10 ms chunks, like a sound card would deliver it.
-fn receive(rx: &mut Receiver, audio: &[f32]) -> Vec<RxBurst> {
+pub(crate) fn receive(rx: &mut Receiver, audio: &[f32]) -> Vec<RxBurst> {
     let mut out = Vec::new();
     for chunk in audio.chunks(480) {
         out.extend(rx.push(chunk));
@@ -371,6 +371,64 @@ fn burst_level_ignores_a_squelch_pop_after_the_burst() {
     }
 }
 
+/// Adds noise to data symbol `hit` of the burst at `start`, on the carriers `band` only
+/// (indices into all carriers), at `g` times the signal power per carrier.
+fn coloured_click(m: &Modem, audio: &mut [f32], start: usize, hit: usize, band: std::ops::Range<usize>, g: f32) {
+    let p = &m.ofdm.p;
+    let l = p.symbol_len();
+    let from = start + (hit + 1) * l - p.ncp;
+    let sig = &audio[start..start + 4 * l];
+    let rms = (sig.iter().map(|x| x * x).sum::<f32>() / sig.len() as f32).sqrt();
+    let a = (2.0 * g * rms * rms / p.num_carriers as f32).sqrt();
+    let mut rng = Prng::new(55);
+    for k in band {
+        let f = p.carrier_freq(k);
+        let phase = rng.next_u32() as f32 / u32::MAX as f32 * std::f32::consts::TAU;
+        for (i, x) in audio[from..from + l].iter_mut().enumerate() {
+            *x += a * (std::f32::consts::TAU * f * i as f32 / p.fs + phase).cos();
+        }
+    }
+}
+
+#[test]
+fn coloured_clicks_need_the_per_carrier_profile() {
+    // Every fourth payload symbol is hit by noise on the upper half of the band only,
+    // about 0.3 (narrow) or 1 (wide) times the signal power per carrier: up to a few
+    // hundred times the normal noise there, nothing extra below. One noise scale per
+    // symbol, the average over its pilots, overstates the noise on the clean carriers
+    // and understates it on the hit ones, and most codewords fail; the per-carrier
+    // profile follows the colour. At the time of writing, codewords decoded out of 24
+    // with / without the profile: narrow 24 / 12, wide 22 / 0.
+    for (mode, cnr, g, min_gain) in [("narrow", 24.0, 0.3, 8), ("wide", 33.0, 1.0, 12)] {
+        let m = modem(mode);
+        let (level, ncw) = (6, 4);
+        let nc = m.ofdm.p.num_carriers;
+        let hdr = m.header_symbols();
+        let nsym = hdr + ncw * m.symbols_per_codeword(level);
+        let (mut with, mut without) = (0, 0);
+        for seed in 0..6u32 {
+            let b = burst(level, ncw, 40 + seed);
+            let (mut audio, start) = received(&m, mode, &b, cnr);
+            let hits: Vec<usize> = (hdr + seed as usize % 4..nsym).step_by(4).collect();
+            for &h in &hits {
+                coloured_click(&m, &mut audio, start, h, nc / 2..nc, g);
+            }
+            let known = m.header_carriers(&b.header);
+            let mut frame = m.ofdm.demodulate_known(&audio, start, nsym, &known).unwrap();
+            for &h in &hits {
+                let c = &frame.carrier_noise_scale[h];
+                assert_eq!(c.len(), m.ofdm.data_carriers(), "{mode} seed {seed}: symbol {h} has no profile");
+                let (lo, hi) = (c[..c.len() / 3].iter().sum::<f32>(), c[2 * c.len() / 3..].iter().sum::<f32>());
+                assert!(hi > 3.0 * lo, "{mode} seed {seed} symbol {h}: profile does not follow the colour: {c:?}");
+            }
+            with += m.decode_payload(&b.header, &frame).iter().filter(|p| p.is_some()).count();
+            frame.carrier_noise_scale.iter_mut().for_each(Vec::clear);
+            without += m.decode_payload(&b.header, &frame).iter().filter(|p| p.is_some()).count();
+        }
+        assert!(with >= without + min_gain, "{mode}: {with}/24 codewords with the profile, {without}/24 without");
+    }
+}
+
 /// `rms` sine at `f` Hz, `n` samples starting at `phase`.
 fn sine(f: f32, rms: f32, n: usize, phase: f32) -> Vec<f32> {
     let w = 2.0 * std::f32::consts::PI * f / 48_000.0;
@@ -471,195 +529,5 @@ fn a_non_finite_sample_does_not_hide_a_burst() {
                 assert!(got[0].payload.iter().all(|p| p.is_some()), "{mode}, {bad} at {at}");
             }
         }
-    }
-}
-
-/// Diagnostic: how much of the fading impairment is in the audio itself (genie SNR:
-/// received audio minus the same burst through a clean channel), and how impulsive.
-/// Prints only (no asserts): compare its numbers with the reported SNR by hand.
-/// `cargo test --release -p vardefm-modem fading_diag -- --ignored --nocapture`
-#[test]
-#[ignore]
-fn fading_diag() {
-    for mode in ["narrow", "wide"] {
-        let m = modem(mode);
-        let level = 6;
-        for dop in [5.0f32, 20.0, 80.0] {
-            for cnr in [24.0f32, 60.0] {
-                let mut line = format!("{mode} dop {dop} cnr {cnr}:");
-                for t in 0..4u32 {
-                    let b = burst(level, m.max_ncw(level).min(4), 100 + t);
-                    let audio = m.modulate(&b);
-                    let base = FmChannelConfig { seed: t as u64 + 1, ..FmChannelConfig::by_name(mode).unwrap() };
-                    let clean = transmit(&FmChannelConfig { cnr_db: None, ..base.clone() }, &audio);
-                    let rx = transmit(
-                        &FmChannelConfig { cnr_db: Some(cnr), fading: Some(Fading::rayleigh(dop)), ..base.clone() },
-                        &audio,
-                    );
-                    let l = m.ofdm.p.symbol_len();
-                    let lead = (base.lead_silence_s * m.fs()) as usize + (base.keyup_delay_s * m.fs()) as usize + l;
-                    let end = (base.lead_silence_s * m.fs()) as usize + audio.len();
-                    let mut ratios: Vec<f32> = clean[lead..end]
-                        .chunks_exact(l)
-                        .zip(rx[lead..end].chunks_exact(l))
-                        .filter_map(|(c, r)| {
-                            let s: f32 = c.iter().map(|x| x * x).sum();
-                            let e: f32 = c.iter().zip(r).map(|(a, b)| (a - b).powi(2)).sum();
-                            (s > 1e-9).then_some(e / s)
-                        })
-                        .collect();
-                    let mean = ratios.iter().sum::<f32>() / ratios.len() as f32;
-                    ratios.sort_by(f32::total_cmp);
-                    let med = ratios[ratios.len() / 2];
-                    let got = receive(&mut Receiver::new(m.clone()), &rx);
-                    let (rep, ok) = got
-                        .first()
-                        .map_or((f32::NAN, 0), |g| (g.snr_db, g.payload.iter().filter(|p| p.is_some()).count()));
-                    line += &format!(
-                        " [genie mean {:.1} med {:.1} rep {:.1} ok {}/{}]",
-                        -10.0 * mean.log10(),
-                        -10.0 * med.log10(),
-                        rep,
-                        ok,
-                        b.payload.len()
-                    );
-                }
-                println!("{line}");
-            }
-        }
-    }
-}
-
-/// Diagnostic: for bursts lost on fading channels, which stage failed: detection
-/// (no detection near the true position), the header, or the payload after a decoded
-/// header. For missed detections it also tries the header at the true position.
-/// Prints only. `TRIALS` (64) bursts per case, `MODE` to run one mode.
-/// `cargo test --release -p vardefm-modem fading_loss_stages -- --ignored --nocapture`
-#[test]
-#[ignore]
-fn fading_loss_stages() {
-    let trials: u32 = std::env::var("TRIALS").ok().and_then(|s| s.parse().ok()).unwrap_or(64);
-    let only_mode = std::env::var("MODE").ok();
-    for mode in ["narrow", "wide"] {
-        if only_mode.as_deref().is_some_and(|o| o != mode) {
-            continue;
-        }
-        let m = modem(mode);
-        let hdr = m.header_symbols();
-        for dop in [5.0f32, 20.0] {
-            for cnr in [14.0f32, 17.0, 20.0, 24.0] {
-                let (mut lost, mut no_detect, mut payload_failed, mut no_header, mut late) = (0, 0, 0, 0, 0);
-                let mut genie_ok = 0;
-                for t in 0..trials {
-                    let b = burst(0, 1, 100 + t);
-                    let base = FmChannelConfig { seed: t as u64 + 1, ..FmChannelConfig::by_name(mode).unwrap() };
-                    let audio = m.modulate(&b);
-                    let truth =
-                        m.ofdm.detect(&transmit(&FmChannelConfig { cnr_db: None, ..base.clone() }, &audio), 0).unwrap();
-                    let rx = transmit(
-                        &FmChannelConfig { cnr_db: Some(cnr), fading: Some(Fading::rayleigh(dop)), ..base.clone() },
-                        &audio,
-                    );
-                    let got = receive(&mut Receiver::new(m.clone()), &rx);
-                    if !got.is_empty() {
-                        continue;
-                    }
-                    lost += 1;
-                    // Which stage? Walk the detector like the receiver does.
-                    let mut from = 0;
-                    let mut found = false;
-                    let mut stage = 0;
-                    while let Some(d) = m.ofdm.detect(&rx, from) {
-                        if (d as isize - truth as isize).abs() <= 2 {
-                            found = true;
-                            let header = m.ofdm.demodulate(&rx, d, hdr).and_then(|f| m.decode_header(&f));
-                            stage = if header.is_some() { 3 } else { 2 };
-                            break;
-                        }
-                        if d > truth + m.ofdm.p.symbol_len() {
-                            stage = 4;
-                            break;
-                        }
-                        from = d;
-                    }
-                    if !found {
-                        if stage == 4 {
-                            late += 1;
-                        } else {
-                            no_detect += 1;
-                            let p = &m.ofdm.p;
-                            let g = Fading::rayleigh(dop).gains(m.fs(), rx.len(), t as u64 + 1);
-                            let pw = |a: usize, b: usize| {
-                                10.0 * (g[a..b].iter().map(|x| x.norm_sqr()).sum::<f32>() / (b - a) as f32).log10()
-                            };
-                            let a0 = truth - p.ncp - p.symbol_len();
-                            let minp = g[a0..truth + p.nfft].iter().map(|x| x.norm_sqr()).fold(f32::MAX, f32::min);
-                            let gh = m.ofdm.demodulate(&rx, truth, hdr).and_then(|f| m.decode_header(&f));
-                            if gh.is_some() {
-                                genie_ok += 1;
-                            }
-                            println!(
-                                "   lost t{t} truth {truth} genie header {}: fade A {:.1} dB, B {:.1} dB, min {:.1} dB",
-                                gh.is_some(),
-                                pw(a0, truth - p.ncp),
-                                pw(truth - p.ncp, truth + p.nfft),
-                                10.0 * minp.log10()
-                            );
-                        }
-                    } else if stage == 2 {
-                        no_header += 1;
-                    } else {
-                        payload_failed += 1;
-                    }
-                }
-                println!(
-                    "{mode} rayleigh:{dop} cnr {cnr}: lost {lost}/{trials}: not detected {no_detect} (genie-timed header ok {genie_ok}), detected elsewhere/late {late}, header failed {no_header}, payload failed {payload_failed}"
-                );
-            }
-        }
-    }
-}
-
-#[test]
-fn per_carrier_click_profile_decodes_fast_fading() {
-    // Wide mode, Rayleigh 80 Hz at 60 dB CNR: the random FM of deep fades gives clicks
-    // whose noise is hundreds of times the normal level mid-band but not on the lowest
-    // carriers. With one noise scale per click-hit symbol (the mean over its pilots)
-    // the mid-band LLRs are too confident and a codeword fails in these two bursts;
-    // with the per-carrier profile every codeword decodes.
-    let (mode, level, ncw) = ("wide", 6, 4);
-    let m = modem(mode);
-    for t in [3u32, 7] {
-        let b = burst(level, ncw, 100 + t);
-        let cfg = FmChannelConfig {
-            cnr_db: Some(60.0),
-            fading: Some(Fading::rayleigh(80.0)),
-            seed: t as u64 + 1,
-            ..FmChannelConfig::by_name(mode).unwrap()
-        };
-        let audio = transmit(&cfg, &m.modulate(&b));
-        let start = m.ofdm.detect(&audio, 0).expect("frame not detected");
-        let nsym = m.header_symbols() + ncw * m.symbols_per_codeword(level);
-        let known = m.header_carriers(&b.header);
-        let mut frame = m.ofdm.demodulate_known(&audio, start, nsym, &known).unwrap();
-
-        let profiled: Vec<usize> = (0..nsym).filter(|&i| !frame.carrier_noise_scale[i].is_empty()).collect();
-        assert!(!profiled.is_empty(), "t{t}: no click-hit symbol");
-        let mut max_spread = 0f32;
-        for &i in &profiled {
-            let c = &frame.carrier_noise_scale[i];
-            assert_eq!(c.len(), m.ofdm.data_carriers());
-            let floor = frame.symbol_noise_scale[i] * (1.0 - 1e-5);
-            assert!(c.iter().all(|&s| s >= floor), "t{t} symbol {i}: below its symbol scale");
-            let (lo, hi) = c.iter().fold((f32::MAX, 0f32), |(lo, hi), &s| (lo.min(s), hi.max(s)));
-            max_spread = max_spread.max(hi / lo);
-        }
-        assert!(max_spread > 3.0, "t{t}: click profiles are flat (max spread {max_spread:.1})");
-
-        let ok = m.decode_payload(&b.header, &frame).iter().filter(|p| p.is_some()).count();
-        assert_eq!(ok, ncw, "t{t}: with the per-carrier profile");
-        frame.carrier_noise_scale.iter_mut().for_each(Vec::clear);
-        let ok_flat = m.decode_payload(&b.header, &frame).iter().filter(|p| p.is_some()).count();
-        assert!(ok_flat < ncw, "t{t}: every codeword decodes even with one scale per symbol");
     }
 }

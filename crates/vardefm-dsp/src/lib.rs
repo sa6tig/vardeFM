@@ -7,6 +7,6 @@ pub mod prng;
 pub mod qam;
 
 pub use num_complex::Complex32;
-pub use ofdm::{Frame, Ofdm};
+pub use ofdm::{Frame, Ofdm, ScConfig, ScMetric};
 pub use params::OfdmParams;
 pub use qam::Modulation;

@@ -72,8 +72,12 @@ So BPSK maps bit 0 to −1 and bit 1 to +1.
 
 ### 1.5 Receiver (informative)
 The reference receiver:
-1. Low-pass filters the audio (wide mode only) and runs a Schmidl-Cox autocorrelation.
-2. Confirms the frame by cross-correlating with preamble B.
+1. Low-pass filters the audio (wide mode only) and runs a Schmidl-Cox autocorrelation,
+   normalized by the quieter half of the window (P²/min(R1, R2)², threshold 0.4), so FM
+   noise in one half of preamble A does not hide it; windows whose halves differ by more
+   than 10 dB are ignored.
+2. Confirms the frame by cross-correlating with preamble B, searching the whole plateau
+   (up to 4 cyclic prefixes either side of its centre).
 3. Places the FFT window mid cyclic prefix, which absorbs clock drift of ±ncp/2 samples
    over the frame.
 4. Estimates the channel from preamble B, smoothed across frequency, and decodes the
@@ -83,7 +87,9 @@ The reference receiver:
    that symbol must not corrupt the estimate.
 5. Tracks it with pilots averaged over ±4 symbols and interpolated in magnitude and phase.
 6. Estimates the noise per carrier and, from the pilots, a noise scale per symbol, so
-   that a symbol hit by an FM click or a squelch pop gets low-confidence LLRs.
+   that a symbol hit by an FM click or a squelch pop gets low-confidence LLRs. A symbol
+   with a raised scale gets a per-carrier scale from its own pilots instead, since such
+   noise is often confined to part of the band.
 
 Because the window never moves, a frame should stay shorter than
 `ncp / 2 / (clock error)`. At 100 ppm that is 13 s (narrow) or 6.7 s (wide).

@@ -317,4 +317,7 @@ mod busy_eval;
 mod detect_eval;
 
 #[cfg(test)]
+mod fading_eval;
+
+#[cfg(test)]
 mod level_eval;

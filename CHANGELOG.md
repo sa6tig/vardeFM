@@ -22,6 +22,19 @@ run the same minor version.
   `fading_table` benchmark runs the level table at 5, 20 and 80 Hz Doppler.
 
 ### Changed
+- **Burst detection holds up when noise hits preamble A.** The receiver only; on-air
+  compatible. The Schmidl-Cox metric is normalized by the quieter half of its window
+  (P²/min(R1, R2)², threshold 0.4) instead of the second half (P²/R2², 0.3). Windows
+  whose halves differ by more than 10 dB are gated out. Fine timing searches the whole
+  plateau, up to 4 cyclic prefixes either side. On the simulator (`detector_eval`, 100
+  paired bursts) narrow mode at 5 dB CNR decodes 84 bursts instead of 59, and Rayleigh
+  20 Hz at 14 dB mean CNR 89 (narrow) and 80 (wide) instead of 73 and 72. Detections on
+  carrier noise stay at about the old rate, with no false headers.
+- **Per-carrier noise for click-hit symbols.** A symbol whose noise scale is above 1
+  also gets a per-carrier scale from its own pilots, so noise confined to part of the
+  band (a click in a fast fade, an interferer) weights the LLRs where it is. New in
+  vardefm-dsp: `Frame::carrier_noise_scale` and `Frame::noise_at`. Also new:
+  `Ofdm::detect_with` and `ScConfig` to run other detection settings.
 - **Busy detection measures only the carrier band** (422–2672 Hz narrow, 400–6000 Hz wide).
   A CTCSS tone, mains hum, a DC step or hiss above the band no longer reads as a busy
   channel, and no longer hides a signal inside the band. A keyed carrier with only a CTCSS
