@@ -2,7 +2,8 @@
 what = "Eb/N0 at 1 % FER, BPSK over AWGN, layered offset min-sum, 50 iterations"
 commit = "fd91ee7"
 command = "WRITE=1 TRIALS=1000 cargo test --release -p vardefm-fec fer_curve -- --ignored"
-trials = 4000
+coarse_trials = 1000
+fine_trials = 4000
 
 [[code]]
 name = "header"

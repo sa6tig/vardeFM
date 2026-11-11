@@ -10,7 +10,9 @@
 //! `level_gate` fails when that point has moved by more than `GATE_MARGIN_DB`: CER
 //! must be below 10 % that far above the point and above 10 % that far below.
 //! Each point decodes `GATE_BURSTS` bursts of up to `CODEWORDS` codewords.
-//! Results do not depend on the machine or the number of threads.
+//! Results do not depend on the number of threads. They may differ in the last bits
+//! between platforms whose maths libraries round `ln`, `cos` or `powf` differently,
+//! which moves points near the margin.
 //!
 //! `cargo test --release -p vardefm-modem level_gate -- --ignored --nocapture`
 //!
@@ -31,12 +33,18 @@ use vardefm_sim::{transmit, FmChannelConfig};
 const TARGET_CER: f32 = 0.1;
 /// The gate measures this far either side of the recorded point, dB.
 const GATE_MARGIN_DB: f32 = 0.25;
-/// Bursts per point of the gate. With 4 codewords per burst, sigma at 10 % CER is 1.5 %.
+/// Bursts per point of the gate. With 4 codewords per burst, sigma at 10 % CER is
+/// 1.5 %, taking codewords as independent. The simulator does not fade, so the
+/// codewords of a burst see independent noise; only a burst that fails to
+/// demodulate as a whole, which does not happen near the recorded points, ties them.
 const GATE_BURSTS: u32 = 100;
 /// Bursts per point of the sweep's fine grid.
 const RECORD_BURSTS: u32 = 200;
 /// Bursts per point of the sweep's coarse search for the crossing.
 const COARSE_BURSTS: u32 = 25;
+/// The sweep's search gives up above this CNR, dB: a level that still fails there
+/// has an error floor.
+const MAX_CNR_DB: i32 = 40;
 /// Codewords per burst, or fewer where a level's burst holds fewer.
 const CODEWORDS: usize = 4;
 
@@ -57,6 +65,9 @@ struct Source {
     what: String,
     commit: String,
     command: String,
+    /// Bursts per point of the 1 dB search.
+    coarse_bursts: u32,
+    /// Bursts per point of the recorded grid, `TRIALS`.
     bursts: u32,
     codewords: usize,
 }
@@ -138,19 +149,37 @@ fn crossing(grid: &[f32], rates: &[f32], target: f32) -> Option<f32> {
     Some(x0 + t * (x1 - x0))
 }
 
+/// The rate at `x` on a grid, interpolated in log10 between the neighbouring points
+/// as in [`crossing`], or linearly next to a 0; clamped to the ends of the grid.
+fn rate_at(grid: &[f32], rates: &[f32], x: f32) -> f32 {
+    let Some(i) = grid.windows(2).position(|w| x <= w[1]) else {
+        return rates[rates.len() - 1];
+    };
+    let (x0, x1, y0, y1) = (grid[i], grid[i + 1], rates[i], rates[i + 1]);
+    let t = ((x - x0) / (x1 - x0)).clamp(0.0, 1.0);
+    if y0 > 0.0 && y1 > 0.0 {
+        10f32.powf(y0.log10() + t * (y1.log10() - y0.log10()))
+    } else {
+        y0 + t * (y1 - y0)
+    }
+}
+
 /// The commit of the working tree, marked when it has uncommitted changes other
-/// than recorded baselines.
+/// than recorded baselines; "unknown" without git or outside a repository.
 fn commit() -> String {
     let git = |args: &[&str]| {
         std::process::Command::new("git")
             .args(args)
             .current_dir(env!("CARGO_MANIFEST_DIR"))
             .output()
+            .ok()
+            .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_default()
     };
-    let head = git(&["rev-parse", "--short", "HEAD"]);
-    if git(&["status", "--porcelain", "--", ":/", ":(top,exclude,glob)**/perf/*.toml"]).is_empty() {
+    let Some(head) = git(&["rev-parse", "--short", "HEAD"]) else {
+        return "unknown".into();
+    };
+    if git(&["status", "--porcelain", "--", ":/", ":(top,exclude,glob)**/perf/*.toml"]).is_some_and(|s| s.is_empty()) {
         head
     } else {
         format!("{head}-dirty")
@@ -180,6 +209,7 @@ fn level_sweep() {
             }
             while at(c + 1) >= TARGET_CER {
                 c += 1;
+                assert!(c < MAX_CNR_DB, "{mode} L{level}: CER is still 10 % or more at {MAX_CNR_DB} dB");
             }
             start = c - 2;
             // Whole quarter dB steps, so the recorded grid reads as written.
@@ -192,17 +222,12 @@ fn level_sweep() {
             let cnr_db = (x * 100.0).round() / 100.0;
             let line: String = grid.iter().zip(&rates).map(|(g, r)| format!(" {g:.2}:{r:.3}")).collect();
             println!("{mode} L{level} {}: 10 % CER at {cnr_db:.2} dB;{line}", LEVELS[level as usize].name);
-            // CER the gate would see on either side, from the nearest grid point.
+            // CER the gate would see on either side, interpolated on the grid.
             let sigma = (TARGET_CER * (1.0 - TARGET_CER) / (GATE_BURSTS as usize * codewords(&m, level)) as f32).sqrt();
             for d in [-GATE_MARGIN_DB, GATE_MARGIN_DB] {
-                let i = grid
-                    .iter()
-                    .enumerate()
-                    .min_by(|a, b| (a.1 - x - d).abs().total_cmp(&(b.1 - x - d).abs()))
-                    .unwrap()
-                    .0;
-                if (rates[i] - TARGET_CER).abs() < 3.0 * sigma {
-                    println!("  WARNING: CER {:.3} at {:.2} dB is within 3 sigma of 10 %", rates[i], grid[i]);
+                let r = rate_at(&grid, &rates, x + d);
+                if (r - TARGET_CER).abs() < 3.0 * sigma {
+                    println!("  WARNING: CER {r:.3} at {:.2} dB is within 3 sigma of 10 %", x + d);
                 }
             }
             points.push(Point {
@@ -223,6 +248,7 @@ fn level_sweep() {
                 command: format!(
                     "WRITE=1 TRIALS={bursts} cargo test --release -p vardefm-modem level_sweep -- --ignored"
                 ),
+                coarse_bursts: COARSE_BURSTS,
                 bursts,
                 codewords: CODEWORDS,
             },
@@ -276,6 +302,15 @@ fn crossing_interpolates_in_log() {
     assert!((x - 1.75).abs() < 1e-3, "{x}");
     assert_eq!(crossing(&grid, &[0.3, 0.2, 0.0], 0.1), Some(1.75));
     assert_eq!(crossing(&grid, &[0.05, 0.02, 0.0], 0.1), None);
+}
+
+#[test]
+fn rate_at_interpolates_in_log_and_clamps() {
+    let (grid, rates) = ([1.0, 2.0, 3.0], [0.1, 0.001, 0.0]);
+    assert!((rate_at(&grid, &rates, 1.5) - 0.01).abs() < 1e-5);
+    assert!((rate_at(&grid, &rates, 2.5) - 0.0005).abs() < 1e-7);
+    assert_eq!(rate_at(&grid, &rates, 0.0), 0.1);
+    assert_eq!(rate_at(&grid, &rates, 9.0), 0.0);
 }
 
 #[test]

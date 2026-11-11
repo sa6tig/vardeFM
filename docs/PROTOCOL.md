@@ -118,7 +118,9 @@ Net rate = data bytes of a full burst ÷ its airtime (leader, preambles and head
 included), before link-layer overhead. For each mode and level, the carrier-to-noise
 ratio in the FM channel simulator at which 10 % of codewords fail, decoded from the
 known burst position, is recorded in `crates/vardefm-modem/perf/levels.toml` and checked
-by the `level_gate` test. Detection is not part of it: below about 8 dB (narrow) and
+by the `level_gate` test. That file is the reference; roughly, it runs from 3 dB
+(level 0) to 16 dB (level 6) in narrow mode and from 5 dB to 24 dB in wide mode, and
+error-free decoding begins about half a dB higher. Detection is not part of it: below about 8 dB (narrow) and
 11 dB (wide) some level 1 bursts are not detected at all.
 
 ### 2.3 Header (96 bits before coding)
@@ -183,7 +185,8 @@ within a code. The reference decoder is layered offset min-sum: every
 check-to-variable magnitude is `max(0, min − 0.5)`, with no scaling, for at most 50
 iterations, and input LLRs are clamped to ±40. The Eb/N0 at which each code reaches 1 %
 frame error rate with it on BPSK/AWGN is recorded in `crates/vardefm-fec/perf/ldpc.toml`
-and checked by the `fer_gate` test.
+and checked by the `fer_gate` test. That file is the reference; roughly, the points are
+1.5 dB (rate 1/2), 2.1 dB (2/3), 2.6 dB (3/4), 3.3 dB (5/6) and 2.2 dB (header).
 
 ### 2.5 Scrambling and interleaving
 - Information bits are XORed with xorshift32 bits before encoding. The seed is

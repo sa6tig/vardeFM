@@ -374,6 +374,9 @@ mod curve {
     use std::time::Instant;
 
     /// Frame error rate of `code` at `ebn0_db` (BPSK, AWGN, 50 iterations).
+    /// Trial `t` uses the same data and noise at every Eb/N0, so the points of a
+    /// curve are correlated: the curve is smoother, and a gate's two points are
+    /// paired.
     fn fer(code: &Ldpc, ebn0_db: f32, trials: u32) -> f32 {
         let rate = code.k as f32 / code.n as f32;
         let esn0 = ebn0_db + 10.0 * rate.log10();
@@ -419,6 +422,9 @@ mod curve {
     const GATE_TRIALS: u32 = 4000;
     /// Frames per point of the fine grid that `fer_curve` records.
     const RECORD_TRIALS: u32 = 4000;
+    /// Half-width of that grid in 0.05 dB steps: ±0.4 dB, so that a coarse crossing
+    /// one 0.25 dB step off at few frames still leaves the true one inside.
+    const FINE_STEPS: i32 = 8;
 
     /// The recorded 1 % FER points, `perf/ldpc.toml`.
     const BASELINE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/perf/ldpc.toml");
@@ -437,7 +443,10 @@ mod curve {
         what: String,
         commit: String,
         command: String,
-        trials: u32,
+        /// Frames per point of the 0.25 dB search, `TRIALS`.
+        coarse_trials: u32,
+        /// Frames per point of the recorded grid.
+        fine_trials: u32,
     }
 
     #[derive(serde::Serialize, serde::Deserialize)]
@@ -484,18 +493,23 @@ mod curve {
     }
 
     /// The commit of the working tree, marked when it has uncommitted changes other
-    /// than recorded baselines.
+    /// than recorded baselines; "unknown" without git or outside a repository.
     fn commit() -> String {
         let git = |args: &[&str]| {
             std::process::Command::new("git")
                 .args(args)
                 .current_dir(env!("CARGO_MANIFEST_DIR"))
                 .output()
+                .ok()
+                .filter(|o| o.status.success())
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                .unwrap_or_default()
         };
-        let head = git(&["rev-parse", "--short", "HEAD"]);
-        if git(&["status", "--porcelain", "--", ":/", ":(top,exclude,glob)**/perf/*.toml"]).is_empty() {
+        let Some(head) = git(&["rev-parse", "--short", "HEAD"]) else {
+            return "unknown".into();
+        };
+        if git(&["status", "--porcelain", "--", ":/", ":(top,exclude,glob)**/perf/*.toml"])
+            .is_some_and(|s| s.is_empty())
+        {
             head
         } else {
             format!("{head}-dirty")
@@ -508,8 +522,9 @@ mod curve {
 
     /// Prints build time and frame error rate vs Eb/N0 for every code (BPSK, AWGN),
     /// 200 frames per point (or `TRIALS`) in 0.25 dB steps from 0.5 dB; a curve ends
-    /// after two error-free points in a row. Then measures the 1 % FER point on a
-    /// 0.05 dB grid around it; with `WRITE=1`, records the points in `perf/ldpc.toml`.
+    /// after two error-free points in a row. With `WRITE=1`, it then measures the
+    /// 1 % FER point on a 0.05 dB grid of `RECORD_TRIALS` frames per point around
+    /// the coarse crossing and records the points in `perf/ldpc.toml`.
     /// `cargo test --release -p vardefm-fec fer_curve -- --ignored --nocapture`
     #[test]
     #[ignore]
@@ -539,10 +554,13 @@ mod curve {
                 }
             }
             println!("  {line}");
+            if !write {
+                continue;
+            }
             let coarse = crossing(&grid, &rates, TARGET_FER).expect("the coarse grid does not cross 1 % FER");
             // Whole steps of 0.05 dB, so the recorded grid reads as written.
             let centre = (coarse * 20.0).round() as i32;
-            let grid: Vec<f32> = (centre - 4..=centre + 4).map(|i| i as f32 / 20.0).collect();
+            let grid: Vec<f32> = (centre - FINE_STEPS..=centre + FINE_STEPS).map(|i| i as f32 / 20.0).collect();
             let rates: Vec<f32> = grid.iter().map(|&e| fer(&code, e, RECORD_TRIALS)).collect();
             let ebn0_db = crossing(&grid, &rates, TARGET_FER).expect("the fine grid does not cross 1 % FER");
             let ebn0_db = (ebn0_db * 100.0).round() / 100.0;
@@ -558,7 +576,8 @@ mod curve {
                     command: format!(
                         "WRITE=1 TRIALS={trials} cargo test --release -p vardefm-fec fer_curve -- --ignored"
                     ),
-                    trials: RECORD_TRIALS,
+                    coarse_trials: trials,
+                    fine_trials: RECORD_TRIALS,
                 },
                 code: points,
             };
