@@ -30,7 +30,7 @@ use vardefm_sim::{transmit, FmChannelConfig};
 /// Codeword error rate at which a level's point is recorded and gated.
 const TARGET_CER: f32 = 0.1;
 /// The gate measures this far either side of the recorded point, dB.
-const GATE_MARGIN_DB: f32 = 0.5;
+const GATE_MARGIN_DB: f32 = 0.25;
 /// Bursts per point of the gate. With 4 codewords per burst, sigma at 10 % CER is 1.5 %.
 const GATE_BURSTS: u32 = 100;
 /// Bursts per point of the sweep's fine grid.
