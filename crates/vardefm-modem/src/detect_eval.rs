@@ -363,15 +363,15 @@ fn detector_eval() {
     }
 }
 
-/// The harness itself: on a strong signal every detector and the genie decode every
-/// burst, and no detector raises a false header on a carrier at -10 dB CNR. `hit` is
-/// a diagnostic, so it is not required here.
 #[test]
 fn on_every_core_keeps_trial_order() {
     assert_eq!(on_every_core(37, |t| t), (0..37).collect::<Vec<_>>());
     assert!(on_every_core(0, |t| t).is_empty());
 }
 
+/// The harness itself: on a strong signal every detector and the genie decode every
+/// burst, and no detector raises a false header on a carrier at -10 dB CNR. `hit` is
+/// a diagnostic, so it is not required here.
 #[test]
 fn harness_sees_strong_bursts_and_no_false_headers() {
     for mode in ["narrow", "wide"] {

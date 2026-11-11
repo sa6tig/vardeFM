@@ -206,7 +206,8 @@ struct Case<'a> {
     ncw: usize,
     /// Where preamble B lands, the same in every trial.
     truth: usize,
-    /// The header's carriers, the channel training; every trial sends the same header.
+    /// The header's carriers, the channel training of a level's codewords; every
+    /// trial sends the same header. Empty for the header itself.
     training: Vec<Vec<Complex32>>,
 }
 
@@ -217,7 +218,11 @@ impl<'a> Case<'a> {
             Target::Level(l) => (l, m.max_ncw(l).min(CODEWORDS)),
         };
         let truth = true_position(m, mode, level, ncw);
-        let training = m.header_carriers(&burst(level, ncw, payload_seed(0)).header);
+        let training = match target {
+            // The header is decoded without training.
+            Target::Header => Vec::new(),
+            Target::Level(_) => m.header_carriers(&burst(level, ncw, payload_seed(0)).header),
+        };
         Case { m, mode, target, level, ncw, truth, training }
     }
 
@@ -387,6 +392,13 @@ fn level_sweep() {
         }
     }
     if write {
+        // A grid that cannot carry the gate stops the run instead of reaching the file.
+        for (points, margin) in [(&header, HEADER_MARGIN_DB), (&level, GATE_MARGIN_DB)] {
+            for p in points {
+                let at = format!("{} {}", p.mode, p.name);
+                check_point(&at, &p.grid_db, &p.rate, p.cnr_db, TARGET_RATE, margin);
+            }
+        }
         let b = Baseline {
             source: Source {
                 what: "CNR at 10 % header and codeword error rate, decoded from the known burst position".into(),

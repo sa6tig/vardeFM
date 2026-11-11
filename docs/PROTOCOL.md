@@ -123,10 +123,10 @@ is the reference; roughly, it runs from 3 dB (level 0) to 16 dB (level 6) in nar
 mode and from 5 dB to 24 dB in wide mode. Error-free decoding begins about half a dB
 higher at the low levels and about 1 dB higher at levels 5 and 6. These are payload
 figures. The header, decoded from preamble B alone, is recorded separately in the same
-file: it reaches 10 % header errors at about 3.7 dB (narrow) and 5.8 dB (wide), above
+file: it reaches 10 % header errors at about 3.7 dB (narrow) and 5.9 dB (wide), above
 level 0's point, and its error rate falls much more slowly than the payload's, so at
-the low levels the header limits a burst. Detection is not part of either. Below about 8 dB (narrow) and 11 dB (wide) some level 1
-bursts are not detected at all.
+the low levels the header limits a burst. Detection is not part of either. Below about
+8 dB (narrow) and 11 dB (wide) some level 1 bursts are not detected at all.
 
 ### 2.3 Header (96 bits before coding)
 80 bits of fields, MSB first, then a CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF) over

@@ -560,17 +560,32 @@ mod curve {
                 continue;
             }
             let coarse = crossing(&grid, &rates, TARGET_FER).expect("the coarse grid does not cross 1 % FER");
-            // Whole steps of 0.05 dB, so the recorded grid reads as written.
-            let centre = (coarse * 20.0).round() as i32;
-            let grid: Vec<f32> = (centre - FINE_STEPS..=centre + FINE_STEPS).map(|i| i as f32 / 20.0).collect();
-            let rates: Vec<f32> = grid.iter().map(|&e| fer(&code, e, RECORD_TRIALS)).collect();
-            let ebn0_db = crossing(&grid, &rates, TARGET_FER).expect("the fine grid does not cross 1 % FER");
-            let ebn0_db = (ebn0_db * 100.0).round() / 100.0;
+            // Whole steps of 0.05 dB, so the recorded grid reads as written. At few
+            // frames the coarse crossing can sit a step or two off, so the grid is
+            // centred again on its own crossing until the gate's points lie on it.
+            let mut centre = (coarse * 20.0).round() as i32;
+            let (grid, rates, ebn0_db) = loop {
+                let grid: Vec<f32> = (centre - FINE_STEPS..=centre + FINE_STEPS).map(|i| i as f32 / 20.0).collect();
+                let rates: Vec<f32> = grid.iter().map(|&e| fer(&code, e, RECORD_TRIALS)).collect();
+                let x = crossing(&grid, &rates, TARGET_FER).expect("the fine grid does not cross 1 % FER");
+                let x = (x * 100.0).round() / 100.0;
+                let on_grid = grid[0] <= x - GATE_MARGIN_DB && x + GATE_MARGIN_DB <= grid[grid.len() - 1];
+                let next = (x * 20.0).round() as i32;
+                if on_grid || next == centre {
+                    break (grid, rates, x);
+                }
+                println!("  fine grid centred again: {:.2} -> {:.2} dB", centre as f32 / 20.0, next as f32 / 20.0);
+                centre = next;
+            };
             println!("  1 % FER at {ebn0_db:.2} dB");
             points.push(Point { name: name.into(), n, k, ebn0_db, grid_db: grid, fer: rates });
         }
         println!("all codes built in {total:.1} ms");
         if write {
+            // A grid that cannot carry the gate stops the run instead of reaching the file.
+            for p in &points {
+                check_point(&format!("({},{})", p.n, p.k), p);
+            }
             let b = Baseline {
                 source: Source {
                     what: "Eb/N0 at 1 % FER, BPSK over AWGN, layered offset min-sum, 50 iterations".into(),
@@ -640,14 +655,19 @@ mod curve {
             let p = base.point(n, k);
             let at = format!("{BASELINE}: ({n},{k})");
             assert_eq!(p.name, name, "{at} is named {:?}", p.name);
-            let (grid, rates) = (&p.grid_db, &p.fer);
-            assert_eq!(grid.len(), rates.len(), "{at}: grid and rates differ in length");
-            assert!(grid.windows(2).all(|w| w[0] < w[1]), "{at}: grid is not increasing");
-            let x = crossing(grid, rates, TARGET_FER).unwrap_or_else(|| panic!("{at}: the grid does not cross 1 %"));
-            let point = p.ebn0_db;
-            assert!(((x * 100.0).round() / 100.0 - point).abs() < 1e-3, "{at}: recorded {point}, grid crosses at {x}");
-            let (lo, hi) = (point - GATE_MARGIN_DB, point + GATE_MARGIN_DB);
-            assert!(grid[0] <= lo && hi <= grid[grid.len() - 1], "{at}: gate points off the grid");
+            check_point(&at, p);
         }
+    }
+
+    /// A recorded point is the crossing of its own grid, and the gate's two points
+    /// lie on that grid.
+    fn check_point(at: &str, p: &Point) {
+        let (grid, rates, point) = (&p.grid_db, &p.fer, p.ebn0_db);
+        assert_eq!(grid.len(), rates.len(), "{at}: grid and rates differ in length");
+        assert!(grid.windows(2).all(|w| w[0] < w[1]), "{at}: grid is not increasing");
+        let x = crossing(grid, rates, TARGET_FER).unwrap_or_else(|| panic!("{at}: the grid does not cross 1 %"));
+        assert!(((x * 100.0).round() / 100.0 - point).abs() < 1e-3, "{at}: recorded {point}, grid crosses at {x}");
+        let (lo, hi) = (point - GATE_MARGIN_DB, point + GATE_MARGIN_DB);
+        assert!(grid[0] <= lo && hi <= grid[grid.len() - 1], "{at}: gate points off the grid");
     }
 }
