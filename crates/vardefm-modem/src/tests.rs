@@ -476,6 +476,8 @@ fn a_non_finite_sample_does_not_hide_a_burst() {
 
 /// Diagnostic: how much of the fading impairment is in the audio itself (genie SNR:
 /// received audio minus the same burst through a clean channel), and how impulsive.
+/// Prints only (no asserts): compare its numbers with the reported SNR by hand.
+/// `cargo test --release -p vardefm-modem fading_diag -- --ignored --nocapture`
 #[test]
 #[ignore]
 fn fading_diag() {
@@ -498,12 +500,12 @@ fn fading_diag() {
                     let lead = (base.lead_silence_s * m.fs()) as usize + (base.keyup_delay_s * m.fs()) as usize + l;
                     let end = (base.lead_silence_s * m.fs()) as usize + audio.len();
                     let mut ratios: Vec<f32> = clean[lead..end]
-                        .chunks(l)
-                        .zip(rx[lead..end].chunks(l))
-                        .map(|(c, r)| {
+                        .chunks_exact(l)
+                        .zip(rx[lead..end].chunks_exact(l))
+                        .filter_map(|(c, r)| {
                             let s: f32 = c.iter().map(|x| x * x).sum();
                             let e: f32 = c.iter().zip(r).map(|(a, b)| (a - b).powi(2)).sum();
-                            e / s
+                            (s > 1e-9).then_some(e / s)
                         })
                         .collect();
                     let mean = ratios.iter().sum::<f32>() / ratios.len() as f32;
@@ -529,7 +531,10 @@ fn fading_diag() {
 }
 
 /// Diagnostic: for bursts lost on fading channels, which stage failed: detection
-/// (Schmidl-Cox plateau), fine timing (preamble B) or the header.
+/// (no detection near the true position), the header, or the payload after a decoded
+/// header. For missed detections it also tries the header at the true position.
+/// Prints only. `TRIALS` (64) bursts per case, `MODE` to run one mode.
+/// `cargo test --release -p vardefm-modem fading_loss_stages -- --ignored --nocapture`
 #[test]
 #[ignore]
 fn fading_loss_stages() {
@@ -543,7 +548,7 @@ fn fading_loss_stages() {
         let hdr = m.header_symbols();
         for dop in [5.0f32, 20.0] {
             for cnr in [14.0f32, 17.0, 20.0, 24.0] {
-                let (mut lost, mut no_detect, mut bad_timing, mut no_header, mut late) = (0, 0, 0, 0, 0);
+                let (mut lost, mut no_detect, mut payload_failed, mut no_header, mut late) = (0, 0, 0, 0, 0);
                 let mut genie_ok = 0;
                 for t in 0..trials {
                     let b = burst(0, 1, 100 + t);
@@ -567,8 +572,8 @@ fn fading_loss_stages() {
                     while let Some(d) = m.ofdm.detect(&rx, from) {
                         if (d as isize - truth as isize).abs() <= 2 {
                             found = true;
-                            let f = m.ofdm.demodulate(&rx, d, hdr).unwrap();
-                            stage = if m.decode_header(&f).is_some() { 3 } else { 2 };
+                            let header = m.ofdm.demodulate(&rx, d, hdr).and_then(|f| m.decode_header(&f));
+                            stage = if header.is_some() { 3 } else { 2 };
                             break;
                         }
                         if d > truth + m.ofdm.p.symbol_len() {
@@ -604,13 +609,57 @@ fn fading_loss_stages() {
                     } else if stage == 2 {
                         no_header += 1;
                     } else {
-                        bad_timing += 1;
+                        payload_failed += 1;
                     }
                 }
                 println!(
-                    "{mode} rayleigh:{dop} cnr {cnr}: lost {lost}/{trials}: not detected {no_detect} (genie-timed header ok {genie_ok}), detected elsewhere/late {late}, header failed {no_header}, other {bad_timing}"
+                    "{mode} rayleigh:{dop} cnr {cnr}: lost {lost}/{trials}: not detected {no_detect} (genie-timed header ok {genie_ok}), detected elsewhere/late {late}, header failed {no_header}, payload failed {payload_failed}"
                 );
             }
         }
+    }
+}
+
+#[test]
+fn per_carrier_click_profile_decodes_fast_fading() {
+    // Wide mode, Rayleigh 80 Hz at 60 dB CNR: the random FM of deep fades gives clicks
+    // whose noise is hundreds of times the normal level mid-band but not on the lowest
+    // carriers. With one noise scale per click-hit symbol (the mean over its pilots)
+    // the mid-band LLRs are too confident and a codeword fails in these two bursts;
+    // with the per-carrier profile every codeword decodes.
+    let (mode, level, ncw) = ("wide", 6, 4);
+    let m = modem(mode);
+    for t in [3u32, 7] {
+        let b = burst(level, ncw, 100 + t);
+        let cfg = FmChannelConfig {
+            cnr_db: Some(60.0),
+            fading: Some(Fading::rayleigh(80.0)),
+            seed: t as u64 + 1,
+            ..FmChannelConfig::by_name(mode).unwrap()
+        };
+        let audio = transmit(&cfg, &m.modulate(&b));
+        let start = m.ofdm.detect(&audio, 0).expect("frame not detected");
+        let nsym = m.header_symbols() + ncw * m.symbols_per_codeword(level);
+        let known = m.header_carriers(&b.header);
+        let mut frame = m.ofdm.demodulate_known(&audio, start, nsym, &known).unwrap();
+
+        let profiled: Vec<usize> = (0..nsym).filter(|&i| !frame.carrier_noise_scale[i].is_empty()).collect();
+        assert!(!profiled.is_empty(), "t{t}: no click-hit symbol");
+        let mut max_spread = 0f32;
+        for &i in &profiled {
+            let c = &frame.carrier_noise_scale[i];
+            assert_eq!(c.len(), m.ofdm.data_carriers());
+            let floor = frame.symbol_noise_scale[i] * (1.0 - 1e-5);
+            assert!(c.iter().all(|&s| s >= floor), "t{t} symbol {i}: below its symbol scale");
+            let (lo, hi) = c.iter().fold((f32::MAX, 0f32), |(lo, hi), &s| (lo.min(s), hi.max(s)));
+            max_spread = max_spread.max(hi / lo);
+        }
+        assert!(max_spread > 3.0, "t{t}: click profiles are flat (max spread {max_spread:.1})");
+
+        let ok = m.decode_payload(&b.header, &frame).iter().filter(|p| p.is_some()).count();
+        assert_eq!(ok, ncw, "t{t}: with the per-carrier profile");
+        frame.carrier_noise_scale.iter_mut().for_each(Vec::clear);
+        let ok_flat = m.decode_payload(&b.header, &frame).iter().filter(|p| p.is_some()).count();
+        assert!(ok_flat < ncw, "t{t}: every codeword decodes even with one scale per symbol");
     }
 }

@@ -18,6 +18,11 @@ use std::sync::Arc;
 
 const PILOT_TABLE_LEN: usize = 32;
 const DETECT_THRESHOLD: f64 = 0.3;
+/// Schmidl-Cox windows whose halves differ in energy by more than this ratio (10 dB)
+/// are not considered.
+const MIN_HALF_ENERGY_RATIO: f64 = 0.1;
+/// Fine timing searches at most this many cyclic prefixes either side of the plateau.
+const MAX_TIMING_SPAN_CP: usize = 4;
 /// Pilots are averaged over this many symbols either side.
 const TRACK_HALF_WINDOW: usize = 4;
 const MIN_PREAMBLE_CORR: f32 = 0.3;
@@ -58,10 +63,12 @@ pub struct Frame {
     /// a symbol hit by an FM click, a squelch pop or a short fade.
     pub symbol_noise_scale: Vec<f32>,
     /// Per symbol: empty when `symbol_noise_scale[i]` applies to every carrier, else
-    /// one scale per data carrier that replaces it. An FM click's noise is far from
-    /// flat across the band (on a fast-fading wide channel, up to 800 times the normal
-    /// level mid-band and little extra on the lowest carriers, where the normal noise
-    /// is already high), so a hit symbol gets its own noise profile from its pilots.
+    /// one scale per data carrier that replaces it, never below `symbol_noise_scale[i]`.
+    /// An FM click's noise is far from flat across the band (on a fast-fading wide
+    /// channel, up to 800 times the normal level mid-band against a few times on the
+    /// lowest carriers), so the one per-symbol scale, an average over the pilots,
+    /// understates it mid-band; there the profile from the symbol's own pilots raises it.
+    /// It does not lower the scale anywhere (flooring at 1 instead measured no better).
     pub carrier_noise_scale: Vec<Vec<f32>>,
     /// Average SNR per symbol (Es/N0) in dB.
     pub snr_db: f32,
@@ -71,6 +78,8 @@ pub struct Frame {
 
 impl Frame {
     /// Noise variance of symbol `i`, data carrier `j`.
+    ///
+    /// Panics if `i` or `j` is out of range (`symbols.len()`, `noise_var.len()`).
     pub fn noise_at(&self, i: usize, j: usize) -> f32 {
         let s = self.carrier_noise_scale.get(i).and_then(|c| c.get(j)).copied();
         self.noise_var[j] * s.unwrap_or(self.symbol_noise_scale[i])
@@ -276,7 +285,9 @@ impl Ofdm {
         let x = |i: usize| sc[i] as f64;
         // Normalized by the energy of both halves (not the second half squared): a burst
         // of FM noise from a fade in one half then lowers the metric by its energy ratio
-        // instead of that ratio squared.
+        // instead of that ratio squared. That metric alone no longer penalizes halves of
+        // very different level (a ring-down, a tone keying up), so such windows are gated
+        // out by `MIN_HALF_ENERGY_RATIO`.
         let mut p = 0f64;
         let mut r = 0f64;
         let mut r1 = 0f64;
@@ -289,7 +300,9 @@ impl Ofdm {
         let mut plateau: Option<(usize, usize)> = None;
         let mut d = 0;
         while d + n + 2 * l < sc.len() {
-            let metric = if r > energy_floor && r1 > energy_floor && p > 0.0 { p * p / (r * r1) } else { 0.0 };
+            let balanced = r.min(r1) >= MIN_HALF_ENERGY_RATIO * r.max(r1);
+            let metric =
+                if r > energy_floor && r1 > energy_floor && p > 0.0 && balanced { p * p / (r * r1) } else { 0.0 };
             match (&mut plateau, metric > DETECT_THRESHOLD) {
                 (None, true) => plateau = Some((d, d)),
                 (Some((_, end)), true) => *end = d,
@@ -298,9 +311,12 @@ impl Ofdm {
                     plateau = None;
                     if end - start >= ncp / 4 {
                         // Noise in part of preamble A skews the plateau, so its centre
-                        // can miss by more than the cyclic prefix: search all of it.
+                        // can miss by more than the cyclic prefix: search all of it, up
+                        // to `MAX_TIMING_SPAN_CP` cyclic prefixes either way (a long
+                        // plateau from a tone or hum would otherwise give a wide search
+                        // and more chances of a false lock).
                         let a0 = from + ((start + end) / 2).saturating_sub(ncp / 2);
-                        let span = ncp.max((end - start) / 2 + ncp / 2);
+                        let span = ((end - start) / 2 + ncp / 2).clamp(ncp, MAX_TIMING_SPAN_CP * ncp);
                         if let Some(b) = self.fine_timing(rx, a0 + l + ncp, span) {
                             return Some(b);
                         }
@@ -469,6 +485,8 @@ impl Ofdm {
         // The reported SNR averages the noise over all symbols, click-hit ones included,
         // as it did before there was a per-symbol scale. Scale the unclamped variance:
         // on a nearly noiseless frame the floor would otherwise be multiplied too.
+        // It uses the per-symbol scales, not `carrier_noise_scale` (which only refines
+        // the LLRs), so that it stays comparable with the link's SNR thresholds.
         let mean_var = raw_var.iter().sum::<f32>() / raw_var.len() as f32;
         let mean_scale = scale.iter().sum::<f32>() / nsym.max(1) as f32;
 
@@ -718,6 +736,93 @@ mod tests {
             }
             assert_eq!(out, bits, "{}", ofdm.p.name);
             println!("{}: SNR at rms 0.5 without noise {:.1} dB", ofdm.p.name, frame.snr_db);
+        }
+    }
+
+    /// In-band noise: random OFDM symbols (no preamble), scaled to `rms`.
+    fn inband_noise(ofdm: &Ofdm, len: usize, rms_level: f32, seed: u32) -> Vec<f32> {
+        let mut rng = Prng::new(seed);
+        let nc = ofdm.p.num_carriers;
+        let mut x = Vec::with_capacity(len + ofdm.p.symbol_len());
+        while x.len() < len {
+            let c: Vec<Complex32> = (0..nc).map(|_| Complex32::new(rng.bpsk(), rng.bpsk())).collect();
+            x.extend(ofdm.symbol_time(&c));
+        }
+        x.truncate(len);
+        let g = rms_level / rms(&x);
+        x.iter_mut().for_each(|v| *v *= g);
+        x
+    }
+
+    #[test]
+    fn detects_with_a_noise_burst_in_preamble_a() {
+        // A fade puts FM noise into the second half of preamble A's body. Normalized
+        // only by the second half's energy, squared, the Schmidl-Cox metric fell from
+        // about 1 to 1/2.4^2 = 0.17, below the threshold; normalized by both halves it
+        // is about 1/2.4.
+        for p in [OfdmParams::narrow(), OfdmParams::wide()] {
+            let ofdm = Ofdm::new(p);
+            let data = random_frame(&ofdm, Modulation::Qpsk, 6, 9);
+            let lead = 1000;
+            let mut rx = vec![0.0; lead];
+            rx.extend(ofdm.modulate_with_leader(&data, 0.1));
+            rx.extend(vec![0.0; 2000]);
+            let clean = ofdm.detect(&rx, 0).expect("frame not detected");
+            let (n, ncp, l) = (ofdm.p.nfft, ofdm.p.ncp, ofdm.p.symbol_len());
+            // Preamble B's body starts at `clean`, so A's body at `clean - l`.
+            let a_body = clean - l;
+            let (from, to) = (a_body + n / 2, a_body + n);
+            let level = rms(&rx[a_body..a_body + n]);
+            let noise = inband_noise(&ofdm, to - from, 1.2 * level, 3);
+            rx[from..to].iter_mut().zip(&noise).for_each(|(x, v)| *x += v);
+            let b = ofdm.detect(&rx, 0).expect("frame not detected with a noise burst in preamble A");
+            assert!((b as isize - clean as isize).abs() <= 2, "{}: {b} vs {clean} (ncp {ncp})", ofdm.p.name);
+        }
+    }
+
+    #[test]
+    fn no_false_lock_on_tones_hum_or_noise() {
+        // Tones at multiples of fs/(nfft/2) repeat every half window, so the
+        // Schmidl-Cox metric sits near 1 while they last; keyed on and off, each
+        // plateau ends and goes to fine timing, which must reject it. Rising and
+        // decaying tones give halves of very different energy.
+        let fs = 48_000.0f32;
+        let secs = 3.0;
+        let len = (fs * secs) as usize;
+        let keyed = |f: f32, shape: &dyn Fn(f32) -> f32| -> Vec<f32> {
+            (0..len)
+                .map(|i| {
+                    let t = i as f32 / fs;
+                    let phase_in_period = (t % 0.5) / 0.5;
+                    let env = if phase_in_period < 0.6 { shape(t % 0.5) } else { 0.0 };
+                    0.3 * env * (2.0 * std::f32::consts::PI * f * t).sin()
+                })
+                .collect()
+        };
+        for p in [OfdmParams::narrow(), OfdmParams::wide()] {
+            let ofdm = Ofdm::new(p);
+            let periodic = fs / (ofdm.p.nfft / 2) as f32 * 10.0;
+            let mut cases: Vec<(&str, Vec<f32>)> = vec![
+                ("keyed tone", keyed(periodic, &|_| 1.0)),
+                ("keyed 1500 Hz", keyed(1500.0, &|_| 1.0)),
+                ("ring-down", keyed(periodic, &|t| (-t / 0.02).exp())),
+                ("rising tone", keyed(periodic, &|t| (t / 0.3).min(1.0).powi(3))),
+            ];
+            let hum: Vec<f32> = (0..len)
+                .map(|i| {
+                    let t = i as f32 / fs;
+                    [50.0f32, 150.0, 250.0].iter().map(|f| 0.1 * (2.0 * std::f32::consts::PI * f * t).sin()).sum()
+                })
+                .collect();
+            cases.push(("hum", hum));
+            let mut rng = Prng::new(11);
+            cases.push((
+                "white noise",
+                (0..len).map(|_| 0.2 * (rng.next_u32() as f32 / u32::MAX as f32 - 0.5)).collect(),
+            ));
+            for (name, x) in cases {
+                assert_eq!(ofdm.detect(&x, 0), None, "{}: false lock on {name}", ofdm.p.name);
+            }
         }
     }
 }
