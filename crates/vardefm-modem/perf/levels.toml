@@ -1,6 +1,6 @@
 [source]
 what = "CNR at 10 % header and codeword error rate, decoded from the known burst position"
-commit = "d73b522-dirty"
+commit = "a7f0dcf"
 command = "WRITE=1 TRIALS=200 cargo test --release -p vardefm-modem level_sweep -- --ignored"
 coarse_bursts = 25
 bursts = 200
