@@ -87,10 +87,7 @@ The reference receiver:
    that symbol must not corrupt the estimate.
 5. Tracks it with pilots averaged over ±4 symbols and interpolated in magnitude and phase.
 6. Estimates the noise per carrier and, from the pilots, a noise scale per symbol, so
-   that a symbol hit by an FM click or a squelch pop gets low-confidence LLRs. A symbol
-   with a raised scale whose pilots show the noise to be uneven across the band (one
-   half more than 4 times the other) gets a per-carrier scale from its own pilots
-   instead.
+   that a symbol hit by an FM click or a squelch pop gets low-confidence LLRs.
 
 Because the window never moves, a frame should stay shorter than
 `ncp / 2 / (clock error)`. At 100 ppm that is 13 s (narrow) or 6.7 s (wide).

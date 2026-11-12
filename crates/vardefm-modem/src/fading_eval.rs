@@ -11,7 +11,7 @@
 //! Environment: `MODES` (narrow,wide), `LEVEL` (6).
 
 use super::*;
-use crate::detect_eval::{env_list, env_modes, env_or};
+use crate::detect_eval::{env_modes, env_or};
 use crate::tests::{burst, modem, receive};
 use vardefm_sim::{transmit, Fading, FmChannelConfig};
 
@@ -65,66 +65,6 @@ fn fading_diag() {
                     );
                 }
                 println!("{line}");
-            }
-        }
-    }
-}
-
-/// Paired measurement of the per-carrier noise profile (`Frame::carrier_noise_scale`)
-/// on fading channels: each burst decoded with the profile and with it cleared.
-/// Prints codewords decoded each way and bursts helped / hurt.
-///
-/// `cargo test --release -p vardefm-modem click_profile_gain -- --ignored --nocapture`
-///
-/// Environment: `MODES` (narrow,wide), `LEVEL` (6), `TRIALS` bursts per cell (48),
-/// `FADINGS` (rayleigh:20,rayleigh:80), `CNRS` (dB list, 33,40,60).
-#[test]
-#[ignore]
-fn click_profile_gain() {
-    let modes = env_modes("narrow,wide");
-    let level: u8 = env_or("LEVEL", 6);
-    assert!((level as usize) < LEVELS.len(), "LEVEL {level}: levels are 0 to {}", LEVELS.len() - 1);
-    let trials: u32 = env_or("TRIALS", 48);
-    let fadings: Vec<Fading> = env_list("FADINGS", "rayleigh:20,rayleigh:80");
-    let cnrs: Vec<f32> = env_list("CNRS", "33,40,60");
-    let ncw = 4;
-    for mode in modes.iter().map(String::as_str) {
-        let m = modem(mode);
-        let nsym = m.header_symbols() + ncw * m.symbols_per_codeword(level);
-        for &f in &fadings {
-            for &cnr in &cnrs {
-                let (mut with, mut without, mut helped, mut hurt, mut total) = (0, 0, 0, 0, 0);
-                for t in 0..trials {
-                    let b = burst(level, ncw, 100 + t);
-                    let cfg = FmChannelConfig {
-                        cnr_db: Some(cnr),
-                        fading: Some(f),
-                        seed: t as u64 + 1,
-                        ..FmChannelConfig::by_name(mode).unwrap()
-                    };
-                    let audio = transmit(&cfg, &m.modulate(&b));
-                    let Some(start) = m.ofdm.detect(&audio, 0) else { continue };
-                    let known = m.header_carriers(&b.header);
-                    let Some(mut frame) = m.ofdm.demodulate_known(&audio, start, nsym, &known) else { continue };
-                    let ok = |frame: &Frame| -> usize {
-                        m.decode_payload(&b.header, frame)
-                            .iter()
-                            .zip(&b.payload)
-                            .filter(|(got, want)| got.as_ref() == Some(*want))
-                            .count()
-                    };
-                    let a = ok(&frame);
-                    frame.carrier_noise_scale.iter_mut().for_each(Vec::clear);
-                    let c = ok(&frame);
-                    with += a;
-                    without += c;
-                    helped += (a > c) as u32;
-                    hurt += (a < c) as u32;
-                    total += ncw;
-                }
-                println!(
-                    "{mode} L{level} {f} {cnr} dB: codewords {with}/{total} with the profile, {without}/{total} without; bursts helped {helped}, hurt {hurt}"
-                );
             }
         }
     }

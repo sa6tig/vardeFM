@@ -26,7 +26,8 @@ const DETECT_THRESHOLD: f64 = 0.4;
 /// halves 10 dB apart pass at ρ² = 0.04. The energy ratio counts at most this much, so
 /// such a window needs ρ² above 0.4/3. In `detect_eval` the cap took detections on a
 /// weak carrier (5 dB CNR) from 6-10 per minute to 0-2, below the classic detector's
-/// 1-10, and cost at most 3 of 100 bursts at any CNR (none significant).
+/// 1-10. On the static channel and at 20 Hz Doppler (it was not run at 5 Hz) it cost
+/// at most 3 of 100 bursts at any CNR, none significantly.
 const MAX_IMBALANCE_GAIN: f64 = 3.0;
 /// Schmidl-Cox windows whose halves differ in energy by more than this ratio (10 dB)
 /// get metric 0. The metric is normalized by the quieter half, so without the gate a
@@ -40,9 +41,8 @@ const MIN_HALF_ENERGY_RATIO: f64 = 0.1;
 /// give a search of thousands of offsets. A real plateau, skewed by noise, needed up
 /// to about 3 cyclic prefixes.
 const MAX_TIMING_SPAN_CP: usize = 4;
-/// A click-hit symbol gets a per-carrier noise profile only when the mean pilot noise
-/// of one half of the band exceeds the other's by this ratio (see `click_profile`).
-const PROFILE_MIN_HALF_RATIO: f32 = 4.0;
+/// The most cyclic prefixes `ScConfig::max_span_cp` may ask for.
+const MAX_SPAN_CP_LIMIT: usize = 16;
 /// Pilots are averaged over this many symbols either side.
 const TRACK_HALF_WINDOW: usize = 4;
 const MIN_PREAMBLE_CORR: f32 = 0.3;
@@ -78,44 +78,13 @@ pub struct Frame {
     /// Estimated noise variance after equalization, per data carrier.
     pub noise_var: Vec<f32>,
     /// Noise scale per OFDM symbol (at least 1). The noise variance of symbol `i`,
-    /// data carrier `j` is `noise_var[j] * symbol_noise_scale[i]` unless
-    /// `carrier_noise_scale[i]` overrides it (see [`Frame::noise_at`]); it is large for
-    /// a symbol hit by an FM click, a squelch pop or a short fade.
+    /// data carrier `j` is `noise_var[j] * symbol_noise_scale[i]`; it is large for a
+    /// symbol hit by an FM click, a squelch pop or a short fade.
     pub symbol_noise_scale: Vec<f32>,
-    /// Per symbol: empty when `symbol_noise_scale[i]` applies to every carrier, else
-    /// one scale per data carrier (at least 1) that replaces it. Set for a symbol with
-    /// a scale above 1 whose pilots show its noise to be uneven across the band (an
-    /// interferer in part of the band, an FM click in a fast fade: up to 800 times the
-    /// normal level mid-band against a few times on the lowest carriers). There the one
-    /// per-symbol scale, an average over the pilots, overstates the noise on some
-    /// carriers and understates it on others. See `click_profile` for when it is set.
-    ///
-    /// It helps when such symbols are frequent enough to break codewords (the test
-    /// `coloured_clicks_need_the_per_carrier_profile`); on the simulated fading
-    /// channels the gain is a few codewords in a hundred or none.
-    ///
-    /// [`Frame::noise_at`] uses it in place of the symbol's scale, so to change a
-    /// symbol's noise, change both fields (or clear this one).
-    pub carrier_noise_scale: Vec<Vec<f32>>,
     /// Average SNR per symbol (Es/N0) in dB.
     pub snr_db: f32,
     /// Sample index just past the end of the frame.
     pub end: usize,
-}
-
-impl Frame {
-    /// Noise variance of symbol `i`, data carrier `j`.
-    ///
-    /// Panics if `i` or `j` is out of range (`symbols.len()`, `noise_var.len()`).
-    pub fn noise_at(&self, i: usize, j: usize) -> f32 {
-        let c = self.carrier_noise_scale.get(i).map_or(&[][..], |c| &c[..]);
-        debug_assert!(
-            c.is_empty() || c.len() == self.noise_var.len(),
-            "carrier_noise_scale[{i}] has {} entries",
-            c.len()
-        );
-        self.noise_var[j] * c.get(j).copied().unwrap_or(self.symbol_noise_scale[i])
-    }
 }
 
 impl Ofdm {
@@ -295,7 +264,10 @@ impl Ofdm {
     }
 
     /// [`Ofdm::detect`] with another Schmidl-Cox configuration (for evaluating them).
+    ///
+    /// Panics if `cfg` is out of range (see [`ScConfig::validate`]).
     pub fn detect_with(&self, rx: &[f32], from: usize, cfg: ScConfig) -> Option<usize> {
+        cfg.validate();
         // Filtering keeps preamble A periodic (the filter is linear and time-invariant),
         // so the autocorrelation still works on the filtered copy.
         let filtered;
@@ -489,29 +461,9 @@ impl Ofdm {
             })
             .collect();
         let noise_var: Vec<f32> = raw_var.iter().map(|v| v.max(1e-6)).collect();
-        // A symbol with its own noise scale gets a per-carrier profile from its own
-        // pilots when they show its noise to be uneven across the band
-        // ([`click_profile`]), interpolated to the data carriers.
-        let carrier_noise_scale: Vec<Vec<f32>> = (0..nsym)
-            .map(|i| {
-                if scale[i] <= 1.0 {
-                    return Vec::new();
-                }
-                let Some(s) = click_profile(&dev[i], &pilot_var) else { return Vec::new() };
-                self.data_idx
-                    .iter()
-                    .map(|&k| {
-                        let (m, t) = self.pilot_pos(k);
-                        s[m] * (1.0 - t) + s[m + 1] * t
-                    })
-                    .collect()
-            })
-            .collect();
         // The reported SNR averages the noise over all symbols, click-hit ones included,
         // as it did before there was a per-symbol scale. Scale the unclamped variance:
         // on a nearly noiseless frame the floor would otherwise be multiplied too.
-        // It uses the per-symbol scales, not `carrier_noise_scale` (which only refines
-        // the LLRs), so that it stays comparable with the link's SNR thresholds.
         let mean_var = raw_var.iter().sum::<f32>() / raw_var.len() as f32;
         let mean_scale = scale.iter().sum::<f32>() / nsym.max(1) as f32;
 
@@ -519,7 +471,6 @@ impl Ofdm {
             symbols,
             noise_var,
             symbol_noise_scale: scale,
-            carrier_noise_scale,
             snr_db: -10.0 * (mean_var * mean_scale.max(1.0)).max(1e-6).log10(),
             end: (base + (nsym as isize + 1) * l + n as isize) as usize,
         })
@@ -542,26 +493,6 @@ impl Ofdm {
     }
 }
 
-/// Noise scale per pilot of one symbol, or None when its noise looks flat across the
-/// band. Each pilot's squared deviation `dev` over its usual level `pilot_var` is a
-/// single noisy sample (2 degrees of freedom), so the profile is smoothed [1 2 1]/4
-/// across pilots and is at least 1. Even smoothed it scatters several-fold around a
-/// flat level, and on flat noise that cost more decoding than one scale per symbol
-/// (on clicks over the whole band hitting every fourth symbol, narrow L6: 22 of 48
-/// codewords against 37). So the profile is used only when the two halves of the band
-/// differ by more than `PROFILE_MIN_HALF_RATIO` in mean deviation (6 pilots each, about
-/// 12 degrees of freedom): then the same flat-click case decodes 36 of 48.
-fn click_profile(dev: &[f32], pilot_var: &[f32]) -> Option<Vec<f32>> {
-    let np = pilot_var.len();
-    let r: Vec<f32> = dev.iter().zip(pilot_var).map(|(d, v)| d / v.max(1e-12)).collect();
-    let half = |rr: &[f32]| rr.iter().sum::<f32>() / rr.len().max(1) as f32;
-    let (a, b) = (half(&r[..np / 2]), half(&r[np / 2..]));
-    if a.max(b) < PROFILE_MIN_HALF_RATIO * a.min(b) {
-        return None;
-    }
-    Some((0..np).map(|m| ((r[m.saturating_sub(1)] + 2.0 * r[m] + r[(m + 1).min(np - 1)]) * 0.25).max(1.0)).collect())
-}
-
 /// How the Schmidl-Cox metric (correlation P between the two halves of the window,
 /// energies R1 and R2) is normalized.
 ///
@@ -571,8 +502,9 @@ fn click_profile(dev: &[f32], pilot_var: &[f32]) -> Option<Vec<f32>> {
 /// way; P²/min(R1, R2)² does not fall while the halves stay within the balance gate.
 /// That last one is ρ²·max(R1, R2)/min(R1, R2), so it also lowers the bar for any
 /// window of unequal halves; [`ScConfig::max_imbalance_gain`] limits how far. On the
-/// simulator it detects the most bursts, on a static channel near the threshold as well
-/// as on fading ones: see `detect_eval` in vardefm-modem.
+/// simulator it detects the most bursts on a static channel near the threshold and at
+/// 20 Hz Doppler; at 5 Hz the detectors are within a few bursts in a hundred of each
+/// other. See `detect_eval` in vardefm-modem.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScMetric {
     /// P² / R2²: the classic form.
@@ -622,6 +554,26 @@ impl ScConfig {
         max_imbalance_gain: f64::INFINITY,
         max_span_cp: 0,
     };
+
+    /// Panics unless every setting is in range: a threshold in (0, 1], an energy ratio
+    /// in [0, 1], an imbalance gain of at least 1 (infinity allowed) and a span of at
+    /// most `MAX_SPAN_CP_LIMIT` cyclic prefixes. Out of range they would silently
+    /// detect everything or nothing (a gain below 1, a ratio above 1), give NaN metrics
+    /// (a gain of 0) or an unbounded fine-timing search.
+    pub fn validate(&self) {
+        assert!(self.threshold > 0.0 && self.threshold <= 1.0, "ScConfig threshold {} not in (0, 1]", self.threshold);
+        assert!(
+            (0.0..=1.0).contains(&self.min_half_energy_ratio),
+            "ScConfig min_half_energy_ratio {} not in [0, 1]",
+            self.min_half_energy_ratio
+        );
+        assert!(self.max_imbalance_gain >= 1.0, "ScConfig max_imbalance_gain {} below 1", self.max_imbalance_gain);
+        assert!(
+            self.max_span_cp <= MAX_SPAN_CP_LIMIT,
+            "ScConfig max_span_cp {} above {MAX_SPAN_CP_LIMIT}",
+            self.max_span_cp
+        );
+    }
 
     /// Metric of a window with correlation `p` between halves of energy `r1`, `r2`.
     fn metric(&self, p: f64, r1: f64, r2: f64) -> f64 {
@@ -948,6 +900,23 @@ mod tests {
     }
 
     #[test]
+    fn fine_timing_searches_a_skewed_plateau() {
+        // Noise in the first half of preamble A skews the Schmidl-Cox plateau late, so
+        // its centre misses preamble B by more than a cyclic prefix. Searching the whole
+        // plateau finds it; searching ±1 cyclic prefix around the centre often does not.
+        // Out of 20 at the time of writing, noise 1.2 times the RMS: narrow 20 / 14,
+        // wide 20 / 11.
+        let centre_only = ScConfig { max_span_cp: 0, ..ScConfig::default() };
+        for p in [OfdmParams::narrow(), OfdmParams::wide()] {
+            let ofdm = Ofdm::new(p);
+            let whole = detected_with_burst(&ofdm, ScConfig::default(), false, 1.2);
+            let centre = detected_with_burst(&ofdm, centre_only, false, 1.2);
+            assert_eq!(whole, 20, "{}: {whole}/20 searching the whole plateau", ofdm.p.name);
+            assert!(centre <= 16, "{}: {centre}/20 searching only around the centre", ofdm.p.name);
+        }
+    }
+
+    #[test]
     fn metric_gates_unbalanced_windows() {
         let cfg = ScConfig::default();
         // Balanced halves: P²/min(R1, R2)².
@@ -969,6 +938,25 @@ mod tests {
     }
 
     #[test]
+    fn config_out_of_range_is_refused() {
+        ScConfig::default().validate();
+        ScConfig::CLASSIC.validate();
+        ScConfig { max_imbalance_gain: f64::INFINITY, ..ScConfig::default() }.validate();
+        let bad = [
+            ScConfig { threshold: 0.0, ..ScConfig::default() },
+            ScConfig { threshold: f64::NAN, ..ScConfig::default() },
+            ScConfig { min_half_energy_ratio: 1.5, ..ScConfig::default() },
+            ScConfig { min_half_energy_ratio: -0.1, ..ScConfig::default() },
+            ScConfig { max_imbalance_gain: 0.0, ..ScConfig::default() },
+            ScConfig { max_imbalance_gain: f64::NAN, ..ScConfig::default() },
+            ScConfig { max_span_cp: usize::MAX, ..ScConfig::default() },
+        ];
+        for cfg in bad {
+            assert!(std::panic::catch_unwind(|| cfg.validate()).is_err(), "{cfg:?} accepted");
+        }
+    }
+
+    #[test]
     fn timing_span_covers_the_plateau_up_to_the_cap() {
         let cfg = ScConfig::default();
         let ncp = 128;
@@ -977,38 +965,6 @@ mod tests {
         // A tone plateau of 2 s at 48 kHz.
         assert_eq!(cfg.timing_span(96_000, ncp), MAX_TIMING_SPAN_CP * ncp);
         assert_eq!(ScConfig::CLASSIC.timing_span(96_000, ncp), ncp);
-    }
-
-    #[test]
-    fn click_profile_spreads_a_lone_outlier() {
-        // One pilot 100 times its usual noise, the others normal: the smoothing spreads
-        // it over its neighbours instead of trusting one noisy sample.
-        let var = vec![0.01; 6];
-        let mut dev = vec![0.01; 6];
-        dev[2] = 1.0;
-        let s = click_profile(&dev, &var).expect("uneven halves");
-        let want = [1.0, 103.0 / 4.0, 202.0 / 4.0, 103.0 / 4.0, 1.0, 1.0];
-        for (got, want) in s.iter().zip(want) {
-            assert!((got - want).abs() < 1e-3, "{s:?}");
-        }
-        // Never below 1, and the band edges repeat their own value.
-        let s = click_profile(&[0.0, 0.0, 0.04], &[0.01; 3]).expect("uneven halves");
-        assert_eq!(s[0], 1.0);
-        assert!((s[2] - 3.0).abs() < 1e-5, "{s:?}");
-    }
-
-    #[test]
-    fn click_profile_only_for_uneven_noise() {
-        let var = vec![0.01; 12];
-        // Flat noise, scattered as single samples are: no profile.
-        let flat = [0.3, 2.1, 0.7, 1.4, 0.2, 1.1, 0.9, 2.6, 0.4, 1.0, 1.7, 0.5].map(|r| r * 50.0 * 0.01);
-        assert!(click_profile(&flat, &var).is_none());
-        // The upper half 3 times the lower: still treated as flat.
-        let mild: Vec<f32> = (0..12).map(|m| if m < 6 { 0.1 } else { 0.3 }).collect();
-        assert!(click_profile(&mild, &var).is_none());
-        // 5 times: a profile.
-        let uneven: Vec<f32> = (0..12).map(|m| if m < 6 { 0.1 } else { 0.5 }).collect();
-        assert!(click_profile(&uneven, &var).is_some());
     }
 
     #[test]
@@ -1049,7 +1005,7 @@ mod tests {
                 dets += 1;
                 pos = b + 1;
             }
-            assert!(dets <= 2, "{}: {dets} detections in 20 s of in-band noise", ofdm.p.name);
+            assert_eq!(dets, 0, "{}: detections in 20 s of in-band noise", ofdm.p.name);
         }
     }
 }

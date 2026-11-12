@@ -243,14 +243,14 @@ impl Modem {
         self.header_bits(h).chunks(nd).map(|c| c.iter().map(|&b| bpsk.map(&[b])).collect()).collect()
     }
 
-    /// LLRs for every bit slot of symbols `from..` of `f`, with each cell's noise
-    /// variance from [`Frame::noise_at`].
+    /// LLRs for every bit slot of symbols `from..` of `f`. The noise variance of
+    /// symbol `i`, carrier `j` is `f.noise_var[j] * f.symbol_noise_scale[i]`.
     fn llrs(m: Modulation, f: &Frame, from: usize) -> Vec<f32> {
         let symbols = &f.symbols[from..];
         let mut out = Vec::with_capacity(symbols.len() * f.noise_var.len() * m.bits_per_symbol());
-        for (i, sym) in symbols.iter().enumerate() {
-            for (j, y) in sym.iter().enumerate() {
-                m.demap_llr(*y, f.noise_at(from + i, j), &mut out);
+        for (sym, &scale) in symbols.iter().zip(&f.symbol_noise_scale[from..]) {
+            for (y, &nv) in sym.iter().zip(&f.noise_var) {
+                m.demap_llr(*y, nv * scale, &mut out);
             }
         }
         out
