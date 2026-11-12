@@ -7,6 +7,9 @@ run the same minor version.
 ## [Unreleased]
 
 ### Added
+- **Detector settings in vardefm-dsp.** `Ofdm::detect_with` runs burst detection with
+  an `ScConfig` (`ScConfig::CLASSIC` is the detector before this release); it panics on
+  settings out of range.
 - **Performance gates.** `level_gate` and `fer_gate` are ignored tests, run by hand in
   release mode, that fail when decoding performance moves. Per mode and level, the CNR
   at which 10 % of codewords fail, and per mode and drive level the CNR at which 10 % of
@@ -22,6 +25,16 @@ run the same minor version.
   `fading_table` benchmark runs the level table at 5, 20 and 80 Hz Doppler.
 
 ### Changed
+- **Burst detection holds up when noise hits preamble A.** The receiver only; on-air
+  compatible. The Schmidl-Cox metric is normalized by the quieter half of its window
+  (P²/min(R1, R2)², the energy ratio counted at most 3 times, threshold 0.4) instead of
+  the second half (P²/R2², 0.3). Windows whose halves differ by more than 10 dB are
+  gated out. Fine timing searches the whole plateau, up to 4 cyclic prefixes either
+  side. On the simulator (`detector_eval`, 100 paired bursts) narrow mode at 5 dB CNR
+  decodes 84 bursts instead of 59, and narrow mode on Rayleigh 20 Hz at 14 dB mean
+  CNR 88 instead of 73 (wide: 77 against 72, not significant; at 5 Hz no difference).
+  Detections on a weak carrier (5 dB CNR), each costing a header decode, are 0-2 per
+  minute against the old 1-10.
 - **Busy detection measures only the carrier band** (422–2672 Hz narrow, 400–6000 Hz wide).
   A CTCSS tone, mains hum, a DC step or hiss above the band no longer reads as a busy
   channel, and no longer hides a signal inside the band. A keyed carrier with only a CTCSS

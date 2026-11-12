@@ -17,7 +17,32 @@ use std::f32::consts::SQRT_2;
 use std::sync::Arc;
 
 const PILOT_TABLE_LEN: usize = 32;
-const DETECT_THRESHOLD: f64 = 0.3;
+/// Schmidl-Cox plateau threshold. With the metric normalized by the quieter half (and
+/// the imbalance capped by `MAX_IMBALANCE_GAIN`), 0.4 keeps nearly all the detection
+/// gain of 0.3 near the detection threshold (`detect_eval`) with fewer detections on
+/// carrier noise.
+const DETECT_THRESHOLD: f64 = 0.4;
+/// P²/min(R1, R2)² is ρ²·max/min: within the balance gate it would let a window with
+/// halves 10 dB apart pass at ρ² = 0.04. The energy ratio counts at most this much, so
+/// such a window needs ρ² above 0.4/3. In `detect_eval` the cap took detections on a
+/// weak carrier (5 dB CNR) from 6-10 per minute to 0-2, below the classic detector's
+/// 1-10. On the static channel and at 20 Hz Doppler (it was not run at 5 Hz) it cost
+/// at most 3 of 100 bursts at any CNR, none significantly.
+const MAX_IMBALANCE_GAIN: f64 = 3.0;
+/// Schmidl-Cox windows whose halves differ in energy by more than this ratio (10 dB)
+/// get metric 0. The metric is normalized by the quieter half, so without the gate a
+/// window straddling a level step (a tone keying up, a ring-down, the start of a
+/// burst) would score up to the energy ratio. FM noise in one half of preamble A stays
+/// inside the gate while its power is below 9 times the signal's (amplitude about 3
+/// times); the tests reach twice the amplitude.
+const MIN_HALF_ENERGY_RATIO: f64 = 0.1;
+/// Fine timing searches the whole plateau, but at most this many cyclic prefixes
+/// either side of its centre: a long plateau from a periodic tone would otherwise
+/// give a search of thousands of offsets. A real plateau, skewed by noise, needed up
+/// to about 3 cyclic prefixes.
+const MAX_TIMING_SPAN_CP: usize = 4;
+/// The most cyclic prefixes `ScConfig::max_span_cp` may ask for.
+const MAX_SPAN_CP_LIMIT: usize = 16;
 /// Pilots are averaged over this many symbols either side.
 const TRACK_HALF_WINDOW: usize = 4;
 const MIN_PREAMBLE_CORR: f32 = 0.3;
@@ -235,6 +260,14 @@ impl Ofdm {
     /// Search `rx` from `from` for a frame. Returns the sample index where the
     /// body of preamble B starts.
     pub fn detect(&self, rx: &[f32], from: usize) -> Option<usize> {
+        self.detect_with(rx, from, ScConfig::default())
+    }
+
+    /// [`Ofdm::detect`] with another Schmidl-Cox configuration (for evaluating them).
+    ///
+    /// Panics if `cfg` is out of range (see [`ScConfig::validate`]).
+    pub fn detect_with(&self, rx: &[f32], from: usize, cfg: ScConfig) -> Option<usize> {
+        cfg.validate();
         // Filtering keeps preamble A periodic (the filter is linear and time-invariant),
         // so the autocorrelation still works on the filtered copy.
         let filtered;
@@ -246,11 +279,11 @@ impl Ofdm {
             }
             None => &rx[from..],
         };
-        self.detect_in(rx, sc, from)
+        self.detect_in(rx, sc, from, cfg)
     }
 
     /// Schmidl-Cox search over `sc` (which starts at `rx[from]`), confirmed on `rx`.
-    fn detect_in(&self, rx: &[f32], sc: &[f32], from: usize) -> Option<usize> {
+    fn detect_in(&self, rx: &[f32], sc: &[f32], from: usize, cfg: ScConfig) -> Option<usize> {
         let n = self.p.nfft;
         let h = n / 2;
         let ncp = self.p.ncp;
@@ -259,26 +292,34 @@ impl Ofdm {
             return None;
         }
         let x = |i: usize| sc[i] as f64;
+        // See `ScConfig` for how the metric is normalized: FM noise from a fade in either
+        // half of preamble A must not push it below the threshold.
         let mut p = 0f64;
         let mut r = 0f64;
+        let mut r1 = 0f64;
         for m in 0..h {
             p += x(m) * x(m + h);
             r += x(m + h).powi(2);
+            r1 += x(m).powi(2);
         }
         let energy_floor = 1e-7 * h as f64;
         let mut plateau: Option<(usize, usize)> = None;
         let mut d = 0;
         while d + n + 2 * l < sc.len() {
-            let metric = if r > energy_floor && p > 0.0 { p * p / (r * r) } else { 0.0 };
-            match (&mut plateau, metric > DETECT_THRESHOLD) {
+            let metric = if r > energy_floor && r1 > energy_floor { cfg.metric(p, r1, r) } else { 0.0 };
+            match (&mut plateau, metric > cfg.threshold) {
                 (None, true) => plateau = Some((d, d)),
                 (Some((_, end)), true) => *end = d,
                 (Some((start, end)), false) => {
                     let (start, end) = (*start, *end);
                     plateau = None;
                     if end - start >= ncp / 4 {
+                        // Noise in part of preamble A skews the plateau, so its centre
+                        // can miss by more than the cyclic prefix: search all of it, up
+                        // to `MAX_TIMING_SPAN_CP` cyclic prefixes either way.
                         let a0 = from + ((start + end) / 2).saturating_sub(ncp / 2);
-                        if let Some(b) = self.fine_timing(rx, a0 + l + ncp) {
+                        let span = cfg.timing_span(end - start, ncp);
+                        if let Some(b) = self.fine_timing(rx, a0 + l + ncp, span) {
                             return Some(b);
                         }
                     }
@@ -287,15 +328,17 @@ impl Ofdm {
             }
             p += x(d + h) * x(d + n) - x(d) * x(d + h);
             r += x(d + n).powi(2) - x(d + h).powi(2);
+            r1 += x(d + h).powi(2) - x(d).powi(2);
             d += 1;
         }
         None
     }
 
-    /// Cross-correlate with preamble B around `expected` and return the best start.
-    fn fine_timing(&self, rx: &[f32], expected: usize) -> Option<usize> {
+    /// Cross-correlate with preamble B within `span` samples of `expected` and return
+    /// the best start.
+    fn fine_timing(&self, rx: &[f32], expected: usize, span: usize) -> Option<usize> {
         let n = self.p.nfft;
-        let span = self.p.ncp as isize;
+        let span = span as isize;
         let mut best = (0.0f32, 0usize);
         for off in -span..=span {
             let s = expected as isize + off;
@@ -447,6 +490,115 @@ impl Ofdm {
         let mag = a.norm() * (1.0 - t) + b.norm() * t;
         let dphi = (b * a.conj()).arg();
         Complex32::from_polar(mag, a.arg() + dphi * t)
+    }
+}
+
+/// How the Schmidl-Cox metric (correlation P between the two halves of the window,
+/// energies R1 and R2) is normalized.
+///
+/// FM noise from a fade adds energy to one half of preamble A but little to P. The
+/// classic P²/R2² then falls by the square of the energy ratio when the noise is in
+/// the second half and ignores it in the first; P²/(R1·R2) falls by the ratio either
+/// way; P²/min(R1, R2)² does not fall while the halves stay within the balance gate.
+/// That last one is ρ²·max(R1, R2)/min(R1, R2), so it also lowers the bar for any
+/// window of unequal halves; [`ScConfig::max_imbalance_gain`] limits how far. On the
+/// simulator it detects the most bursts on a static channel near the threshold and at
+/// 20 Hz Doppler; at 5 Hz the detectors are within a few bursts in a hundred of each
+/// other. See `detect_eval` in vardefm-modem.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScMetric {
+    /// P² / R2²: the classic form.
+    SecondHalf,
+    /// P² / (R1·R2): the squared correlation coefficient.
+    BothHalves,
+    /// P² / min(R1, R2)², with the energy ratio capped by
+    /// [`ScConfig::max_imbalance_gain`].
+    QuieterHalf,
+}
+
+/// Schmidl-Cox detection settings. `Default` is what [`Ofdm::detect`] uses.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScConfig {
+    pub metric: ScMetric,
+    /// A plateau is where the metric exceeds this.
+    pub threshold: f64,
+    /// Windows whose halves differ in energy by more than this ratio get metric 0
+    /// (0 = no gate).
+    pub min_half_energy_ratio: f64,
+    /// For [`ScMetric::QuieterHalf`]: the metric is ρ²·max(R1, R2)/min(R1, R2), and
+    /// the energy ratio counts at most this much (infinity = no cap).
+    pub max_imbalance_gain: f64,
+    /// Search fine timing over the whole plateau, up to this many cyclic prefixes
+    /// either way (0 = ±1 cyclic prefix around the plateau centre).
+    pub max_span_cp: usize,
+}
+
+impl Default for ScConfig {
+    fn default() -> Self {
+        Self {
+            metric: ScMetric::QuieterHalf,
+            threshold: DETECT_THRESHOLD,
+            min_half_energy_ratio: MIN_HALF_ENERGY_RATIO,
+            max_imbalance_gain: MAX_IMBALANCE_GAIN,
+            max_span_cp: MAX_TIMING_SPAN_CP,
+        }
+    }
+}
+
+impl ScConfig {
+    /// The detector before fading hardening.
+    pub const CLASSIC: Self = Self {
+        metric: ScMetric::SecondHalf,
+        threshold: 0.3,
+        min_half_energy_ratio: 0.0,
+        max_imbalance_gain: f64::INFINITY,
+        max_span_cp: 0,
+    };
+
+    /// Panics unless every setting is in range: a threshold in (0, 1], an energy ratio
+    /// in [0, 1], an imbalance gain of at least 1 (infinity allowed) and a span of at
+    /// most `MAX_SPAN_CP_LIMIT` cyclic prefixes. Out of range they would silently
+    /// detect everything or nothing (a gain below 1, a ratio above 1), give NaN metrics
+    /// (a gain of 0) or an unbounded fine-timing search.
+    pub fn validate(&self) {
+        assert!(self.threshold > 0.0 && self.threshold <= 1.0, "ScConfig threshold {} not in (0, 1]", self.threshold);
+        assert!(
+            (0.0..=1.0).contains(&self.min_half_energy_ratio),
+            "ScConfig min_half_energy_ratio {} not in [0, 1]",
+            self.min_half_energy_ratio
+        );
+        assert!(self.max_imbalance_gain >= 1.0, "ScConfig max_imbalance_gain {} below 1", self.max_imbalance_gain);
+        assert!(
+            self.max_span_cp <= MAX_SPAN_CP_LIMIT,
+            "ScConfig max_span_cp {} above {MAX_SPAN_CP_LIMIT}",
+            self.max_span_cp
+        );
+    }
+
+    /// Metric of a window with correlation `p` between halves of energy `r1`, `r2`.
+    fn metric(&self, p: f64, r1: f64, r2: f64) -> f64 {
+        if p <= 0.0 || r1.min(r2) < self.min_half_energy_ratio * r1.max(r2) {
+            return 0.0;
+        }
+        p * p
+            / match self.metric {
+                ScMetric::SecondHalf => r2 * r2,
+                ScMetric::BothHalves => r1 * r2,
+                ScMetric::QuieterHalf => {
+                    let (lo, hi) = (r1.min(r2), r1.max(r2));
+                    lo * hi / (hi / lo).min(self.max_imbalance_gain)
+                }
+            }
+    }
+
+    /// Fine-timing search span either side of the expected position, for a plateau of
+    /// `plateau` samples.
+    fn timing_span(&self, plateau: usize, ncp: usize) -> usize {
+        if self.max_span_cp == 0 {
+            ncp
+        } else {
+            (plateau / 2 + ncp / 2).clamp(ncp, self.max_span_cp * ncp)
+        }
     }
 }
 
@@ -669,6 +821,191 @@ mod tests {
             }
             assert_eq!(out, bits, "{}", ofdm.p.name);
             println!("{}: SNR at rms 0.5 without noise {:.1} dB", ofdm.p.name, frame.snr_db);
+        }
+    }
+
+    /// In-band noise: random OFDM symbols (no preamble), scaled to `rms`.
+    fn inband_noise(ofdm: &Ofdm, len: usize, rms_level: f32, seed: u32) -> Vec<f32> {
+        let mut rng = Prng::new(seed);
+        let nc = ofdm.p.num_carriers;
+        let mut x = Vec::with_capacity(len + ofdm.p.symbol_len());
+        while x.len() < len {
+            let c: Vec<Complex32> = (0..nc).map(|_| Complex32::new(rng.bpsk(), rng.bpsk())).collect();
+            x.extend(ofdm.symbol_time(&c));
+        }
+        x.truncate(len);
+        let g = rms_level / rms(&x);
+        x.iter_mut().for_each(|v| *v *= g);
+        x
+    }
+    /// A frame after 1000 samples of silence, and where `detect` finds it.
+    fn frame_and_position(ofdm: &Ofdm) -> (Vec<f32>, usize) {
+        let data = random_frame(ofdm, Modulation::Qpsk, 6, 9);
+        let mut rx = vec![0.0; 1000];
+        rx.extend(ofdm.modulate_with_leader(&data, 0.1));
+        rx.extend(vec![0.0; 2000]);
+        let b = ofdm.detect(&rx, 0).expect("frame not detected");
+        (rx, b)
+    }
+
+    /// How many of 20 noise bursts (seeds) in one half of preamble A's body, at
+    /// `level` times its RMS, still let `cfg` find the frame at its clean position.
+    fn detected_with_burst(ofdm: &Ofdm, cfg: ScConfig, second_half: bool, level: f32) -> usize {
+        let (rx, clean) = frame_and_position(ofdm);
+        let (n, l) = (ofdm.p.nfft, ofdm.p.symbol_len());
+        // Preamble B's body starts at `clean`, so A's body at `clean - l`.
+        let a_body = clean - l;
+        let from = if second_half { a_body + n / 2 } else { a_body };
+        let rms_a = rms(&rx[a_body..a_body + n]);
+        (0..20)
+            .filter(|&seed| {
+                let mut rx = rx.clone();
+                let noise = inband_noise(ofdm, n / 2, level * rms_a, 100 + seed);
+                rx[from..from + n / 2].iter_mut().zip(&noise).for_each(|(x, v)| *x += v);
+                ofdm.detect_with(&rx, 0, cfg).is_some_and(|b| b.abs_diff(clean) <= 2)
+            })
+            .count()
+    }
+
+    #[test]
+    fn detects_with_a_noise_burst_in_either_half_of_preamble_a() {
+        // A fade puts FM noise into part of preamble A. It adds energy to that half
+        // but little correlation between the halves, so a metric normalized by the
+        // noisy half drops below the threshold: the classic P²/R2² for noise in the
+        // second half, P²/(R1·R2) for either. Normalized by the quieter half, with the
+        // energy ratio capped at 3, it holds while the noisy half has up to 3 times the
+        // energy of the clean one, then falls in proportion. Out of 20 (classic, R1·R2, min²) at
+        // the time of writing, noise 2 times the RMS: narrow first half 6/0/14, second
+        // 0/2/20; wide first 5/0/14, second 0/0/17. (Classic at its own threshold 0.3,
+        // the others at 0.4.)
+        let both = ScConfig { metric: ScMetric::BothHalves, ..ScConfig::default() };
+        for p in [OfdmParams::narrow(), OfdmParams::wide()] {
+            let ofdm = Ofdm::new(p);
+            let name = ofdm.p.name;
+            for second in [false, true] {
+                let half = ["first", "second"][second as usize];
+                for level in [1.2, 2.0] {
+                    let got = detected_with_burst(&ofdm, ScConfig::default(), second, level);
+                    let want = if level < 1.5 { 20 } else { 12 };
+                    assert!(got >= want, "{name}, noise {level}x in the {half} half: {got}/20");
+                    for (other, cfg) in [("classic", ScConfig::CLASSIC), ("R1·R2", both)] {
+                        let o = detected_with_burst(&ofdm, cfg, second, level);
+                        assert!(got >= o, "{name}, noise {level}x in the {half} half: {got}/20, {other} {o}/20");
+                    }
+                }
+            }
+            let classic = detected_with_burst(&ofdm, ScConfig::CLASSIC, true, 1.2);
+            assert!(classic <= 5, "{name}: classic metric found {classic}/20 with noise in the second half");
+        }
+    }
+
+    #[test]
+    fn fine_timing_searches_a_skewed_plateau() {
+        // Noise in the first half of preamble A skews the Schmidl-Cox plateau late, so
+        // its centre misses preamble B by more than a cyclic prefix. Searching the whole
+        // plateau finds it; searching ±1 cyclic prefix around the centre often does not.
+        // Out of 20 at the time of writing, noise 1.2 times the RMS: narrow 20 / 14,
+        // wide 20 / 11.
+        let centre_only = ScConfig { max_span_cp: 0, ..ScConfig::default() };
+        for p in [OfdmParams::narrow(), OfdmParams::wide()] {
+            let ofdm = Ofdm::new(p);
+            let whole = detected_with_burst(&ofdm, ScConfig::default(), false, 1.2);
+            let centre = detected_with_burst(&ofdm, centre_only, false, 1.2);
+            assert_eq!(whole, 20, "{}: {whole}/20 searching the whole plateau", ofdm.p.name);
+            assert!(centre <= 16, "{}: {centre}/20 searching only around the centre", ofdm.p.name);
+        }
+    }
+
+    #[test]
+    fn metric_gates_unbalanced_windows() {
+        let cfg = ScConfig::default();
+        // Balanced halves: P²/min(R1, R2)².
+        assert!((cfg.metric(0.5, 1.0, 2.0) - 0.25).abs() < 1e-12);
+        assert!((cfg.metric(0.5, 2.0, 1.0) - 0.25).abs() < 1e-12);
+        // A perfectly correlated scaled copy, halves 20 times apart (a ring-down): would
+        // score 20 without the gate.
+        assert_eq!(cfg.metric(20f64.sqrt(), 1.0, 20.0), 0.0);
+        assert_eq!(cfg.metric(20f64.sqrt(), 20.0, 1.0), 0.0);
+        // Just inside the gate it counts, the imbalance capped: halves 9 times apart,
+        // perfectly correlated (ρ² = 1), score 3, not 9.
+        assert!((cfg.metric(3.0, 1.0, 9.0) - 3.0).abs() < 1e-12);
+        let uncapped = ScConfig { max_imbalance_gain: f64::INFINITY, ..cfg };
+        assert!((uncapped.metric(3.0, 1.0, 9.0) - 9.0).abs() < 1e-12);
+        // Anti-correlated halves never count.
+        assert_eq!(cfg.metric(-1.0, 1.0, 1.0), 0.0);
+        // The classic metric: P²/R2², no gate.
+        assert!((ScConfig::CLASSIC.metric(1.0, 100.0, 2.0) - 0.25).abs() < 1e-12);
+    }
+
+    #[test]
+    fn config_out_of_range_is_refused() {
+        ScConfig::default().validate();
+        ScConfig::CLASSIC.validate();
+        ScConfig { max_imbalance_gain: f64::INFINITY, ..ScConfig::default() }.validate();
+        let bad = [
+            ScConfig { threshold: 0.0, ..ScConfig::default() },
+            ScConfig { threshold: f64::NAN, ..ScConfig::default() },
+            ScConfig { min_half_energy_ratio: 1.5, ..ScConfig::default() },
+            ScConfig { min_half_energy_ratio: -0.1, ..ScConfig::default() },
+            ScConfig { max_imbalance_gain: 0.0, ..ScConfig::default() },
+            ScConfig { max_imbalance_gain: f64::NAN, ..ScConfig::default() },
+            ScConfig { max_span_cp: usize::MAX, ..ScConfig::default() },
+        ];
+        for cfg in bad {
+            assert!(std::panic::catch_unwind(|| cfg.validate()).is_err(), "{cfg:?} accepted");
+        }
+    }
+
+    #[test]
+    fn timing_span_covers_the_plateau_up_to_the_cap() {
+        let cfg = ScConfig::default();
+        let ncp = 128;
+        assert_eq!(cfg.timing_span(10, ncp), ncp);
+        assert_eq!(cfg.timing_span(400, ncp), 200 + ncp / 2);
+        // A tone plateau of 2 s at 48 kHz.
+        assert_eq!(cfg.timing_span(96_000, ncp), MAX_TIMING_SPAN_CP * ncp);
+        assert_eq!(ScConfig::CLASSIC.timing_span(96_000, ncp), ncp);
+    }
+
+    #[test]
+    fn no_false_lock_on_keyed_tones_or_inband_noise() {
+        // Tones at multiples of fs/(nfft/2) repeat every half window, so the
+        // Schmidl-Cox metric sits near 1 while they last; keyed on and off, each
+        // plateau ends and goes to fine timing, which must reject it. In-band noise
+        // (random OFDM symbols, no preamble) must not lock either. Detections are
+        // cheap, but each costs the receiver a header decode. The detection rate on FM
+        // noise from a weak carrier (a few per minute at most) needs minutes of audio
+        // to measure: only `detect_eval` in vardefm-modem checks it.
+        let fs = 48_000.0f32;
+        let len = (fs * 3.0) as usize;
+        let keyed = |f: f32, shape: &dyn Fn(f32) -> f32| -> Vec<f32> {
+            (0..len)
+                .map(|i| {
+                    let t = i as f32 / fs;
+                    let env = if t % 0.5 < 0.3 { shape(t % 0.5) } else { 0.0 };
+                    0.3 * env * (std::f32::consts::TAU * f * t).sin()
+                })
+                .collect()
+        };
+        for p in [OfdmParams::narrow(), OfdmParams::wide()] {
+            let ofdm = Ofdm::new(p);
+            let periodic = fs / (ofdm.p.nfft / 2) as f32 * 10.0;
+            let cases: Vec<(&str, Vec<f32>)> = vec![
+                ("keyed tone", keyed(periodic, &|_| 1.0)),
+                ("keyed 1500 Hz", keyed(1500.0, &|_| 1.0)),
+                ("ring-down", keyed(periodic, &|t| (-t / 0.02).exp())),
+                ("rising tone", keyed(periodic, &|t| (t / 0.3).min(1.0).powi(3))),
+            ];
+            for (name, x) in cases {
+                assert_eq!(ofdm.detect(&x, 0), None, "{}: false lock on {name}", ofdm.p.name);
+            }
+            let noise = inband_noise(&ofdm, (fs * 20.0) as usize, 0.2, 21);
+            let (mut dets, mut pos) = (0, 0);
+            while let Some(b) = ofdm.detect(&noise, pos) {
+                dets += 1;
+                pos = b + 1;
+            }
+            assert_eq!(dets, 0, "{}: detections in 20 s of in-band noise", ofdm.p.name);
         }
     }
 }

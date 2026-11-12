@@ -3,11 +3,11 @@ use std::sync::Arc;
 use vardefm_dsp::prng::Prng;
 use vardefm_sim::{transmit, Fading, FmChannelConfig};
 
-fn modem(mode: &str) -> Arc<Modem> {
+pub(crate) fn modem(mode: &str) -> Arc<Modem> {
     Arc::new(Modem::new(OfdmParams::by_name(mode).unwrap(), 0.1))
 }
 
-fn burst(level: u8, ncw: usize, seed: u32) -> Burst {
+pub(crate) fn burst(level: u8, ncw: usize, seed: u32) -> Burst {
     let mut rng = Prng::new(seed);
     let n = Modem::payload_bytes(level);
     Burst {
@@ -28,7 +28,7 @@ fn burst(level: u8, ncw: usize, seed: u32) -> Burst {
 }
 
 /// Push audio in 10 ms chunks, like a sound card would deliver it.
-fn receive(rx: &mut Receiver, audio: &[f32]) -> Vec<RxBurst> {
+pub(crate) fn receive(rx: &mut Receiver, audio: &[f32]) -> Vec<RxBurst> {
     let mut out = Vec::new();
     for chunk in audio.chunks(480) {
         out.extend(rx.push(chunk));

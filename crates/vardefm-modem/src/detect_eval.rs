@@ -28,6 +28,7 @@
 //! `cargo test --release -p vardefm-modem detector_eval -- --ignored --nocapture`
 //!
 //! Environment: `MODES` (narrow,wide), `TRIALS` per CNR (100), `LEVEL` (1), `NCW` (1),
+//! `FADING` (a fading spec such as `rayleigh:20`; CNR is then the mean CNR),
 //! `CNRS` (dB list, default per mode), `NOISE_SECONDS` per noise case (60),
 //! `CSV` (file to append the burst results to).
 
@@ -36,13 +37,19 @@ use std::f32::consts::PI;
 use std::io::Write;
 use std::sync::Arc;
 use vardefm_dsp::prng::Prng;
-use vardefm_sim::{transmit, FmChannelConfig};
+use vardefm_dsp::ScConfig;
+use vardefm_sim::{transmit, Fading, FmChannelConfig};
 
 /// A burst detector: search `rx` from `from`, return where the body of preamble B starts.
 pub(crate) type DetectFn = fn(&Modem, &[f32], usize) -> Option<usize>;
 
 /// Detectors under evaluation. The first one is the reference for the paired tests.
-pub(crate) const DETECTORS: &[(&str, DetectFn)] = &[("sc", |m, rx, from| m.ofdm.detect(rx, from))];
+pub(crate) const DETECTORS: &[(&str, DetectFn)] = &[
+    ("sc", |m, rx, from| m.ofdm.detect(rx, from)),
+    // Schmidl-Cox as before the fading work: P²/R2², no balance gate, fine timing
+    // ±1 cyclic prefix around the plateau centre.
+    ("classic", |m, rx, from| m.ofdm.detect_with(rx, from, ScConfig::CLASSIC)),
+];
 
 /// Leader length used by the evaluation, seconds (the `vardefm modem` default).
 const TXDELAY: f32 = 0.15;
@@ -133,24 +140,41 @@ fn channel_seed(cnr: f32, t: u32) -> u64 {
     (((cnr * 100.0).round() as i64 as u64) << 32) | t as u64
 }
 
-/// The `level` burst of `ncw` codewords that trial `t` sends, and the audio the
-/// receiver gets from the `mode` channel at `cnr` dB.
-pub(crate) fn received(m: &Modem, mode: &str, cnr: f32, level: u8, ncw: usize, t: u32) -> (Burst, Vec<f32>) {
-    let sent = burst(level, ncw, payload_seed(t));
-    let rx = through_channel(m, mode, cnr, &sent, t);
+/// The burst that trial `t` of `spec` sends, and the audio the receiver gets.
+fn received(m: &Modem, spec: &TrialSpec, t: u32) -> (Burst, Vec<f32>) {
+    let sent = burst(spec.level, spec.ncw, payload_seed(t));
+    let rx = through_channel_with(m, spec.mode, spec.cnr, spec.fading, &sent, t);
     (sent, rx)
 }
 
 /// The audio the receiver gets when trial `t` sends `sent` over the `mode` channel
 /// at `cnr` dB.
 pub(crate) fn through_channel(m: &Modem, mode: &str, cnr: f32, sent: &Burst, t: u32) -> Vec<f32> {
-    let cfg =
-        FmChannelConfig { cnr_db: Some(cnr), seed: channel_seed(cnr, t), ..FmChannelConfig::by_name(mode).unwrap() };
+    through_channel_with(m, mode, cnr, None, sent, t)
+}
+
+/// [`through_channel`] with flat fading (`cnr` is then the mean CNR).
+fn through_channel_with(m: &Modem, mode: &str, cnr: f32, fading: Option<Fading>, sent: &Burst, t: u32) -> Vec<f32> {
+    let cfg = FmChannelConfig {
+        cnr_db: Some(cnr),
+        fading,
+        seed: channel_seed(cnr, t),
+        ..FmChannelConfig::by_name(mode).unwrap()
+    };
     transmit(&cfg, &m.modulate(sent))
 }
 
-fn trial(m: &Modem, mode: &str, cnr: f32, level: u8, ncw: usize, truth: usize, t: u32) -> Trial {
-    let (sent, rx) = received(m, mode, cnr, level, ncw, t);
+/// One trial: `fading` is None for a static channel.
+struct TrialSpec<'a> {
+    mode: &'a str,
+    cnr: f32,
+    fading: Option<Fading>,
+    level: u8,
+    ncw: usize,
+}
+
+fn trial(m: &Modem, spec: &TrialSpec, truth: usize, t: u32) -> Trial {
+    let (sent, rx) = received(m, spec, t);
     let tol = m.ofdm.p.ncp / 4;
     let det = DETECTORS
         .iter()
@@ -188,9 +212,9 @@ pub(crate) fn on_every_core<R: Send>(trials: u32, f: impl Fn(u32) -> R + Sync) -
 }
 
 /// Run `trials` trials of a `level` burst of `ncw` codewords on every core.
-fn run_trials(m: &Modem, mode: &str, cnr: f32, level: u8, ncw: usize, trials: u32) -> Vec<Trial> {
-    let truth = true_position(m, mode, level, ncw);
-    on_every_core(trials, |t| trial(m, mode, cnr, level, ncw, truth, t))
+fn run_trials(m: &Modem, spec: &TrialSpec, trials: u32) -> Vec<Trial> {
+    let truth = true_position(m, spec.mode, spec.level, spec.ncw);
+    on_every_core(trials, |t| trial(m, spec, truth, t))
 }
 
 /// Two-sided exact McNemar p-value for `b` and `c` discordant pairs.
@@ -249,7 +273,8 @@ pub(crate) fn env_flag(name: &str) -> bool {
 }
 
 /// The kinds of audio without a burst in the false-detection pass, for [`noise_case`].
-const NOISE_CASES: [&str; 4] = ["carrier at -10 dB CNR", "weak carrier, 5 dB CNR", "white noise", "keyed tones"];
+const NOISE_CASES: [&str; 5] =
+    ["carrier at -10 dB CNR", "weak carrier, 5 dB CNR", "white noise", "keyed tones", "voice-like level steps"];
 
 /// Tone sets for the "keyed tones" case, Hz. 750 + 1500 Hz repeat every nfft/2
 /// samples in both modes, like preamble A; then a roger beep and DTMF pairs.
@@ -295,6 +320,28 @@ fn noise_case(mode: &str, case: usize, seconds: f32, fs: f32) -> Vec<f32> {
                 })
                 .collect()
         }
+        4 => {
+            // Speech-like: a pitch with harmonics (periodic, as voiced speech is) plus
+            // noise, its level stepping at syllable rate over 0 to -10 dB. Steps make
+            // Schmidl-Cox windows whose halves differ in level.
+            let mut rng = Prng::new(98);
+            let mut uniform = move || rng.next_u32() as f32 / u32::MAX as f32;
+            let syllable = (0.12 * fs) as usize;
+            let mut level = 1.0f32;
+            let mut pitch = 150.0f32;
+            let mut phase = 0.0f32;
+            (0..n)
+                .map(|i| {
+                    if i % syllable == 0 {
+                        level = 10f32.powf(-uniform() / 2.0);
+                        pitch = 100.0 + 150.0 * uniform();
+                    }
+                    phase = (phase + 2.0 * PI * pitch / fs) % (2.0 * PI);
+                    let voiced: f32 = (1..=12).map(|h| (h as f32 * phase).sin() / h as f32).sum();
+                    0.1 * level * (voiced + 0.5 * (uniform() - 0.5))
+                })
+                .collect()
+        }
         _ => unreachable!("noise case {case}"),
     }
 }
@@ -321,6 +368,8 @@ fn detector_eval() {
     let level: u8 = env_or("LEVEL", 1);
     let ncw: usize = env_or("NCW", 1);
     let noise_s: f32 = env_or("NOISE_SECONDS", 60.0);
+    let fading: Option<Fading> =
+        std::env::var("FADING").ok().map(|v| v.parse().unwrap_or_else(|e| panic!("FADING={v:?}: {e}")));
     assert!((level as usize) < LEVELS.len(), "LEVEL {level}: levels are 0 to {}", LEVELS.len() - 1);
     assert!(trials > 0, "TRIALS must be at least 1");
     assert!(noise_s > 0.0, "NOISE_SECONDS={noise_s}: must be more than 0");
@@ -342,8 +391,9 @@ fn detector_eval() {
     });
     let names: Vec<&str> = DETECTORS.iter().map(|(n, _)| *n).collect();
     println!(
-        "level {level} ({}), {ncw} codeword(s), {trials} trials per point, txdelay {TXDELAY} s",
-        LEVELS[level as usize].name
+        "level {level} ({}), {ncw} codeword(s), {trials} trials per point, txdelay {TXDELAY} s, {}",
+        LEVELS[level as usize].name,
+        fading.map_or("static channel".into(), |f| format!("fading {f} (CNR is the mean)"))
     );
     for &mode in &modes {
         let m = modem(mode);
@@ -353,7 +403,7 @@ fn detector_eval() {
         assert!(ncw <= max, "NCW {ncw}: a level {level} burst in {mode} mode holds at most {max} codewords");
         println!("\n{mode}: hits and decoded bursts out of {trials}; paired test against '{}'", names[0]);
         for cnr in cnr_list(mode) {
-            let res = run_trials(&m, mode, cnr, level, ncw, trials);
+            let res = run_trials(&m, &TrialSpec { mode, cnr, fading, level, ncw }, trials);
             let genie = res.iter().filter(|r| r.genie).count();
             let mut line = format!("  CNR {cnr:5.1} dB  genie {genie:4}");
             for (d, name) in names.iter().enumerate() {
@@ -408,7 +458,7 @@ fn harness_sees_strong_bursts_and_no_false_headers() {
             let tx = m.modulate(&burst(1, 1, payload_seed(t)));
             assert_eq!(m.ofdm.detect(&transmit(&clean, &tx), 0), Some(truth), "{mode}: payload {t} moves the burst");
         }
-        for r in run_trials(&m, mode, 25.0, 1, 1, 4) {
+        for r in run_trials(&m, &TrialSpec { mode, cnr: 25.0, fading: None, level: 1, ncw: 1 }, 4) {
             assert!(r.genie, "{mode}: genie failed on a strong signal");
             assert!(r.det.iter().all(|&(_, ok)| ok), "{mode}: a detector missed a strong burst");
         }
