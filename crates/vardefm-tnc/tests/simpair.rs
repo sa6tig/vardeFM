@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use vardefm_dsp::prng::Prng;
+use vardefm_sim::Fading;
 use vardefm_tnc::simpair::{SimPair, SimPairConfig};
 
 const TIMEOUT: Duration = Duration::from_secs(240);
@@ -128,9 +129,14 @@ fn payload(n: usize, seed: u32) -> Vec<u8> {
 /// Simulated time runs 20x faster than real time: fast enough for CI, slow
 /// enough that host reaction times (milliseconds) stay realistic.
 fn sim(mode: &str, cnr: Option<f32>, ppm: f32, seed: u64) -> SimPair {
+    sim_fading(mode, cnr, ppm, seed, None)
+}
+
+fn sim_fading(mode: &str, cnr: Option<f32>, ppm: f32, seed: u64, fading: Option<Fading>) -> SimPair {
     SimPair::start(SimPairConfig {
         mode: mode.into(),
         cnr_db: cnr,
+        fading,
         ppm,
         seed,
         speed: 20.0,
@@ -144,7 +150,11 @@ fn sim(mode: &str, cnr: Option<f32>, ppm: f32, seed: u64) -> SimPair {
 
 /// Full session: connect A->B, 10 kB each way, graceful disconnect.
 fn session(mode: &str, cnr: Option<f32>, ppm: f32, seed: u64) {
-    let sp = sim(mode, cnr, ppm, seed);
+    session_fading(mode, cnr, ppm, seed, None);
+}
+
+fn session_fading(mode: &str, cnr: Option<f32>, ppm: f32, seed: u64, fading: Option<Fading>) {
+    let sp = sim_fading(mode, cnr, ppm, seed, fading);
     let mut a = Host::connect("A", sp.addrs[0]);
     let mut b = Host::connect("B", sp.addrs[1]);
 
@@ -183,7 +193,7 @@ fn session(mode: &str, cnr: Option<f32>, ppm: f32, seed: u64) {
     let secs = t1.now - t0.now;
     let air = (t1.airtime[0] - t0.airtime[0], t1.airtime[1] - t0.airtime[1]);
     println!(
-        "{mode} cnr={cnr:?} ppm={ppm}: 2 x 10 kB in {secs:.1} s ({:.0} bit/s total), airtime A {:.1} s / B {:.1} s, \
+        "{mode} cnr={cnr:?} ppm={ppm} fading={fading:?}: 2 x 10 kB in {secs:.1} s ({:.0} bit/s total), airtime A {:.1} s / B {:.1} s, \
          bursts {}, disconnect {:.1} s",
         20_000.0 * 8.0 / secs,
         air.0,
@@ -211,6 +221,14 @@ fn narrow_weak_signal_with_clock_error() {
 #[test]
 fn wide_moderate_signal() {
     session("wide", Some(24.0), -50.0, 3);
+}
+
+#[test]
+fn narrow_mobile_fading() {
+    // A mobile path: every burst fades (Rayleigh, 20 Hz Doppler) at 30 dB mean CNR.
+    // Some bursts are lost or partly decoded; ARQ and rate adaptation must still
+    // deliver every byte intact.
+    session_fading("narrow", Some(30.0), 0.0, 5, Some(Fading::rayleigh(20.0)));
 }
 
 #[test]

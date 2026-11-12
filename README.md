@@ -84,6 +84,7 @@ vardefm sim-pair --cnr 18 --ppm -40 --record wavs
 |---|---|
 | `--mode narrow\|wide` | mic/speaker audio or 9600 data port |
 | `--cnr <dB>` | carrier-to-noise ratio (omit for no noise) |
+| `--fading <spec>` | flat fading of a mobile or portable path: `rayleigh:<Doppler Hz>` or `rician:<Doppler Hz>:<K dB>`; `--cnr` is then the mean CNR. Each transmission fades independently, which is only realistic above a few Hz of Doppler (fades much shorter than a burst); the squelch stays open through fades |
 | `--ppm <n>` | sound-card clock error |
 | `--keyup <s>`, `--txdelay <s>` | radio key-up time and the modem's leader (must be longer) |
 | `--a-port`, `--b-port` | command ports (data = +1); defaults 8300 and 8310 |
@@ -103,6 +104,9 @@ It prints one line per transmission and per reception:
 # Frames through a simulated FM link at 12 dB carrier-to-noise, 80 ppm clock error
 vardefm sim --mode narrow --mod qpsk --cnr 12 --ppm 80
 
+# The same on a mobile path: Rayleigh fading with 20 Hz Doppler, 25 dB mean CNR
+vardefm sim --mode narrow --mod qpsk --cnr 25 --fading rayleigh:20
+
 # Bit-error table over signal level for every modulation (uncoded)
 vardefm sweep --mode wide
 
@@ -115,7 +119,8 @@ vardefm rx-wav --mode narrow --mod qpsk --in recording.wav
 ```
 
 Useful options: `--txdelay` (leader length; it must exceed the radio's key-up time),
-`--tilt=<dB/oct>`, `--rms <level>`. Set `VARDEFM_DUMP=1` to print per-carrier SNR.
+`--tilt=<dB/oct>`, `--rms <level>`. `sim` and `sweep` also take `--fading <spec>`
+(as for `sim-pair`). Set `VARDEFM_DUMP=1` to print per-carrier SNR.
 
 ### Tests
 
@@ -144,6 +149,7 @@ VARDEFM_TEST_WAV_DIR=wavs cargo test --test audio
 Benchmarks (ignored by default; run in release mode):
 ```sh
 cargo test --release -p vardefm-modem level_table -- --ignored --nocapture   # level vs CNR
+cargo test --release -p vardefm-modem fading_table -- --ignored --nocapture  # same, Rayleigh 5/20/80 Hz
 cargo test --release -p vardefm-fec fer_curve -- --ignored --nocapture       # LDPC curves
 ```
 

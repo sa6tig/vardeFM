@@ -16,7 +16,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use vardefm_link::LinkConfig;
 use vardefm_modem::{Modem, OfdmParams, LEVELS};
-use vardefm_sim::{transmit, FmChannelConfig};
+use vardefm_sim::{transmit, Fading, FmChannelConfig};
 
 /// Audio step: 10 ms.
 const STEP: usize = 480;
@@ -27,6 +27,9 @@ pub struct SimPairConfig {
     pub mode: String,
     /// Carrier-to-noise ratio in dB; None = noiseless.
     pub cnr_db: Option<f32>,
+    /// Flat fading (None = static). Each transmission gets its own independent fading
+    /// process, seeded like its noise.
+    pub fading: Option<Fading>,
     /// Receiver clock error in ppm (both directions).
     pub ppm: f32,
     /// Radio key-up delay in seconds.
@@ -52,6 +55,7 @@ impl Default for SimPairConfig {
         Self {
             mode: "narrow".into(),
             cnr_db: Some(20.0),
+            fading: None,
             ppm: 0.0,
             keyup_s: 0.05,
             txdelay_s: 0.1,
@@ -109,6 +113,7 @@ impl SimPair {
             ports,
             channel: FmChannelConfig {
                 cnr_db: cfg.cnr_db,
+                fading: cfg.fading,
                 clock_offset_ppm: cfg.ppm,
                 keyup_delay_s: cfg.keyup_s,
                 lead_silence_s: 0.0,

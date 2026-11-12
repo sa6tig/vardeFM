@@ -8,7 +8,7 @@ mod radio_cmds;
 use vardefm_audio::Channel;
 use vardefm_cli::{count_errors, decode_all, make_frame, read_wav, test_bits, write_wav};
 use vardefm_dsp::{Modulation, Ofdm, OfdmParams};
-use vardefm_sim::{transmit, FmChannelConfig};
+use vardefm_sim::{transmit, Fading, FmChannelConfig};
 use vardefm_tnc::simpair::{SimPair, SimPairConfig};
 
 #[derive(Parser)]
@@ -71,6 +71,9 @@ enum Cmd {
         /// Simulated radio key-up time, seconds
         #[arg(long, default_value_t = 0.05)]
         keyup: f32,
+        /// Flat fading: rayleigh:<doppler Hz> or rician:<doppler Hz>:<K dB> (CNR is then the mean)
+        #[arg(long)]
+        fading: Option<Fading>,
     },
     /// BER table over CNR for every modulation
     Sweep {
@@ -83,6 +86,9 @@ enum Cmd {
         /// Simulated radio key-up time, seconds
         #[arg(long, default_value_t = 0.05)]
         keyup: f32,
+        /// Flat fading: rayleigh:<doppler Hz> or rician:<doppler Hz>:<K dB> (CNR is then the mean)
+        #[arg(long)]
+        fading: Option<Fading>,
     },
     /// Write test frames to a WAV file (play it into a radio)
     TxWav {
@@ -220,6 +226,9 @@ enum Cmd {
         /// Random seed for the channel noise
         #[arg(long, default_value_t = 1)]
         seed: u64,
+        /// Flat fading: rayleigh:<doppler Hz> or rician:<doppler Hz>:<K dB> (CNR is then the mean; each transmission fades independently)
+        #[arg(long)]
+        fading: Option<Fading>,
         /// Simulated seconds per real second (0 = as fast as possible)
         #[arg(long, default_value_t = 1.0)]
         speed: f64,
@@ -285,19 +294,21 @@ fn raw_rate(ofdm: &Ofdm, m: Modulation, nsym: usize) -> f32 {
 fn main() {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Sim { modem, cnr, frames, ppm, keyup } => {
+        Cmd::Sim { modem, cnr, frames, ppm, keyup, fading } => {
             let (ofdm, m) = modem.build();
             let mut cfg = FmChannelConfig::by_name(&modem.mode).unwrap();
             cfg.cnr_db = cnr;
+            cfg.fading = fading;
             cfg.clock_offset_ppm = ppm;
             cfg.keyup_delay_s = keyup;
             let st = run_sim(&ofdm, m, modem.symbols, modem.txdelay, &cfg, frames);
             println!(
-                "mode={} mod={} cnr={} ppm={}  raw={:.0} bit/s",
+                "mode={} mod={} cnr={} ppm={} fading={}  raw={:.0} bit/s",
                 modem.mode,
                 m.name(),
                 cnr.map_or("none".into(), |c| format!("{c} dB")),
                 ppm,
+                fading.map_or("none".into(), |f| f.to_string()),
                 raw_rate(&ofdm, m, modem.symbols)
             );
             println!(
@@ -308,10 +319,17 @@ fn main() {
                 st.snr_sum / st.snr_n.max(1) as f32
             );
         }
-        Cmd::Sweep { modem, frames, ppm, keyup } => {
+        Cmd::Sweep { modem, frames, ppm, keyup, fading } => {
             let (ofdm, _) = modem.build();
             let cnrs = [6.0, 8.0, 10.0, 12.0, 15.0, 20.0, 25.0, 30.0, 40.0];
-            println!("mode={} symbols/frame={} ppm={} frames/point={}", modem.mode, modem.symbols, ppm, frames);
+            println!(
+                "mode={} symbols/frame={} ppm={} fading={} frames/point={}",
+                modem.mode,
+                modem.symbols,
+                ppm,
+                fading.map_or("none".into(), |f| f.to_string()),
+                frames
+            );
             print!("{:>8} {:>8}", "mod", "raw b/s");
             for c in cnrs {
                 print!(" {:>8}", format!("{c}dB"));
@@ -323,6 +341,7 @@ fn main() {
                 for (ci, &c) in cnrs.iter().enumerate() {
                     let mut cfg = FmChannelConfig::by_name(&modem.mode).unwrap();
                     cfg.cnr_db = Some(c);
+                    cfg.fading = fading;
                     cfg.clock_offset_ppm = ppm;
                     cfg.keyup_delay_s = keyup;
                     let st = run_sim(&ofdm, m, modem.symbols, modem.txdelay, &cfg, frames);
@@ -408,13 +427,14 @@ fn main() {
             radio_cmds::monitor(audio_in.as_deref(), in_channel, &mode).unwrap_or_else(|m| die(&m))
         }
         Cmd::Decode { mode, input } => radio_cmds::decode(&input, &mode).unwrap_or_else(|m| die(&m)),
-        Cmd::SimPair { mode, cnr, ppm, keyup, txdelay, seed, speed, host, a_port, b_port, record } => {
+        Cmd::SimPair { mode, cnr, ppm, keyup, txdelay, seed, fading, speed, host, a_port, b_port, record } => {
             if keyup >= txdelay {
                 die("--txdelay must be longer than --keyup");
             }
             let cfg = SimPairConfig {
                 mode,
                 cnr_db: cnr,
+                fading,
                 ppm,
                 keyup_s: keyup,
                 txdelay_s: txdelay,
@@ -428,9 +448,10 @@ fn main() {
             };
             let sp = SimPair::start(cfg.clone()).unwrap_or_else(|e| die(&e.to_string()));
             println!(
-                "sim-pair: {} mode, CNR {}, {} ppm, key-up {} s, speed {}x",
+                "sim-pair: {} mode, CNR {}, fading {}, {} ppm, key-up {} s, speed {}x",
                 cfg.mode,
                 cnr.map_or("none".into(), |c| format!("{c} dB")),
+                fading.map_or("none".into(), |f| f.to_string()),
                 ppm,
                 keyup,
                 speed
