@@ -47,6 +47,7 @@ fn fading_diag() {
                             (s > 1e-9).then_some(e / s)
                         })
                         .collect();
+                    assert!(!ratios.is_empty(), "{mode}: no whole symbol to compare");
                     let mean = ratios.iter().sum::<f32>() / ratios.len() as f32;
                     ratios.sort_by(f32::total_cmp);
                     let med = ratios[ratios.len() / 2];

@@ -379,53 +379,83 @@ fn coloured_click(m: &Modem, audio: &mut [f32], start: usize, hit: usize, band: 
     let from = start + (hit + 1) * l - p.ncp;
     let sig = &audio[start..start + 4 * l];
     let rms = (sig.iter().map(|x| x * x).sum::<f32>() / sig.len() as f32).sqrt();
-    let a = (2.0 * g * rms * rms / p.num_carriers as f32).sqrt();
-    let mut rng = Prng::new(55);
+    // Gaussian noise on each carrier: a complex Gaussian amplitude (Box-Muller) per
+    // carrier and symbol, so a pilot's deviation scatters as real noise does.
+    let sigma = (g * rms * rms / p.num_carriers as f32).sqrt();
+    let mut rng = Prng::new(55 + hit as u32);
+    let mut uniform = || (rng.next_u32() as f32 + 1.0) / (u32::MAX as f32 + 2.0);
     for k in band {
         let f = p.carrier_freq(k);
-        let phase = rng.next_u32() as f32 / u32::MAX as f32 * std::f32::consts::TAU;
+        let (u1, u2) = (uniform(), uniform());
+        // Rayleigh amplitude with mean square 2 sigma²: a carrier power of sigma².
+        let amp = sigma * (-2.0 * u1.ln()).sqrt();
+        let phase = u2 * std::f32::consts::TAU;
         for (i, x) in audio[from..from + l].iter_mut().enumerate() {
-            *x += a * (std::f32::consts::TAU * f * i as f32 / p.fs + phase).cos();
+            *x += amp * (std::f32::consts::TAU * f * i as f32 / p.fs + phase).cos();
         }
     }
 }
 
+/// Bursts of `level` 6, 4 codewords, at `cnr` dB, 12 seeds, every fourth payload symbol
+/// hit by Gaussian noise on the carriers `band(nc)` at `g` times the signal power per
+/// carrier. Returns codewords decoded with and without `Frame::carrier_noise_scale`,
+/// out of 48, how many hit symbols got a profile and how many were hit.
+fn click_trials(
+    mode: &str,
+    cnr: f32,
+    g: f32,
+    band: fn(usize) -> std::ops::Range<usize>,
+) -> (usize, usize, usize, usize) {
+    let m = modem(mode);
+    let (level, ncw) = (6, 4);
+    let nc = m.ofdm.p.num_carriers;
+    let hdr = m.header_symbols();
+    let nsym = hdr + ncw * m.symbols_per_codeword(level);
+    let (mut with, mut without, mut profiled, mut total_hits) = (0, 0, 0, 0);
+    for seed in 0..12u32 {
+        let b = burst(level, ncw, 40 + seed);
+        let (mut audio, start) = received(&m, mode, &b, cnr);
+        let hits: Vec<usize> = (hdr + seed as usize % 4..nsym).step_by(4).collect();
+        for &h in &hits {
+            coloured_click(&m, &mut audio, start, h, band(nc), g);
+        }
+        let known = m.header_carriers(&b.header);
+        let mut frame = m.ofdm.demodulate_known(&audio, start, nsym, &known).unwrap();
+        total_hits += hits.len();
+        profiled += hits.iter().filter(|&&h| !frame.carrier_noise_scale[h].is_empty()).count();
+        with += m.decode_payload(&b.header, &frame).iter().filter(|p| p.is_some()).count();
+        // `noise_at` takes the profile over the symbol scale, so clear the profile.
+        frame.carrier_noise_scale.iter_mut().for_each(Vec::clear);
+        without += m.decode_payload(&b.header, &frame).iter().filter(|p| p.is_some()).count();
+    }
+    (with, without, profiled, total_hits)
+}
+
 #[test]
 fn coloured_clicks_need_the_per_carrier_profile() {
-    // Every fourth payload symbol is hit by noise on the upper half of the band only,
-    // about 0.3 (narrow) or 1 (wide) times the signal power per carrier: up to a few
-    // hundred times the normal noise there, nothing extra below. One noise scale per
-    // symbol, the average over its pilots, overstates the noise on the clean carriers
-    // and understates it on the hit ones, and most codewords fail; the per-carrier
-    // profile follows the colour. At the time of writing, codewords decoded out of 24
-    // with / without the profile: narrow 24 / 12, wide 22 / 0.
-    for (mode, cnr, g, min_gain) in [("narrow", 24.0, 0.3, 8), ("wide", 33.0, 1.0, 12)] {
-        let m = modem(mode);
-        let (level, ncw) = (6, 4);
-        let nc = m.ofdm.p.num_carriers;
-        let hdr = m.header_symbols();
-        let nsym = hdr + ncw * m.symbols_per_codeword(level);
-        let (mut with, mut without) = (0, 0);
-        for seed in 0..6u32 {
-            let b = burst(level, ncw, 40 + seed);
-            let (mut audio, start) = received(&m, mode, &b, cnr);
-            let hits: Vec<usize> = (hdr + seed as usize % 4..nsym).step_by(4).collect();
-            for &h in &hits {
-                coloured_click(&m, &mut audio, start, h, nc / 2..nc, g);
-            }
-            let known = m.header_carriers(&b.header);
-            let mut frame = m.ofdm.demodulate_known(&audio, start, nsym, &known).unwrap();
-            for &h in &hits {
-                let c = &frame.carrier_noise_scale[h];
-                assert_eq!(c.len(), m.ofdm.data_carriers(), "{mode} seed {seed}: symbol {h} has no profile");
-                let (lo, hi) = (c[..c.len() / 3].iter().sum::<f32>(), c[2 * c.len() / 3..].iter().sum::<f32>());
-                assert!(hi > 3.0 * lo, "{mode} seed {seed} symbol {h}: profile does not follow the colour: {c:?}");
-            }
-            with += m.decode_payload(&b.header, &frame).iter().filter(|p| p.is_some()).count();
-            frame.carrier_noise_scale.iter_mut().for_each(Vec::clear);
-            without += m.decode_payload(&b.header, &frame).iter().filter(|p| p.is_some()).count();
-        }
-        assert!(with >= without + min_gain, "{mode}: {with}/24 codewords with the profile, {without}/24 without");
+    // Noise on the upper half of the band only, a few hundred times the normal noise
+    // there and nothing extra below. One noise scale per symbol, the average over its
+    // pilots, overstates the noise on the clean carriers and understates it on the hit
+    // ones; the per-carrier profile follows the colour. At the time of writing,
+    // codewords decoded out of 48 with / without the profile: narrow 38 / 11, wide
+    // 23 / 12; a profile on 115 of 120 and 91 of 96 hit symbols.
+    for (mode, cnr, g, min_gain) in [("narrow", 24.0, 0.21, 15), ("wide", 33.0, 0.4, 6)] {
+        let (with, without, profiled, hits) = click_trials(mode, cnr, g, |nc| nc / 2..nc);
+        assert!(profiled * 10 >= 9 * hits, "{mode}: a profile on {profiled} of {hits} hit symbols");
+        assert!(with >= without + min_gain, "{mode}: {with}/48 codewords with the profile, {without}/48 without");
+    }
+}
+
+#[test]
+fn flat_clicks_lose_little_to_the_per_carrier_profile() {
+    // The same noise over the whole band: one scale per symbol is right, and a profile
+    // estimated from single pilot samples would only add scatter (it cost 15 of 48
+    // codewords before profiles were limited to uneven noise). At the time of writing,
+    // with / without: narrow 36 / 37, wide 35 / 37.
+    for (mode, cnr, g) in [("narrow", 24.0, 0.09), ("wide", 33.0, 0.08)] {
+        let (with, without, _, _) = click_trials(mode, cnr, g, |nc| 0..nc);
+        assert!(without >= 24, "{mode}: only {without}/48 codewords decode: the case says nothing");
+        assert!(with + 4 >= without, "{mode}: {with}/48 codewords with the profile, {without}/48 without");
     }
 }
 

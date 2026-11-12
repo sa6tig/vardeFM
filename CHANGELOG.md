@@ -7,6 +7,11 @@ run the same minor version.
 ## [Unreleased]
 
 ### Added
+- **Detector settings and per-carrier noise in vardefm-dsp.** `Ofdm::detect_with` runs
+  burst detection with an `ScConfig` (`ScConfig::CLASSIC` is the detector before this
+  release). `Frame::noise_at` gives the noise variance of one cell, and the new public
+  field `Frame::carrier_noise_scale` holds the per-carrier scales; code that builds a
+  `Frame` with a struct literal must add it.
 - **Performance gates.** `level_gate` and `fer_gate` are ignored tests, run by hand in
   release mode, that fail when decoding performance moves. Per mode and level, the CNR
   at which 10 % of codewords fail, and per mode and drive level the CNR at which 10 % of
@@ -24,17 +29,18 @@ run the same minor version.
 ### Changed
 - **Burst detection holds up when noise hits preamble A.** The receiver only; on-air
   compatible. The Schmidl-Cox metric is normalized by the quieter half of its window
-  (P²/min(R1, R2)², threshold 0.4) instead of the second half (P²/R2², 0.3). Windows
-  whose halves differ by more than 10 dB are gated out. Fine timing searches the whole
-  plateau, up to 4 cyclic prefixes either side. On the simulator (`detector_eval`, 100
-  paired bursts) narrow mode at 5 dB CNR decodes 84 bursts instead of 59, and Rayleigh
-  20 Hz at 14 dB mean CNR 89 (narrow) and 80 (wide) instead of 73 and 72. Detections on
-  carrier noise stay at about the old rate, with no false headers.
-- **Per-carrier noise for click-hit symbols.** A symbol whose noise scale is above 1
-  also gets a per-carrier scale from its own pilots, so noise confined to part of the
-  band (a click in a fast fade, an interferer) weights the LLRs where it is. New in
-  vardefm-dsp: `Frame::carrier_noise_scale` and `Frame::noise_at`. Also new:
-  `Ofdm::detect_with` and `ScConfig` to run other detection settings.
+  (P²/min(R1, R2)², the energy ratio counted at most 3 times, threshold 0.4) instead of
+  the second half (P²/R2², 0.3). Windows whose halves differ by more than 10 dB are
+  gated out. Fine timing searches the whole plateau, up to 4 cyclic prefixes either
+  side. On the simulator (`detector_eval`, 100 paired bursts) narrow mode at 5 dB CNR
+  decodes 84 bursts instead of 59, and Rayleigh 20 Hz at 14 dB mean CNR 88 (narrow)
+  and 77 (wide) instead of 73 and 72. Detections on a weak carrier (5 dB CNR) are 0-2
+  per minute against the old 1-10, none with a false header.
+- **Per-carrier noise for some click-hit symbols.** A symbol whose noise scale is above
+  1, and whose pilots show its noise to be uneven across the band (one half more than 4
+  times the other), gets a per-carrier scale from its own pilots. That helps where
+  such noise hits many symbols (a band-limited interferer); on the simulated fading
+  channels the gain is a few codewords in a hundred or none.
 - **Busy detection measures only the carrier band** (422–2672 Hz narrow, 400–6000 Hz wide).
   A CTCSS tone, mains hum, a DC step or hiss above the band no longer reads as a busy
   channel, and no longer hides a signal inside the band. A keyed carrier with only a CTCSS

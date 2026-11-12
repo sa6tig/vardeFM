@@ -273,7 +273,8 @@ pub(crate) fn env_flag(name: &str) -> bool {
 }
 
 /// The kinds of audio without a burst in the false-detection pass, for [`noise_case`].
-const NOISE_CASES: [&str; 4] = ["carrier at -10 dB CNR", "weak carrier, 5 dB CNR", "white noise", "keyed tones"];
+const NOISE_CASES: [&str; 5] =
+    ["carrier at -10 dB CNR", "weak carrier, 5 dB CNR", "white noise", "keyed tones", "voice-like level steps"];
 
 /// Tone sets for the "keyed tones" case, Hz. 750 + 1500 Hz repeat every nfft/2
 /// samples in both modes, like preamble A; then a roger beep and DTMF pairs.
@@ -316,6 +317,28 @@ fn noise_case(mode: &str, case: usize, seconds: f32, fs: f32) -> Vec<f32> {
                         .iter()
                         .map(|&f| 0.15 * (2.0 * PI * ((on as u64 * f) % rate) as f32 / rate as f32).sin())
                         .sum()
+                })
+                .collect()
+        }
+        4 => {
+            // Speech-like: a pitch with harmonics (periodic, as voiced speech is) plus
+            // noise, its level stepping at syllable rate over 0 to -10 dB. Steps make
+            // Schmidl-Cox windows whose halves differ in level.
+            let mut rng = Prng::new(98);
+            let mut uniform = move || rng.next_u32() as f32 / u32::MAX as f32;
+            let syllable = (0.12 * fs) as usize;
+            let mut level = 1.0f32;
+            let mut pitch = 150.0f32;
+            let mut phase = 0.0f32;
+            (0..n)
+                .map(|i| {
+                    if i % syllable == 0 {
+                        level = 10f32.powf(-uniform() / 2.0);
+                        pitch = 100.0 + 150.0 * uniform();
+                    }
+                    phase = (phase + 2.0 * PI * pitch / fs) % (2.0 * PI);
+                    let voiced: f32 = (1..=12).map(|h| (h as f32 * phase).sin() / h as f32).sum();
+                    0.1 * level * (voiced + 0.5 * (uniform() - 0.5))
                 })
                 .collect()
         }
