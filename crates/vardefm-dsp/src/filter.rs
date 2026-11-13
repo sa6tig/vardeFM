@@ -105,6 +105,51 @@ impl Chain {
         c
     }
 
+    /// A response that rises by `db_per_octave` (falls, if negative) from `lo` to
+    /// `hi` Hz and levels off within about an octave outside them. Its gain keeps the
+    /// power of a signal with a flat spectrum from `lo` to `hi`, so a tilt reshapes
+    /// such a signal without making it louder or quieter.
+    ///
+    /// Built from one first-order shelf per octave, each stepping the gain by
+    /// `db_per_octave`, so the slope ripples by a fraction of a dB around the
+    /// target. At ±6 dB/octave the shelves merge into a single zero or pole.
+    pub fn tilt(fs: f32, db_per_octave: f32, lo: f32, hi: f32) -> Self {
+        let mut c = Self::new();
+        if db_per_octave == 0.0 {
+            return c;
+        }
+        assert!(0.0 < lo && lo < hi && hi < fs / 2.0, "tilt band {lo}..{hi} Hz");
+        // Bilinear prewarp: the analog frequency that lands on `f` Hz after the transform.
+        let warp = |f: f32| 2.0 * fs * (PI * f / fs).tan();
+        let step = 10f32.powf(db_per_octave.abs() / 20.0);
+        let octaves = (hi / lo).log2().ceil() as i32;
+        let mut corners = Vec::new();
+        // One extra shelf past each edge, so the slope holds all the way to `lo` and `hi`.
+        for k in -1..=octaves {
+            // Corners stay below Nyquist, where the prewarp diverges.
+            let corner = |f: f32| warp(f.min(0.49 * fs));
+            let (lower, upper) = (corner(lo * 2f32.powi(k)), corner(lo * 2f32.powi(k) * step));
+            // H(s) = (1 + s/wz) / (1 + s/wp): rising when the zero sits below the pole.
+            corners.push(if db_per_octave > 0.0 { (lower, upper) } else { (upper, lower) });
+        }
+        // Mean power gain over `lo..hi` on a fine linear grid; the prewarp makes the
+        // analog response at warp(f) the digital response at f.
+        const GRID: usize = 512;
+        let power = (0..GRID)
+            .map(|i| {
+                let w = warp(lo + (hi - lo) * (i as f32 + 0.5) / GRID as f32);
+                corners.iter().map(|&(wz, wp)| (1.0 + (w / wz).powi(2)) / (1.0 + (w / wp).powi(2))).product::<f32>()
+            })
+            .sum::<f32>()
+            / GRID as f32;
+        let g = power.sqrt().recip();
+        for (i, &(wz, wp)) in corners.iter().enumerate() {
+            let n = if i == 0 { g } else { 1.0 };
+            c.first.push(FirstOrder::from_analog(fs, n, n / wz, 1.0, 1.0 / wp));
+        }
+        c
+    }
+
     pub fn push_first_order(&mut self, f: FirstOrder) {
         self.first.push(f);
     }
@@ -296,6 +341,43 @@ mod tests {
         let mut de = Chain::new();
         de.push_first_order(FirstOrder::deemphasis(fs, 750e-6));
         let _ = Chain::highpass4(fs, 400.0).then(de);
+    }
+
+    #[test]
+    fn tilt_has_its_slope_across_the_band_and_keeps_a_flat_signals_power() {
+        let fs = 48_000.0;
+        let db = |c: &Chain, freq: f32| {
+            let mut c = c.clone();
+            20.0 * tone_gain(&mut |x| c.process(x), freq, fs).log10()
+        };
+        for (lo, hi) in [(300.0, 3000.0), (300.0, 7000.0)] {
+            for slope in [-6.0, -3.0, 3.0, 6.0] {
+                let c = Chain::tilt(fs, slope, lo, hi);
+                // Every carrier of both modes lies between 422 Hz and 6 kHz; within
+                // the band the gain follows the slope, measured from 1 kHz.
+                let at_1k = db(&c, 1000.0);
+                for freq in [422.0, 700.0, 1500.0, 2672.0, 6000.0].into_iter().filter(|&f| f > lo && f < hi) {
+                    let want = slope * (freq / 1000.0f32).log2();
+                    let got = db(&c, freq) - at_1k;
+                    assert!(
+                        (got - want).abs() < 0.6,
+                        "{lo}..{hi} {slope} dB/oct at {freq} Hz: {got:.2} dB, want {want:.2}"
+                    );
+                }
+                // Equal tones spread evenly over the band keep their total power.
+                let n = 32;
+                let power = (0..n)
+                    .map(|i| 10f32.powf(db(&c, lo + (hi - lo) * (i as f32 + 0.5) / n as f32) / 10.0))
+                    .sum::<f32>()
+                    / n as f32;
+                assert!(
+                    power.log10().abs() * 10.0 < 0.3,
+                    "{lo}..{hi} {slope} dB/oct: power {:.2} dB",
+                    10.0 * power.log10()
+                );
+            }
+        }
+        assert!(Chain::tilt(fs, 0.0, 300.0, 3000.0).first.is_empty());
     }
 
     #[test]

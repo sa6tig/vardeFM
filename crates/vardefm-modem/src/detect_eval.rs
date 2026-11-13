@@ -34,9 +34,10 @@
 //! `NOISE_SEED` (1, for other noise in that pass), `CSV` (file to append the burst
 //! results to). Three more change the bursts' path, not the noise cases: `CHANNEL`,
 //! the radio audio response (matched, tx-pre-only or rx-de-only, see [`CHANNELS`]),
-//! `TX_TILT`, dB/octave the sender tilts its audio by beyond what the receiver
-//! expects (0), and `CTCSS`, the deviation in Hz of a CTCSS tone the sending radio
-//! adds (0 = none; wide mode only, as the narrow audio path filters sub-tones out).
+//! `TX_TILT`, dB/octave the sending radio tilts its audio by (0, the simulator's
+//! `tx_tilt_db_per_octave`), and `CTCSS`, the deviation in Hz of a CTCSS tone the
+//! sending radio adds (0 = none; wide mode only, as the narrow audio path filters
+//! sub-tones out).
 
 use super::*;
 use crate::busy_eval::CTCSS_HZ;
@@ -56,15 +57,12 @@ const REFERENCE: Detector = Detector::SchmidlCox;
 const TXDELAY: f32 = 0.15;
 
 pub(crate) fn modem(mode: &str) -> Arc<Modem> {
-    eval_modem(mode, 0.0, Detector::default())
+    eval_modem(mode, Detector::default())
 }
 
-/// A modem whose TX tilt is `tilt` dB/octave more than the mode's and whose receiver
-/// uses `detector`.
-fn eval_modem(mode: &str, tilt: f32, detector: Detector) -> Arc<Modem> {
-    let mut p = OfdmParams::by_name(mode).unwrap();
-    p.tilt_db_per_octave += tilt;
-    let mut m = Modem::new(p, TXDELAY).with_detector(detector);
+/// The `mode` modem whose receiver uses `detector`.
+fn eval_modem(mode: &str, detector: Detector) -> Arc<Modem> {
+    let mut m = Modem::new(OfdmParams::by_name(mode).unwrap(), TXDELAY).with_detector(detector);
     // Trials already run on every core.
     m.decode_threads = 1;
     Arc::new(m)
@@ -77,9 +75,10 @@ fn eval_modem(mode: &str, tilt: f32, detector: Detector) -> Arc<Modem> {
 /// narrow channel's 750 us in either mode.
 const CHANNELS: [&str; 3] = ["matched", "tx-pre-only", "rx-de-only"];
 
-/// The FM channel of `mode` with response `channel` from [`CHANNELS`].
-fn channel(mode: &str, channel: &str) -> FmChannelConfig {
-    let base = FmChannelConfig::by_name(mode).unwrap();
+/// The FM channel of `mode` with response `channel` from [`CHANNELS`] and a sending
+/// radio that tilts its audio by `tx_tilt` dB/octave.
+fn channel(mode: &str, channel: &str, tx_tilt: f32) -> FmChannelConfig {
+    let base = FmChannelConfig { tx_tilt_db_per_octave: tx_tilt, ..FmChannelConfig::by_name(mode).unwrap() };
     let us = FmChannelConfig::narrow().tx_emphasis_us;
     match channel {
         "matched" => base,
@@ -89,21 +88,19 @@ fn channel(mode: &str, channel: &str) -> FmChannelConfig {
     }
 }
 
-/// What a trial sends through and receives with: the receiving modem, whose detectors
-/// are evaluated, the sending modem, which may tilt its audio differently, the
-/// channel between them, without noise, and the deviation of a CTCSS tone the sending
-/// radio adds (0 for none).
+/// What a trial sends through and receives with: the modem at both ends, whose
+/// detectors are evaluated, the channel between them, without noise, which holds every
+/// mismatch of the two radios' audio responses, and the deviation of a CTCSS tone the
+/// sending radio adds (0 for none).
 struct Link {
-    rx: Arc<Modem>,
-    tx: Arc<Modem>,
+    modem: Arc<Modem>,
     chan: FmChannelConfig,
     ctcss_hz: f32,
 }
 
 impl Link {
     fn new(mode: &str, chan: &str, tx_tilt: f32) -> Self {
-        let tx = eval_modem(mode, tx_tilt, Detector::default());
-        Self { rx: modem(mode), tx, chan: channel(mode, chan), ctcss_hz: 0.0 }
+        Self { modem: modem(mode), chan: channel(mode, chan, tx_tilt), ctcss_hz: 0.0 }
     }
 
     fn matched(mode: &str) -> Self {
@@ -114,7 +111,7 @@ impl Link {
     /// passes sub-tones, as busy_eval models it: wide mode.
     fn with_ctcss(self, deviation_hz: f32) -> Self {
         let passes = self.chan.tx_band.0 < CTCSS_HZ[0];
-        assert!(deviation_hz == 0.0 || passes, "CTCSS: the {} TX audio path filters it out", self.rx.ofdm.p.name);
+        assert!(deviation_hz == 0.0 || passes, "CTCSS: the {} TX audio path filters it out", self.modem.ofdm.p.name);
         Self { ctcss_hz: deviation_hz, ..self }
     }
 
@@ -225,10 +222,10 @@ pub(crate) fn through_channel(m: &Modem, mode: &str, cnr: f32, sent: &Burst, t: 
 }
 
 fn trial(link: &Link, cnr: f32, level: u8, ncw: usize, truth: usize, t: u32) -> Trial {
-    let m = &*link.rx;
+    let m = &*link.modem;
     let sent = burst(level, ncw, payload_seed(t));
     let cfg = FmChannelConfig { cnr_db: Some(cnr), seed: channel_seed(cnr, t), ..link.chan.clone() };
-    let rx = transmit(&cfg, &link.on_air(link.tx.modulate(&sent), t));
+    let rx = transmit(&cfg, &link.on_air(link.modem.modulate(&sent), t));
     let tol = m.ofdm.p.ncp / 4;
     let det = Detector::ALL
         .iter()
@@ -250,8 +247,8 @@ fn trial(link: &Link, cnr: f32, level: u8, ncw: usize, truth: usize, t: u32) -> 
 /// agreeing with the reference rather than finding the burst.
 fn link_position(link: &Link, level: u8, ncw: usize) -> usize {
     let clean = FmChannelConfig { cnr_db: None, ..link.chan.clone() };
-    let rx = transmit(&clean, &link.tx.modulate(&burst(level, ncw, payload_seed(0))));
-    let ofdm = &link.rx.ofdm;
+    let rx = transmit(&clean, &link.modem.modulate(&burst(level, ncw, payload_seed(0))));
+    let ofdm = &link.modem.ofdm;
     let truth = ofdm.detect_with(REFERENCE, &rx, 0).expect("burst not found on a clean channel");
     for d in Detector::ALL {
         let at = ofdm.detect_with(d, &rx, 0);
@@ -440,7 +437,7 @@ fn false_detections(m: &Modem, d: Detector, rx: &[f32]) -> (u32, u32) {
 /// fed in 10 ms chunks. The best of three runs, so that a cold cache or a busy core
 /// does not set the figure.
 fn receiver_load(mode: &str, detector: Detector, audio: &[f32]) -> f64 {
-    let m = eval_modem(mode, 0.0, detector);
+    let m = eval_modem(mode, detector);
     let fs = m.fs() as f64;
     let chunk = (fs / 100.0) as usize;
     (0..3)
@@ -512,7 +509,7 @@ fn detector_eval() {
     );
     for &mode in &modes {
         let link = Link::new(mode, chan, tx_tilt).with_ctcss(ctcss);
-        let m = &*link.rx;
+        let m = &*link.modem;
         // A longer burst would modulate, but its header would not unpack (MAX_NCW) or
         // the modem would never send it (MAX_PAYLOAD_SECONDS): every trial would fail.
         let max = m.max_ncw(level);
@@ -612,7 +609,7 @@ fn matched_filter_stays_below_threshold_on_unseen_noise() {
 fn harness_sees_strong_bursts_and_no_false_headers() {
     for mode in OfdmParams::all().map(|p| p.name) {
         let link = Link::matched(mode);
-        let m = &*link.rx;
+        let m = &*link.modem;
         // The true position must not depend on the payload, or one copy could not give it.
         let truth = link_position(&link, 1, 1);
         let clean = FmChannelConfig { cnr_db: None, ..link.chan.clone() };
@@ -720,7 +717,7 @@ fn offline_receive_matches_the_streaming_receiver() {
         let sent = burst(1, 1, 7);
         let tx = modem(mode).modulate(&sent);
         for detector in Detector::ALL {
-            let m = eval_modem(mode, 0.0, detector);
+            let m = eval_modem(mode, detector);
             let (mut total, mut ok) = (0, 0);
             for seed in 0..seeds {
                 for cnr in cnrs {

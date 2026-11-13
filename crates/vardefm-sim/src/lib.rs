@@ -22,6 +22,12 @@ pub struct FmChannelConfig {
     /// RX de-emphasis time constant in microseconds. A radio whose value differs from
     /// `tx_emphasis_us` passes the modem audio with a tilted response.
     pub rx_emphasis_us: Option<f32>,
+    /// TX audio response tilt in dB per octave across `tx_band` above 300 Hz: a
+    /// sending radio whose audio response does not match the receiver's. It keeps
+    /// the power of audio with a flat spectrum across that band, so it reshapes the
+    /// modem's carriers without changing their level much, and acts before the
+    /// deviation limiter, like pre-emphasis.
+    pub tx_tilt_db_per_octave: f32,
     /// TX audio passband in Hz.
     pub tx_band: (f32, f32),
     /// RX audio passband in Hz.
@@ -51,6 +57,7 @@ impl FmChannelConfig {
             deviation_hz: 2_500.0,
             tx_emphasis_us: Some(750.0),
             rx_emphasis_us: Some(750.0),
+            tx_tilt_db_per_octave: 0.0,
             tx_band: (300.0, 3_000.0),
             rx_band: (300.0, 3_000.0),
             if_bandwidth_hz: 11_000.0,
@@ -87,6 +94,9 @@ impl FmChannelConfig {
     }
 }
 
+/// Lowest frequency the TX tilt reaches, Hz; below it the response levels off.
+const TILT_LOW_HZ: f32 = 300.0;
+
 /// Pass one transmission (audio at `cfg.fs`, full scale = peak deviation) through the channel.
 pub fn transmit(cfg: &FmChannelConfig, audio: &[f32]) -> Vec<f32> {
     let fs = cfg.fs;
@@ -100,9 +110,13 @@ pub fn transmit(cfg: &FmChannelConfig, audio: &[f32]) -> Vec<f32> {
     // --- Transmitter audio chain ---
     let mut tx_chain = Chain::bandpass4(fs, cfg.tx_band.0, cfg.tx_band.1);
     let mut pre = cfg.tx_emphasis_us.map(|us| FirstOrder::preemphasis(fs, us * 1e-6));
+    // The tilt spans the speech band at most: a radio's response does not keep
+    // rising (or falling) to the 20 Hz edge of a data port.
+    let tilt_lo = cfg.tx_band.0.max(TILT_LOW_HZ);
+    let mut tilt = Chain::tilt(fs, cfg.tx_tilt_db_per_octave, tilt_lo, cfg.tx_band.1);
     let mut tx_audio = vec![0f32; total];
     for (i, &x) in audio.iter().enumerate() {
-        let mut v = x;
+        let mut v = tilt.process(x);
         if let Some(p) = &mut pre {
             v = p.process(v);
         }
@@ -178,6 +192,29 @@ mod tests {
         let out = transmit(&cfg, &tone);
         let peak = out[24_000..40_000].iter().fold(0f32, |m, v| m.max(v.abs()));
         assert!((peak - 0.3).abs() < 0.05, "peak {peak}");
+    }
+
+    #[test]
+    fn tx_tilt_shapes_tones_by_the_octave() {
+        let peak_db = |slope: f32, freq: f32| {
+            let cfg = FmChannelConfig {
+                tx_tilt_db_per_octave: slope,
+                lead_silence_s: 0.0,
+                keyup_delay_s: 0.0,
+                ..FmChannelConfig::wide()
+            };
+            let tone: Vec<f32> = (0..48_000).map(|i| 0.1 * (2.0 * PI * freq * i as f32 / 48_000.0).sin()).collect();
+            let out = transmit(&cfg, &tone);
+            20.0 * (out[24_000..40_000].iter().fold(0f32, |m, v| m.max(v.abs())) / 0.1).log10()
+        };
+        for slope in [-6.0, -3.0, 3.0, 6.0] {
+            let gain = |freq: f32| peak_db(slope, freq) - peak_db(0.0, freq);
+            let at_1k = gain(1000.0);
+            for (freq, octaves) in [(500.0, -1.0), (4000.0, 2.0)] {
+                let got = gain(freq) - at_1k;
+                assert!((got - slope * octaves).abs() < 0.7, "{slope} dB/oct at {freq} Hz: {got:.2} dB from 1 kHz");
+            }
+        }
     }
 }
 

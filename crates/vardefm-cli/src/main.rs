@@ -94,6 +94,10 @@ enum Cmd {
         /// Simulated radio key-up time, seconds
         #[arg(long, default_value_t = 0.05)]
         keyup: f32,
+        /// Sending radio's audio response tilt in dB/octave at about the same level (a radio
+        /// mismatch; --tilt changes the modem at both ends instead)
+        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+        tx_tilt: f32,
     },
     /// BER table over CNR for every modulation
     Sweep {
@@ -108,6 +112,10 @@ enum Cmd {
         /// Simulated radio key-up time, seconds
         #[arg(long, default_value_t = 0.05)]
         keyup: f32,
+        /// Sending radio's audio response tilt in dB/octave at about the same level (a radio
+        /// mismatch; --tilt changes the modem at both ends instead)
+        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+        tx_tilt: f32,
     },
     /// Write test frames to a WAV file (play it into a radio)
     TxWav {
@@ -251,6 +259,9 @@ enum Cmd {
         /// Radio key-up time, seconds
         #[arg(long, default_value_t = 0.05)]
         keyup: f32,
+        /// Sending radio's audio response tilt in dB/octave at about the same level (both directions)
+        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+        tx_tilt: f32,
         /// Leader before each burst, seconds (must exceed --keyup)
         #[arg(long, default_value_t = 0.1)]
         txdelay: f32,
@@ -324,12 +335,13 @@ fn raw_rate(ofdm: &Ofdm, m: Modulation, nsym: usize) -> f32 {
 fn main() {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Sim { modem, det, cnr, frames, ppm, keyup } => {
+        Cmd::Sim { modem, det, cnr, frames, ppm, keyup, tx_tilt } => {
             let (ofdm, m) = modem.build_rx(&det);
             let mut cfg = FmChannelConfig::by_name(&modem.mode).unwrap();
             cfg.cnr_db = cnr;
             cfg.clock_offset_ppm = ppm;
             cfg.keyup_delay_s = keyup;
+            cfg.tx_tilt_db_per_octave = tx_tilt;
             let st = run_sim(&ofdm, m, modem.symbols, modem.txdelay, &cfg, frames);
             println!(
                 "mode={} mod={} cnr={} ppm={}  raw={:.0} bit/s",
@@ -347,7 +359,7 @@ fn main() {
                 st.snr_sum / st.snr_n.max(1) as f32
             );
         }
-        Cmd::Sweep { modem, det, frames, ppm, keyup } => {
+        Cmd::Sweep { modem, det, frames, ppm, keyup, tx_tilt } => {
             let (ofdm, _) = modem.build_rx(&det);
             let cnrs = [6.0, 8.0, 10.0, 12.0, 15.0, 20.0, 25.0, 30.0, 40.0];
             println!("mode={} symbols/frame={} ppm={} frames/point={}", modem.mode, modem.symbols, ppm, frames);
@@ -364,6 +376,7 @@ fn main() {
                     cfg.cnr_db = Some(c);
                     cfg.clock_offset_ppm = ppm;
                     cfg.keyup_delay_s = keyup;
+                    cfg.tx_tilt_db_per_octave = tx_tilt;
                     let st = run_sim(&ofdm, m, modem.symbols, modem.txdelay, &cfg, frames);
                     print!(" {:>8.1e}", st.errors as f64 / st.bits as f64);
                     if m == Modulation::Qpsk {
@@ -449,7 +462,7 @@ fn main() {
             radio_cmds::monitor(audio_in.as_deref(), in_channel, &mode, det.detector).unwrap_or_else(|m| die(&m))
         }
         Cmd::Decode { mode, input, det } => radio_cmds::decode(&input, &mode, det.detector).unwrap_or_else(|m| die(&m)),
-        Cmd::SimPair { mode, cnr, ppm, keyup, txdelay, seed, speed, host, a_port, b_port, record, det } => {
+        Cmd::SimPair { mode, cnr, ppm, keyup, tx_tilt, txdelay, seed, speed, host, a_port, b_port, record, det } => {
             if keyup >= txdelay {
                 die("--txdelay must be longer than --keyup");
             }
@@ -458,6 +471,7 @@ fn main() {
                 cnr_db: cnr,
                 ppm,
                 keyup_s: keyup,
+                tx_tilt,
                 txdelay_s: txdelay,
                 seed,
                 speed,

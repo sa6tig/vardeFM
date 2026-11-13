@@ -31,6 +31,8 @@ pub struct SimPairConfig {
     pub ppm: f32,
     /// Radio key-up delay in seconds.
     pub keyup_s: f32,
+    /// Sending radio's audio response tilt in dB/octave (both directions).
+    pub tx_tilt: f32,
     /// Leader before each burst (must exceed `keyup_s`).
     pub txdelay_s: f32,
     pub seed: u64,
@@ -56,6 +58,7 @@ impl Default for SimPairConfig {
             cnr_db: Some(20.0),
             ppm: 0.0,
             keyup_s: 0.05,
+            tx_tilt: 0.0,
             txdelay_s: 0.1,
             seed: 1,
             speed: 1.0,
@@ -114,6 +117,7 @@ impl SimPair {
                 cnr_db: cfg.cnr_db,
                 clock_offset_ppm: cfg.ppm,
                 keyup_delay_s: cfg.keyup_s,
+                tx_tilt_db_per_octave: cfg.tx_tilt,
                 lead_silence_s: 0.0,
                 ..channel
             },
