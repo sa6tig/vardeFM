@@ -105,19 +105,25 @@ impl Chain {
         c
     }
 
-    /// A response that rises by `db_per_octave` (falls, if negative) from `lo` to
-    /// `hi` Hz and levels off within about an octave outside them. Its gain keeps the
-    /// power of a signal with a flat spectrum from `lo` to `hi`, so a tilt reshapes
-    /// such a signal without making it louder or quieter.
+    /// A response that rises by `db_per_octave` (falls, if negative; -6 to +6) from
+    /// `lo` to `hi` Hz. It levels off over about an octave below `lo`, but keeps rising
+    /// (or falling) for one to two octaves above `hi`, where the last shelf ends. Its gain
+    /// keeps the power of a signal with a flat spectrum from `lo` to `hi`.
     ///
     /// Built from one first-order shelf per octave, each stepping the gain by
     /// `db_per_octave`, so the slope ripples by a fraction of a dB around the
-    /// target. At ±6 dB/octave the shelves merge into a single zero or pole.
+    /// target. At ±6 dB/octave the shelves merge into a single zero or pole; past
+    /// that a shelf spans more than an octave and the slope no longer holds at the
+    /// band edges, so steeper tilts are refused.
     pub fn tilt(fs: f32, db_per_octave: f32, lo: f32, hi: f32) -> Self {
         let mut c = Self::new();
         if db_per_octave == 0.0 {
             return c;
         }
+        assert!(
+            db_per_octave.is_finite() && db_per_octave.abs() <= 6.0,
+            "tilt {db_per_octave} dB/octave: must be within -6..6"
+        );
         assert!(0.0 < lo && lo < hi && hi < fs / 2.0, "tilt band {lo}..{hi} Hz");
         // Bilinear prewarp: the analog frequency that lands on `f` Hz after the transform.
         let warp = |f: f32| 2.0 * fs * (PI * f / fs).tan();
@@ -381,6 +387,14 @@ mod tests {
             }
         }
         assert!(Chain::tilt(fs, 0.0, 300.0, 3000.0).first.is_empty());
+    }
+
+    #[test]
+    fn tilt_refuses_slopes_it_cannot_hold() {
+        for slope in [f32::NAN, f32::INFINITY, 6.5, -7.0] {
+            let r = std::panic::catch_unwind(|| Chain::tilt(48_000.0, slope, 300.0, 3000.0));
+            assert!(r.is_err(), "{slope} dB/octave was accepted");
+        }
     }
 
     #[test]

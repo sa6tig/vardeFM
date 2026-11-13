@@ -34,10 +34,10 @@
 //! `NOISE_SEED` (1, for other noise in that pass), `CSV` (file to append the burst
 //! results to). Three more change the bursts' path, not the noise cases: `CHANNEL`,
 //! the radio audio response (matched, tx-pre-only or rx-de-only, see [`CHANNELS`]),
-//! `TX_TILT`, dB/octave the sending radio tilts its audio by (0, the simulator's
-//! `tx_tilt_db_per_octave`), and `CTCSS`, the deviation in Hz of a CTCSS tone the
-//! sending radio adds (0 = none; wide mode only, as the narrow audio path filters
-//! sub-tones out).
+//! `TX_TILT`, dB/octave the sending radio tilts its audio by, -6 to 6 (0; the
+//! simulator's `tx_tilt_db_per_octave`, at the audio's own RMS), and `CTCSS`, the
+//! deviation in Hz of a CTCSS tone the sending radio adds after its audio response
+//! (0 = none; wide mode only, as the narrow audio path filters sub-tones out).
 
 use super::*;
 use crate::busy_eval::CTCSS_HZ;
@@ -47,7 +47,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use vardefm_dsp::ofdm::MF_THRESHOLD;
 use vardefm_dsp::prng::Prng;
-use vardefm_sim::{transmit, FmChannelConfig};
+use vardefm_sim::{transmit, Ctcss, FmChannelConfig};
 
 /// The detector every other one is compared with in the paired test. Every detector
 /// in [`Detector::ALL`] is evaluated.
@@ -115,21 +115,14 @@ impl Link {
         Self { ctcss_hz: deviation_hz, ..self }
     }
 
-    /// What the sending radio puts on the air for burst audio `tx` in trial `t`: the
-    /// audio plus the trial's CTCSS tone, the standard tones in turn, each trial with
-    /// its own phase.
-    fn on_air(&self, tx: Vec<f32>, t: u32) -> Vec<f32> {
-        if self.ctcss_hz == 0.0 {
-            return tx;
-        }
-        let f = CTCSS_HZ[t as usize % CTCSS_HZ.len()] as f64;
-        let a = self.ctcss_hz / self.chan.deviation_hz;
-        let fs = self.chan.fs as f64;
-        let phase = t as f64 * 0.618;
-        tx.iter()
-            .enumerate()
-            .map(|(i, &v)| v + a * (2.0 * std::f64::consts::PI * (f * i as f64 / fs + phase)).sin() as f32)
-            .collect()
+    /// The CTCSS tone the sending radio adds in trial `t`: the standard tones in turn,
+    /// each trial with its own phase.
+    fn ctcss(&self, t: u32) -> Option<Ctcss> {
+        (self.ctcss_hz != 0.0).then(|| Ctcss {
+            hz: CTCSS_HZ[t as usize % CTCSS_HZ.len()] as f64,
+            deviation_hz: self.ctcss_hz,
+            phase: t as f64 * 0.618,
+        })
     }
 }
 
@@ -224,8 +217,9 @@ pub(crate) fn through_channel(m: &Modem, mode: &str, cnr: f32, sent: &Burst, t: 
 fn trial(link: &Link, cnr: f32, level: u8, ncw: usize, truth: usize, t: u32) -> Trial {
     let m = &*link.modem;
     let sent = burst(level, ncw, payload_seed(t));
-    let cfg = FmChannelConfig { cnr_db: Some(cnr), seed: channel_seed(cnr, t), ..link.chan.clone() };
-    let rx = transmit(&cfg, &link.on_air(link.modem.modulate(&sent), t));
+    let cfg =
+        FmChannelConfig { cnr_db: Some(cnr), seed: channel_seed(cnr, t), ctcss: link.ctcss(t), ..link.chan.clone() };
+    let rx = transmit(&cfg, &link.modem.modulate(&sent));
     let tol = m.ofdm.p.ncp / 4;
     let det = Detector::ALL
         .iter()
@@ -466,7 +460,7 @@ fn detector_eval() {
     let chan = chan.trim();
     let tx_tilt: f32 = env_or("TX_TILT", 0.0);
     assert!(CHANNELS.contains(&chan), "CHANNEL: unknown channel {chan:?} (one of {})", CHANNELS.join(", "));
-    assert!(tx_tilt.is_finite(), "TX_TILT={tx_tilt}: must be a finite dB/octave");
+    assert!(tx_tilt.is_finite() && tx_tilt.abs() <= 6.0, "TX_TILT={tx_tilt}: must be within -6..6 dB/octave");
     assert!(ctcss.is_finite() && ctcss >= 0.0, "CTCSS={ctcss}: must be a deviation in Hz, 0 for none");
     assert!((level as usize) < LEVELS.len(), "LEVEL {level}: levels are 0 to {}", LEVELS.len() - 1);
     assert!(trials > 0, "TRIALS must be at least 1");
@@ -487,7 +481,9 @@ fn detector_eval() {
     for mode in &modes {
         cnr_list(mode);
     }
-    const CSV_HEADER: &str = "mode,channel,tx_tilt,ctcss_hz,level,ncw,cnr_db,trials,detector,hits,bursts";
+    // `radio_tx_tilt`, not the `tx_tilt` of files from the second-modem tilt, whose
+    // rows the header check must keep out.
+    const CSV_HEADER: &str = "mode,channel,radio_tx_tilt,ctcss_hz,level,ncw,cnr_db,trials,detector,hits,bursts";
     let mut csv = std::env::var("CSV").ok().map(|p| {
         // Appending rows to a file with other columns would mix them up unnoticed.
         let old = std::fs::read_to_string(&p).unwrap_or_default();
@@ -643,6 +639,52 @@ fn mismatched_links_still_carry_strong_bursts() {
                 assert!(r.genie, "{mode} {chan} tilt {tilt}: genie failed on a strong signal");
                 assert!(r.det.iter().all(|&(_, ok)| ok), "{mode} {chan} tilt {tilt}: a detector missed a strong burst");
             }
+        }
+    }
+}
+
+/// `TX_TILT` reaches the channel: on a clean channel, a tilted link's high carriers
+/// gain on its low ones by the tilt times the octaves between them, within the
+/// shelves' ripple and the band edges' easing.
+#[test]
+fn tx_tilt_reaches_the_channel() {
+    for mode in OfdmParams::all().map(|p| p.name) {
+        let power_ratio_db = |tilt: f32| {
+            let link = Link::new(mode, "matched", tilt);
+            let p = &link.modem.ofdm.p;
+            // No squelch tail: its noise burst would fill the weak carriers' bins.
+            let clean = FmChannelConfig { cnr_db: None, squelch_tail_s: 0.0, ..link.chan.clone() };
+            let rx = transmit(&clean, &link.modem.modulate(&burst(1, 4, payload_seed(0))));
+            // Mean single-bin periodogram over nfft-long blocks at carrier `k`.
+            let power = |k: usize| {
+                let w = 2.0 * std::f64::consts::PI * p.carrier_freq(k) as f64 / clean.fs as f64;
+                let blocks: Vec<f64> = rx
+                    .chunks_exact(p.nfft)
+                    .map(|b| {
+                        let (re, im) = b.iter().enumerate().fold((0f64, 0f64), |(re, im), (i, &x)| {
+                            // Hann window: the tilt spreads carrier powers over tens of
+                            // dB, which a bare block would leak into the weak ones.
+                            let hann = 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / p.nfft as f64).cos();
+                            let x = x as f64 * hann;
+                            (re + x * (w * i as f64).cos(), im - x * (w * i as f64).sin())
+                        });
+                        re * re + im * im
+                    })
+                    .collect();
+                blocks.iter().sum::<f64>() / blocks.len() as f64
+            };
+            let (lo, hi) = (2, p.num_carriers - 3);
+            let octaves = (p.carrier_freq(hi) / p.carrier_freq(lo)).log2();
+            (10.0 * (power(hi) / power(lo)).log10() as f32, octaves)
+        };
+        let (flat, octaves) = power_ratio_db(0.0);
+        for tilt in [-6.0, -3.0, 3.0, 6.0] {
+            let got = power_ratio_db(tilt).0 - flat;
+            let want = tilt * octaves;
+            assert!(
+                (got - want).abs() < 2.0,
+                "{mode} TX_TILT {tilt}: high carriers gained {got:.1} dB, want {want:.1}"
+            );
         }
     }
 }

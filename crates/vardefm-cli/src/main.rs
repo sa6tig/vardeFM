@@ -29,7 +29,8 @@ struct ModemArgs {
     /// Data symbols per frame
     #[arg(long, default_value_t = 40, value_parser = at_least_one)]
     symbols: usize,
-    /// TX spectral tilt in dB/octave (negative tilts down the high carriers)
+    /// Modem spectral tilt in dB/octave at both ends, which the receiver expects
+    /// (negative tilts down the high carriers); see --tx-tilt for a radio mismatch
     #[arg(long)]
     tilt: Option<f32>,
     /// TX RMS level, 0..1
@@ -94,9 +95,9 @@ enum Cmd {
         /// Simulated radio key-up time, seconds
         #[arg(long, default_value_t = 0.05)]
         keyup: f32,
-        /// Sending radio's audio response tilt in dB/octave, keeping a flat signal's power (a
-        /// radio mismatch; --tilt changes the modem at both ends instead)
-        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+        /// Sending radio's audio response tilt in dB/octave, -6 to 6, at the audio's own
+        /// level (a radio mismatch; --tilt changes the modem at both ends instead)
+        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true, value_parser = radio_tilt)]
         tx_tilt: f32,
     },
     /// BER table over CNR for every modulation
@@ -112,9 +113,9 @@ enum Cmd {
         /// Simulated radio key-up time, seconds
         #[arg(long, default_value_t = 0.05)]
         keyup: f32,
-        /// Sending radio's audio response tilt in dB/octave, keeping a flat signal's power (a
-        /// radio mismatch; --tilt changes the modem at both ends instead)
-        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+        /// Sending radio's audio response tilt in dB/octave, -6 to 6, at the audio's own
+        /// level (a radio mismatch; --tilt changes the modem at both ends instead)
+        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true, value_parser = radio_tilt)]
         tx_tilt: f32,
     },
     /// Write test frames to a WAV file (play it into a radio)
@@ -259,8 +260,9 @@ enum Cmd {
         /// Radio key-up time, seconds
         #[arg(long, default_value_t = 0.05)]
         keyup: f32,
-        /// Sending radio's audio response tilt in dB/octave, keeping a flat signal's power (both directions)
-        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+        /// Sending radio's audio response tilt in dB/octave, -6 to 6, at the audio's own
+        /// level (both directions)
+        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true, value_parser = radio_tilt)]
         tx_tilt: f32,
         /// Leader before each burst, seconds (must exceed --keyup)
         #[arg(long, default_value_t = 0.1)]
@@ -337,18 +339,15 @@ fn main() {
     match cli.cmd {
         Cmd::Sim { modem, det, cnr, frames, ppm, keyup, tx_tilt } => {
             let (ofdm, m) = modem.build_rx(&det);
-            let mut cfg = FmChannelConfig::by_name(&modem.mode).unwrap();
-            cfg.cnr_db = cnr;
-            cfg.clock_offset_ppm = ppm;
-            cfg.keyup_delay_s = keyup;
-            cfg.tx_tilt_db_per_octave = tx_tilt;
+            let cfg = sim_channel(&modem.mode, cnr, ppm, keyup, tx_tilt);
             let st = run_sim(&ofdm, m, modem.symbols, modem.txdelay, &cfg, frames);
             println!(
-                "mode={} mod={} cnr={} ppm={}  raw={:.0} bit/s",
+                "mode={} mod={} cnr={} ppm={} tx_tilt={}  raw={:.0} bit/s",
                 modem.mode,
                 m.name(),
                 cnr.map_or("none".into(), |c| format!("{c} dB")),
                 ppm,
+                tx_tilt,
                 raw_rate(&ofdm, m, modem.symbols)
             );
             println!(
@@ -362,7 +361,10 @@ fn main() {
         Cmd::Sweep { modem, det, frames, ppm, keyup, tx_tilt } => {
             let (ofdm, _) = modem.build_rx(&det);
             let cnrs = [6.0, 8.0, 10.0, 12.0, 15.0, 20.0, 25.0, 30.0, 40.0];
-            println!("mode={} symbols/frame={} ppm={} frames/point={}", modem.mode, modem.symbols, ppm, frames);
+            println!(
+                "mode={} symbols/frame={} ppm={} tx_tilt={} frames/point={}",
+                modem.mode, modem.symbols, ppm, tx_tilt, frames
+            );
             print!("{:>8} {:>8}", "mod", "raw b/s");
             for c in cnrs {
                 print!(" {:>8}", format!("{c}dB"));
@@ -372,11 +374,7 @@ fn main() {
             for m in Modulation::ALL {
                 print!("{:>8} {:>8.0}", m.name(), raw_rate(&ofdm, m, modem.symbols));
                 for (ci, &c) in cnrs.iter().enumerate() {
-                    let mut cfg = FmChannelConfig::by_name(&modem.mode).unwrap();
-                    cfg.cnr_db = Some(c);
-                    cfg.clock_offset_ppm = ppm;
-                    cfg.keyup_delay_s = keyup;
-                    cfg.tx_tilt_db_per_octave = tx_tilt;
+                    let cfg = sim_channel(&modem.mode, Some(c), ppm, keyup, tx_tilt);
                     let st = run_sim(&ofdm, m, modem.symbols, modem.txdelay, &cfg, frames);
                     print!(" {:>8.1e}", st.errors as f64 / st.bits as f64);
                     if m == Modulation::Qpsk {
@@ -521,10 +519,54 @@ fn main() {
 }
 
 /// Parses a count that must be at least 1.
+/// The simulated FM channel of `mode` for the sim and sweep commands.
+fn sim_channel(mode: &str, cnr: Option<f32>, ppm: f32, keyup: f32, tx_tilt: f32) -> FmChannelConfig {
+    FmChannelConfig {
+        cnr_db: cnr,
+        clock_offset_ppm: ppm,
+        keyup_delay_s: keyup,
+        tx_tilt_db_per_octave: tx_tilt,
+        ..FmChannelConfig::by_name(mode).unwrap_or_else(|| die("unknown mode"))
+    }
+}
+
+/// A radio tilt in dB/octave: the simulator models -6 to 6.
+fn radio_tilt(s: &str) -> Result<f32, String> {
+    match s.parse::<f32>() {
+        Ok(t) if t.is_finite() && t.abs() <= 6.0 => Ok(t),
+        Ok(_) => Err("must be within -6..6 dB/octave".into()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 fn at_least_one(s: &str) -> Result<usize, String> {
     match s.parse::<usize>() {
         Ok(n) if n >= 1 => Ok(n),
         Ok(_) => Err("must be at least 1".into()),
         Err(e) => Err(e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tx_tilt_reaches_the_simulated_channel() {
+        let sim = Cli::try_parse_from(["vardefm", "sim", "--tx-tilt", "-3"]).unwrap();
+        let Cmd::Sim { modem, tx_tilt, .. } = sim.cmd else { panic!("not sim") };
+        assert_eq!(sim_channel(&modem.mode, None, 0.0, 0.05, tx_tilt).tx_tilt_db_per_octave, -3.0);
+        let sweep = Cli::try_parse_from(["vardefm", "sweep", "--tx-tilt", "4.5"]).unwrap();
+        let Cmd::Sweep { modem, tx_tilt, .. } = sweep.cmd else { panic!("not sweep") };
+        assert_eq!(sim_channel(&modem.mode, Some(10.0), 0.0, 0.05, tx_tilt).tx_tilt_db_per_octave, 4.5);
+        let pair = Cli::try_parse_from(["vardefm", "sim-pair", "--tx-tilt", "6"]).unwrap();
+        assert!(matches!(pair.cmd, Cmd::SimPair { tx_tilt, .. } if tx_tilt == 6.0));
+    }
+
+    #[test]
+    fn tx_tilt_outside_the_modelled_range_is_refused() {
+        for t in ["7", "-6.5", "nan", "inf"] {
+            assert!(Cli::try_parse_from(["vardefm", "sim", "--tx-tilt", t]).is_err(), "{t}");
+        }
     }
 }

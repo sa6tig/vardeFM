@@ -31,7 +31,7 @@ pub struct SimPairConfig {
     pub ppm: f32,
     /// Radio key-up delay in seconds.
     pub keyup_s: f32,
-    /// Sending radio's audio response tilt in dB/octave (both directions).
+    /// Sending radio's audio response tilt in dB/octave, -6 to 6 (both directions).
     pub tx_tilt: f32,
     /// Leader before each burst (must exceed `keyup_s`).
     pub txdelay_s: f32,
@@ -90,11 +90,28 @@ pub struct SimPair {
     handle: Option<JoinHandle<()>>,
 }
 
+impl SimPairConfig {
+    /// The FM channel between the two stations. The mode must be known.
+    fn channel(&self) -> FmChannelConfig {
+        FmChannelConfig {
+            cnr_db: self.cnr_db,
+            clock_offset_ppm: self.ppm,
+            keyup_delay_s: self.keyup_s,
+            tx_tilt_db_per_octave: self.tx_tilt,
+            lead_silence_s: 0.0,
+            ..FmChannelConfig::by_name(&self.mode).unwrap()
+        }
+    }
+}
+
 impl SimPair {
     pub fn start(cfg: SimPairConfig) -> io::Result<Self> {
         let params = OfdmParams::by_name(&cfg.mode)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "mode must be narrow or wide"))?;
-        let channel = FmChannelConfig::by_name(&cfg.mode).unwrap();
+        if !(cfg.tx_tilt.is_finite() && cfg.tx_tilt.abs() <= 6.0) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "tx_tilt must be within -6..6 dB/octave"));
+        }
+        let channel = cfg.channel();
         let data_port = |p: u16| if p == 0 { 0 } else { p + 1 };
         let ports = [
             HostPort::bind(&cfg.host, cfg.a_port, data_port(cfg.a_port))?,
@@ -113,14 +130,7 @@ impl SimPair {
                 Station::new("B", modem.clone(), LinkConfig::default(), cfg.seed as u32 * 2 + 2),
             ],
             ports,
-            channel: FmChannelConfig {
-                cnr_db: cfg.cnr_db,
-                clock_offset_ppm: cfg.ppm,
-                keyup_delay_s: cfg.keyup_s,
-                tx_tilt_db_per_octave: cfg.tx_tilt,
-                lead_silence_s: 0.0,
-                ..channel
-            },
+            channel,
             incoming: [Vec::new(), Vec::new()],
             tx_end: [None, None],
             t: 0,
@@ -319,4 +329,33 @@ fn write_wav(path: &std::path::Path, fs: u32, samples: &[f32]) -> Result<(), hou
         w.write_sample((v.clamp(-1.0, 1.0) * 32767.0) as i16)?;
     }
     w.finalize()
+}
+
+#[cfg(test)]
+mod channel_tests {
+    use super::*;
+
+    #[test]
+    fn the_channel_carries_every_link_setting() {
+        let cfg = SimPairConfig {
+            mode: "wide".into(),
+            cnr_db: Some(12.0),
+            ppm: 30.0,
+            keyup_s: 0.08,
+            tx_tilt: -4.0,
+            ..Default::default()
+        };
+        let c = cfg.channel();
+        assert_eq!(
+            (c.cnr_db, c.clock_offset_ppm, c.keyup_delay_s, c.tx_tilt_db_per_octave),
+            (Some(12.0), 30.0, 0.08, -4.0)
+        );
+        assert_eq!((c.deviation_hz, c.lead_silence_s), (FmChannelConfig::wide().deviation_hz, 0.0));
+    }
+
+    #[test]
+    fn a_tilt_outside_the_modelled_range_is_refused() {
+        let cfg = SimPairConfig { tx_tilt: 7.0, a_port: 0, b_port: 0, ..Default::default() };
+        assert_eq!(SimPair::start(cfg).err().map(|e| e.kind()), Some(io::ErrorKind::InvalidInput));
+    }
 }

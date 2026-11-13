@@ -115,7 +115,9 @@ vardefm rx-wav --mode narrow --mod qpsk --in recording.wav
 ```
 
 Useful options: `--txdelay` (leader length; it must exceed the radio's key-up time),
-`--tilt=<dB/oct>`, `--rms <level>`. Set `VARDEFM_DUMP=1` to print per-carrier SNR.
+`--tilt=<dB/oct>` (the modem's tilt, at both ends), `--rms <level>`. `sim`, `sweep` and
+`sim-pair` also take `--tx-tilt=<dB/oct>`: a sending radio whose audio response tilts
+against the receiver's, -6 to 6 dB/octave. Set `VARDEFM_DUMP=1` to print per-carrier SNR.
 
 ### Tests
 
