@@ -154,7 +154,14 @@ pub(crate) fn through_channel(m: &Modem, mode: &str, cnr: f32, sent: &Burst, t: 
 }
 
 /// [`through_channel`] with flat fading (`cnr` is then the mean CNR).
-fn through_channel_with(m: &Modem, mode: &str, cnr: f32, fading: Option<Fading>, sent: &Burst, t: u32) -> Vec<f32> {
+pub(crate) fn through_channel_with(
+    m: &Modem,
+    mode: &str,
+    cnr: f32,
+    fading: Option<Fading>,
+    sent: &Burst,
+    t: u32,
+) -> Vec<f32> {
     let cfg = FmChannelConfig {
         cnr_db: Some(cnr),
         fading,

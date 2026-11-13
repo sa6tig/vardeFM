@@ -50,6 +50,8 @@ const MIN_PREAMBLE_CORR: f32 = 0.3;
 /// noise scale. Normal symbols almost never get there (the per-symbol estimate averages
 /// 18-24 real noise samples).
 const SCALE_THRESHOLD: f32 = 2.0;
+/// Passes of the noise model's fit (per-symbol scale, then per-pilot variance).
+const NOISE_FIT_PASSES: usize = 5;
 /// TX low-pass cutoff relative to the top carrier frequency.
 const TX_LOWPASS_FACTOR: f32 = 1.15;
 /// Clip-and-filter passes before the final clamp.
@@ -451,13 +453,17 @@ impl Ofdm {
             .collect();
 
         // Noise per data carrier, interpolated from the pilots, plus the noise of the
-        // channel estimate.
+        // channel estimate. The interpolation is geometric (linear in dB): at the low
+        // edge of the wide band the noise falls about 20-fold over the first pilot gap,
+        // and linear interpolation of such a convex profile overstated it on the
+        // carriers in between by up to 4 times (`noise_calib` in vardefm-modem).
         let raw_var: Vec<f32> = self
             .data_idx
             .iter()
             .map(|&k| {
                 let (m, t) = self.pilot_pos(k);
-                (pilot_var[m] * (1.0 - t) + pilot_var[m + 1] * t) * (1.0 + est_noise)
+                let (a, b) = (pilot_var[m].max(1e-12), pilot_var[m + 1].max(1e-12));
+                a.powf(1.0 - t) * b.powf(t) * (1.0 + est_noise)
             })
             .collect();
         let noise_var: Vec<f32> = raw_var.iter().map(|v| v.max(1e-6)).collect();
@@ -672,23 +678,33 @@ fn robust_reference(e: &[f32]) -> f32 {
 /// typical level: with 9-12 pilots per symbol the estimate is noisy, and the point is
 /// to catch symbols hit by a click, not to fine-tune the rest. (Scaling every symbol by
 /// `max(1, e/mean)` cost a little at the 64QAM levels.)
+///
+/// The two halves are fitted in turn, `NOISE_FIT_PASSES` times. The first per-pilot
+/// variance includes the click-hit symbols at full weight, so the pilots where clicks
+/// land (mid-band, under fast fading) look noisy in every symbol, and a click there
+/// stands out less than it should. With one pass, wide mode at 80 Hz Doppler
+/// underpredicted click-hit symbols mid-band 2.4-3.5 times; with five, 1.2-1.8 times
+/// (`noise_calib` in vardefm-modem). On Rayleigh channels it lost fewer codewords
+/// (`fading_cer`).
 fn noise_model(dev: &[Vec<f32>]) -> (Vec<f32>, Vec<f32>) {
     let nsym = dev.len();
     let np = dev.first().map_or(0, |d| d.len());
     let per_pilot = |scale: &[f32]| -> Vec<f32> {
         (0..np).map(|m| dev.iter().zip(scale).map(|(d, s)| d[m] / s).sum::<f32>() / nsym.max(1) as f32).collect()
     };
-    let ones = vec![1.0; nsym];
-    let var = per_pilot(&ones);
+    let mut scale = vec![1.0; nsym];
+    let mut var = per_pilot(&scale);
     if nsym < 3 {
-        return (ones, var);
+        return (scale, var);
     }
-    // Noise energy per symbol, each pilot relative to its own average.
-    let e: Vec<f32> =
-        dev.iter().map(|d| d.iter().zip(&var).map(|(x, v)| x / v.max(1e-12)).sum::<f32>() / np as f32).collect();
-    let reference = robust_reference(&e);
-    let scale: Vec<f32> = e.iter().map(|x| x / reference).map(|r| if r > SCALE_THRESHOLD { r } else { 1.0 }).collect();
-    let var = per_pilot(&scale);
+    for _ in 0..NOISE_FIT_PASSES {
+        // Noise energy per symbol, each pilot relative to its own average.
+        let e: Vec<f32> =
+            dev.iter().map(|d| d.iter().zip(&var).map(|(x, v)| x / v.max(1e-12)).sum::<f32>() / np as f32).collect();
+        let reference = robust_reference(&e);
+        scale = e.iter().map(|x| x / reference).map(|r| if r > SCALE_THRESHOLD { r } else { 1.0 }).collect();
+        var = per_pilot(&scale);
+    }
     (scale, var)
 }
 

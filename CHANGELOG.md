@@ -35,6 +35,18 @@ run the same minor version.
   CNR 88 instead of 73 (wide: 77 against 72, not significant; at 5 Hz no difference).
   Detections on a weak carrier (5 dB CNR), each costing a header decode, are 0-2 per
   minute against the old 1-10.
+- **The noise model fits fast fading better.** The receiver only; on-air compatible.
+  The noise of the data carriers is interpolated geometrically between pilots (it was
+  linear), and the separable fit (per-pilot variance × per-symbol scale) runs five
+  passes instead of one. At the low edge of the wide band, where the noise falls about
+  20-fold across the first pilot gap, the receiver overpredicted the noise of clean
+  symbols about 2 times (0.45-0.6 measured over predicted in the lowest quarter at 20
+  and 80 Hz Doppler); now 1.0-1.06 (`noise_calib`). On Rayleigh channels at 5, 20 and
+  80 Hz (`fading_cer`, 100 paired bursts per point, 12-44 dB) 706 bursts lost fewer
+  codewords and 131 more; wide level 6 at 80 Hz lost 4946 codewords against 5183. The
+  static `level_gate` passes. Under fading the reported SNR is lower at low CNR (wide
+  level 6 at 20 Hz, 20 dB mean CNR: 0.2 dB against 4.3), on the static channel within
+  0.1 dB up to 33 dB CNR. (#19)
 - **Busy detection measures only the carrier band** (422–2672 Hz narrow, 400–6000 Hz wide).
   A CTCSS tone, mains hum, a DC step or hiss above the band no longer reads as a busy
   channel, and no longer hides a signal inside the band. A keyed carrier with only a CTCSS
