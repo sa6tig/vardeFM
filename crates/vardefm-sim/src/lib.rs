@@ -24,9 +24,11 @@ pub struct FmChannelConfig {
     pub rx_emphasis_us: Option<f32>,
     /// TX audio response tilt in dB per octave across `tx_band` above 300 Hz: a
     /// sending radio whose audio response does not match the receiver's. It keeps
-    /// the power of audio with a flat spectrum across that band, so it reshapes the
-    /// modem's carriers without changing their level much, and acts before the
-    /// deviation limiter, like pre-emphasis.
+    /// the power of audio with a flat spectrum across that band, and acts before
+    /// the deviation limiter, like pre-emphasis. Audio that is not flat changes level:
+    /// the narrow modem's stays within 0.9 dB from -6 to +6 dB/octave, but the wide
+    /// modem's, which the modem itself tilts by +3 dB/octave, drops by 1.5 dB at
+    /// -3 dB/octave and by 3.3 dB at -6 dB/octave.
     pub tx_tilt_db_per_octave: f32,
     /// TX audio passband in Hz.
     pub tx_band: (f32, f32),

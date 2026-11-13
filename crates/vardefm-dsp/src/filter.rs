@@ -353,14 +353,17 @@ mod tests {
         for (lo, hi) in [(300.0, 3000.0), (300.0, 7000.0)] {
             for slope in [-6.0, -3.0, 3.0, 6.0] {
                 let c = Chain::tilt(fs, slope, lo, hi);
-                // Every carrier of both modes lies between 422 Hz and 6 kHz; within
-                // the band the gain follows the slope, measured from 1 kHz.
+                // Across the band, in eighth-octave steps, the gain follows the slope,
+                // measured from 1 kHz: within 0.5 dB where the carriers of both modes
+                // lie (422 Hz to 6 kHz), within 1 dB out to the band edges.
                 let at_1k = db(&c, 1000.0);
-                for freq in [422.0, 700.0, 1500.0, 2672.0, 6000.0].into_iter().filter(|&f| f > lo && f < hi) {
+                let steps = (8.0 * (hi / lo).log2()).floor() as i32;
+                for freq in (0..=steps).map(|k| lo * 2f32.powf(k as f32 / 8.0)) {
                     let want = slope * (freq / 1000.0f32).log2();
                     let got = db(&c, freq) - at_1k;
+                    let tol = if (422.0..=6000.0).contains(&freq) { 0.5 } else { 1.0 };
                     assert!(
-                        (got - want).abs() < 0.6,
+                        (got - want).abs() < tol,
                         "{lo}..{hi} {slope} dB/oct at {freq} Hz: {got:.2} dB, want {want:.2}"
                     );
                 }

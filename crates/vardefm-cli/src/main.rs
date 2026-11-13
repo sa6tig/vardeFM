@@ -94,8 +94,8 @@ enum Cmd {
         /// Simulated radio key-up time, seconds
         #[arg(long, default_value_t = 0.05)]
         keyup: f32,
-        /// Sending radio's audio response tilt in dB/octave at about the same level (a radio
-        /// mismatch; --tilt changes the modem at both ends instead)
+        /// Sending radio's audio response tilt in dB/octave, keeping a flat signal's power (a
+        /// radio mismatch; --tilt changes the modem at both ends instead)
         #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
         tx_tilt: f32,
     },
@@ -112,8 +112,8 @@ enum Cmd {
         /// Simulated radio key-up time, seconds
         #[arg(long, default_value_t = 0.05)]
         keyup: f32,
-        /// Sending radio's audio response tilt in dB/octave at about the same level (a radio
-        /// mismatch; --tilt changes the modem at both ends instead)
+        /// Sending radio's audio response tilt in dB/octave, keeping a flat signal's power (a
+        /// radio mismatch; --tilt changes the modem at both ends instead)
         #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
         tx_tilt: f32,
     },
@@ -259,7 +259,7 @@ enum Cmd {
         /// Radio key-up time, seconds
         #[arg(long, default_value_t = 0.05)]
         keyup: f32,
-        /// Sending radio's audio response tilt in dB/octave at about the same level (both directions)
+        /// Sending radio's audio response tilt in dB/octave, keeping a flat signal's power (both directions)
         #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
         tx_tilt: f32,
         /// Leader before each burst, seconds (must exceed --keyup)
