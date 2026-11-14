@@ -38,6 +38,11 @@ run the same minor version.
   burst it falls in or shortly before, and cannot leave busy detection deaf; the last
   good sample takes its place. (#10)
 
+### Fixed
+- `sim` and `sweep` accept a negative `--ppm` (`--ppm -20`), as `sim-pair` already did.
+- A filter that gets a NaN or infinite sample recovers once the input is good again
+  instead of putting out NaN for the rest of the run.
+
 ## [0.3.1] - 2026-11-09
 
 On-air compatible with 0.3.0.

@@ -7,6 +7,19 @@ use std::f32::consts::PI;
 /// the state into subnormal numbers, which are very slow on x86 and stay there.
 const FLUSH: f32 = 1e-30;
 
+/// The filter state `z`, or zero when it is tiny (see [`FLUSH`]) or not finite. A NaN
+/// or infinite input would otherwise stay in the state for good; this way the output
+/// is bad only while bad input lasts plus the filter's own ringing.
+#[inline]
+fn settle(z: f32) -> f32 {
+    // NaN fails the comparison, so it is zeroed too.
+    if z.abs() >= FLUSH && z.is_finite() {
+        z
+    } else {
+        0.0
+    }
+}
+
 /// Second-order IIR section (transposed direct form II).
 #[derive(Clone, Debug)]
 pub struct Biquad {
@@ -42,13 +55,8 @@ impl Biquad {
     pub fn process(&mut self, x: f32) -> f32 {
         let y = self.b0 * x + self.z1;
         self.z1 = self.b1 * x - self.a1 * y + self.z2;
-        self.z2 = self.b2 * x - self.a2 * y;
-        if self.z1.abs() < FLUSH {
-            self.z1 = 0.0;
-        }
-        if self.z2.abs() < FLUSH {
-            self.z2 = 0.0;
-        }
+        self.z2 = settle(self.b2 * x - self.a2 * y);
+        self.z1 = settle(self.z1);
         y
     }
 }
@@ -129,12 +137,14 @@ impl Chain {
         let warp = |f: f32| 2.0 * fs * (PI * f / fs).tan();
         let step = 10f32.powf(db_per_octave.abs() / 20.0);
         let octaves = (hi / lo).log2().ceil() as i32;
+        // The last shelf's top corner must stay clear of Nyquist, where the prewarp
+        // diverges and the shelf could not be built.
+        let top = lo * 2f32.powi(octaves) * step;
+        assert!(top < 0.49 * fs, "tilt band {lo}..{hi} Hz at {db_per_octave} dB/octave needs a shelf up to {top} Hz");
         let mut corners = Vec::new();
         // One extra shelf past each edge, so the slope holds all the way to `lo` and `hi`.
         for k in -1..=octaves {
-            // Corners stay below Nyquist, where the prewarp diverges.
-            let corner = |f: f32| warp(f.min(0.49 * fs));
-            let (lower, upper) = (corner(lo * 2f32.powi(k)), corner(lo * 2f32.powi(k) * step));
+            let (lower, upper) = (warp(lo * 2f32.powi(k)), warp(lo * 2f32.powi(k) * step));
             // H(s) = (1 + s/wz) / (1 + s/wp): rising when the zero sits below the pole.
             corners.push(if db_per_octave > 0.0 { (lower, upper) } else { (upper, lower) });
         }
@@ -222,10 +232,7 @@ impl FirstOrder {
     #[inline]
     pub fn process(&mut self, x: f32) -> f32 {
         let y = self.b0 * x + self.z;
-        self.z = self.b1 * x - self.a1 * y;
-        if self.z.abs() < FLUSH {
-            self.z = 0.0;
-        }
+        self.z = settle(self.b1 * x - self.a1 * y);
         y
     }
 }
@@ -394,6 +401,39 @@ mod tests {
         for slope in [f32::NAN, f32::INFINITY, 6.5, -7.0] {
             let r = std::panic::catch_unwind(|| Chain::tilt(48_000.0, slope, 300.0, 3000.0));
             assert!(r.is_err(), "{slope} dB/octave was accepted");
+        }
+        // A band whose shelves would reach Nyquist is refused rather than bent.
+        assert!(std::panic::catch_unwind(|| Chain::tilt(48_000.0, 6.0, 300.0, 20_000.0)).is_err());
+    }
+
+    /// Every chain in use takes a NaN, an infinity and a run of exact silence, and
+    /// then filters a tone as if none of it had happened.
+    #[test]
+    fn filters_recover_from_bad_input_and_silence() {
+        let fs = 48_000.0;
+        let chains = [
+            ("tilt -6", Chain::tilt(fs, -6.0, 300.0, 7000.0)),
+            ("tilt +6", Chain::tilt(fs, 6.0, 300.0, 3000.0)),
+            ("bandpass", Chain::bandpass4(fs, 20.0, 7000.0)),
+            ("emphasis", {
+                let mut c = Chain::new();
+                c.push_first_order(FirstOrder::preemphasis(fs, 750e-6));
+                c.push_first_order(FirstOrder::deemphasis(fs, 750e-6));
+                c
+            }),
+        ];
+        for (name, fresh) in chains {
+            let mut c = fresh.clone();
+            for x in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                c.process(x);
+            }
+            for _ in 0..10 * 48_000 {
+                c.process(0.0);
+            }
+            let (mut a, mut b) = (fresh.clone(), c);
+            let want = tone_gain(&mut |x| a.process(x), 1000.0, fs);
+            let got = tone_gain(&mut |x| b.process(x), 1000.0, fs);
+            assert!((got - want).abs() < 1e-4, "{name}: 1 kHz gain {got} after bad input, {want} fresh");
         }
     }
 

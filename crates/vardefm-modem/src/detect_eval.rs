@@ -628,8 +628,9 @@ fn harness_sees_strong_bursts_and_no_false_headers() {
 /// Every radio response, and a TX tilt of ±6 dB/octave on the matched response, still
 /// carries a strong burst to the genie and to every detector. The genie check makes a
 /// detector failure here a failure of detection, not of a channel nothing could
-/// decode. Both at once can be too much: in wide mode, pre-emphasis and +6 dB/octave
-/// clip the top carriers.
+/// decode. Both at once can be too much, so they are not combined here: in wide mode,
+/// pre-emphasis with +6 dB/octave let the genie decode only 18 of 20 bursts at 25 dB
+/// CNR (`CHANNEL=tx-pre-only TX_TILT=6 MODES=wide CNRS=25 TRIALS=20`).
 #[test]
 fn mismatched_links_still_carry_strong_bursts() {
     let cases = CHANNELS.iter().map(|&c| (c, 0.0)).chain([("matched", -6.0), ("matched", 6.0)]);

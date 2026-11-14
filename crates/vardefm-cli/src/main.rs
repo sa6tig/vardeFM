@@ -90,7 +90,7 @@ enum Cmd {
         #[arg(long, default_value_t = 10)]
         frames: usize,
         /// Receiver sound-card clock error in ppm
-        #[arg(long, default_value_t = 0.0)]
+        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
         ppm: f32,
         /// Simulated radio key-up time, seconds
         #[arg(long, default_value_t = 0.05)]
@@ -108,7 +108,8 @@ enum Cmd {
         det: DetectorArg,
         #[arg(long, default_value_t = 5)]
         frames: usize,
-        #[arg(long, default_value_t = 0.0)]
+        /// Receiver sound-card clock error in ppm
+        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
         ppm: f32,
         /// Simulated radio key-up time, seconds
         #[arg(long, default_value_t = 0.05)]
@@ -336,10 +337,13 @@ fn raw_rate(ofdm: &Ofdm, m: Modulation, nsym: usize) -> f32 {
 
 fn main() {
     let cli = Cli::parse();
+    // Built from the parsed command, where a test can check them.
+    let channel = cli.cmd.sim_channel();
+    let pair = cli.cmd.sim_pair_config();
     match cli.cmd {
-        Cmd::Sim { modem, det, cnr, frames, ppm, keyup, tx_tilt } => {
+        Cmd::Sim { modem, det, cnr, frames, ppm, tx_tilt, .. } => {
             let (ofdm, m) = modem.build_rx(&det);
-            let cfg = sim_channel(&modem.mode, cnr, ppm, keyup, tx_tilt);
+            let cfg = channel.expect("sim has a channel");
             let st = run_sim(&ofdm, m, modem.symbols, modem.txdelay, &cfg, frames);
             println!(
                 "mode={} mod={} cnr={} ppm={} tx_tilt={}  raw={:.0} bit/s",
@@ -358,7 +362,8 @@ fn main() {
                 st.snr_sum / st.snr_n.max(1) as f32
             );
         }
-        Cmd::Sweep { modem, det, frames, ppm, keyup, tx_tilt } => {
+        Cmd::Sweep { modem, det, frames, ppm, tx_tilt, .. } => {
+            let channel = channel.expect("sweep has a channel");
             let (ofdm, _) = modem.build_rx(&det);
             let cnrs = [6.0, 8.0, 10.0, 12.0, 15.0, 20.0, 25.0, 30.0, 40.0];
             println!(
@@ -374,7 +379,7 @@ fn main() {
             for m in Modulation::ALL {
                 print!("{:>8} {:>8.0}", m.name(), raw_rate(&ofdm, m, modem.symbols));
                 for (ci, &c) in cnrs.iter().enumerate() {
-                    let cfg = sim_channel(&modem.mode, Some(c), ppm, keyup, tx_tilt);
+                    let cfg = FmChannelConfig { cnr_db: Some(c), ..channel.clone() };
                     let st = run_sim(&ofdm, m, modem.symbols, modem.txdelay, &cfg, frames);
                     print!(" {:>8.1e}", st.errors as f64 / st.bits as f64);
                     if m == Modulation::Qpsk {
@@ -460,26 +465,11 @@ fn main() {
             radio_cmds::monitor(audio_in.as_deref(), in_channel, &mode, det.detector).unwrap_or_else(|m| die(&m))
         }
         Cmd::Decode { mode, input, det } => radio_cmds::decode(&input, &mode, det.detector).unwrap_or_else(|m| die(&m)),
-        Cmd::SimPair { mode, cnr, ppm, keyup, tx_tilt, txdelay, seed, speed, host, a_port, b_port, record, det } => {
+        Cmd::SimPair { cnr, ppm, keyup, txdelay, speed, .. } => {
             if keyup >= txdelay {
                 die("--txdelay must be longer than --keyup");
             }
-            let cfg = SimPairConfig {
-                mode,
-                cnr_db: cnr,
-                ppm,
-                keyup_s: keyup,
-                tx_tilt,
-                txdelay_s: txdelay,
-                seed,
-                speed,
-                host,
-                a_port,
-                b_port,
-                record: record.map(Into::into),
-                detector: det.detector,
-                verbose: true,
-            };
+            let cfg = pair.expect("sim-pair has a config");
             let sp = SimPair::start(cfg.clone()).unwrap_or_else(|e| die(&e.to_string()));
             println!(
                 "sim-pair: {} mode, CNR {}, {} ppm, key-up {} s, speed {}x, detector {}",
@@ -519,14 +509,47 @@ fn main() {
 }
 
 /// Parses a count that must be at least 1.
-/// The simulated FM channel of `mode` for the sim and sweep commands.
-fn sim_channel(mode: &str, cnr: Option<f32>, ppm: f32, keyup: f32, tx_tilt: f32) -> FmChannelConfig {
-    FmChannelConfig {
-        cnr_db: cnr,
-        clock_offset_ppm: ppm,
-        keyup_delay_s: keyup,
-        tx_tilt_db_per_octave: tx_tilt,
-        ..FmChannelConfig::by_name(mode).unwrap_or_else(|| die("unknown mode"))
+impl Cmd {
+    /// The simulated FM channel of the sim and sweep commands (sweep sets the CNR of
+    /// each point itself); None for the others.
+    fn sim_channel(&self) -> Option<FmChannelConfig> {
+        let (modem, cnr, ppm, keyup, tx_tilt) = match self {
+            Cmd::Sim { modem, cnr, ppm, keyup, tx_tilt, .. } => (modem, *cnr, ppm, keyup, tx_tilt),
+            Cmd::Sweep { modem, ppm, keyup, tx_tilt, .. } => (modem, None, ppm, keyup, tx_tilt),
+            _ => return None,
+        };
+        Some(FmChannelConfig {
+            cnr_db: cnr,
+            clock_offset_ppm: *ppm,
+            keyup_delay_s: *keyup,
+            tx_tilt_db_per_octave: *tx_tilt,
+            ..FmChannelConfig::by_name(&modem.mode).unwrap_or_else(|| die("unknown mode"))
+        })
+    }
+
+    /// The sim-pair command's link; None for the others.
+    fn sim_pair_config(&self) -> Option<SimPairConfig> {
+        let Cmd::SimPair { mode, cnr, ppm, keyup, tx_tilt, txdelay, seed, speed, host, a_port, b_port, record, det } =
+            self
+        else {
+            return None;
+        };
+        Some(SimPairConfig {
+            mode: mode.clone(),
+            cnr_db: *cnr,
+            ppm: *ppm,
+            keyup_s: *keyup,
+            tx_tilt: *tx_tilt,
+            txdelay_s: *txdelay,
+            seed: *seed,
+            speed: *speed,
+            host: host.clone(),
+            a_port: *a_port,
+            b_port: *b_port,
+            record: record.clone().map(Into::into),
+            detector: det.detector,
+            verbose: true,
+        })
     }
 }
 
@@ -551,16 +574,59 @@ fn at_least_one(s: &str) -> Result<usize, String> {
 mod tests {
     use super::*;
 
+    fn parse(args: &[&str]) -> Cmd {
+        Cli::try_parse_from(["vardefm"].iter().chain(args)).unwrap().cmd
+    }
+
+    /// Every channel option of sim and sweep reaches the channel the command runs on.
     #[test]
-    fn tx_tilt_reaches_the_simulated_channel() {
-        let sim = Cli::try_parse_from(["vardefm", "sim", "--tx-tilt", "-3"]).unwrap();
-        let Cmd::Sim { modem, tx_tilt, .. } = sim.cmd else { panic!("not sim") };
-        assert_eq!(sim_channel(&modem.mode, None, 0.0, 0.05, tx_tilt).tx_tilt_db_per_octave, -3.0);
-        let sweep = Cli::try_parse_from(["vardefm", "sweep", "--tx-tilt", "4.5"]).unwrap();
-        let Cmd::Sweep { modem, tx_tilt, .. } = sweep.cmd else { panic!("not sweep") };
-        assert_eq!(sim_channel(&modem.mode, Some(10.0), 0.0, 0.05, tx_tilt).tx_tilt_db_per_octave, 4.5);
-        let pair = Cli::try_parse_from(["vardefm", "sim-pair", "--tx-tilt", "6"]).unwrap();
-        assert!(matches!(pair.cmd, Cmd::SimPair { tx_tilt, .. } if tx_tilt == 6.0));
+    fn sim_and_sweep_options_reach_their_channel() {
+        let opts = ["--mode", "wide", "--ppm", "-20", "--keyup", "0.3", "--tx-tilt", "-3"];
+        for (cmd, cnr) in [("sim", Some(12.5)), ("sweep", None)] {
+            let mut args = vec![cmd];
+            args.extend(opts);
+            if cmd == "sim" {
+                args.extend(["--cnr", "12.5"]);
+            }
+            let c = parse(&args).sim_channel().unwrap();
+            let got = (c.cnr_db, c.clock_offset_ppm, c.keyup_delay_s, c.tx_tilt_db_per_octave, c.deviation_hz);
+            assert_eq!(got, (cnr, -20.0, 0.3, -3.0, FmChannelConfig::wide().deviation_hz), "{cmd}");
+        }
+    }
+
+    /// Every option of sim-pair reaches the link it starts.
+    #[test]
+    fn sim_pair_options_reach_its_config() {
+        let c = parse(&[
+            "sim-pair",
+            "--mode",
+            "wide",
+            "--cnr",
+            "15",
+            "--ppm",
+            "-20",
+            "--keyup",
+            "0.2",
+            "--tx-tilt",
+            "6",
+            "--txdelay",
+            "0.4",
+            "--seed",
+            "7",
+            "--speed",
+            "0",
+            "--host",
+            "0.0.0.0",
+            "--a-port",
+            "9000",
+            "--b-port",
+            "9100",
+        ])
+        .sim_pair_config()
+        .unwrap();
+        let got = (c.mode.as_str(), c.cnr_db, c.ppm, c.keyup_s, c.tx_tilt, c.txdelay_s, c.seed, c.speed);
+        assert_eq!(got, ("wide", Some(15.0), -20.0, 0.2, 6.0, 0.4, 7, 0.0));
+        assert_eq!((c.host.as_str(), c.a_port, c.b_port), ("0.0.0.0", 9000, 9100));
     }
 
     #[test]

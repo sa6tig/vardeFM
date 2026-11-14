@@ -91,16 +91,16 @@ pub struct SimPair {
 }
 
 impl SimPairConfig {
-    /// The FM channel between the two stations. The mode must be known.
-    fn channel(&self) -> FmChannelConfig {
-        FmChannelConfig {
+    /// The FM channel between the two stations; None for an unknown mode.
+    fn channel(&self) -> Option<FmChannelConfig> {
+        Some(FmChannelConfig {
             cnr_db: self.cnr_db,
             clock_offset_ppm: self.ppm,
             keyup_delay_s: self.keyup_s,
             tx_tilt_db_per_octave: self.tx_tilt,
             lead_silence_s: 0.0,
-            ..FmChannelConfig::by_name(&self.mode).unwrap()
-        }
+            ..FmChannelConfig::by_name(&self.mode)?
+        })
     }
 }
 
@@ -111,7 +111,7 @@ impl SimPair {
         if !(cfg.tx_tilt.is_finite() && cfg.tx_tilt.abs() <= 6.0) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "tx_tilt must be within -6..6 dB/octave"));
         }
-        let channel = cfg.channel();
+        let channel = cfg.channel().expect("a mode OfdmParams knows has a channel");
         let data_port = |p: u16| if p == 0 { 0 } else { p + 1 };
         let ports = [
             HostPort::bind(&cfg.host, cfg.a_port, data_port(cfg.a_port))?,
@@ -345,7 +345,7 @@ mod channel_tests {
             tx_tilt: -4.0,
             ..Default::default()
         };
-        let c = cfg.channel();
+        let c = cfg.channel().unwrap();
         assert_eq!(
             (c.cnr_db, c.clock_offset_ppm, c.keyup_delay_s, c.tx_tilt_db_per_octave),
             (Some(12.0), 30.0, 0.08, -4.0)
