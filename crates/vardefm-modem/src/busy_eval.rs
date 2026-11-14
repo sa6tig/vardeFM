@@ -44,7 +44,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use vardefm_dsp::filter::Chain;
 use vardefm_dsp::prng::Prng;
-use vardefm_sim::{transmit, FmChannelConfig};
+use vardefm_sim::{transmit, Ctcss, FmChannelConfig};
 
 /// A busy detector for the mode with these parameters.
 pub(crate) type MakeFn = fn(&OfdmParams) -> BusyDetector;
@@ -162,16 +162,18 @@ fn lead(rng: &mut Prng) -> usize {
 
 /// `audio` sent over the simulated channel after the closed-squelch lead.
 fn on_air(ctx: &Ctx, rng: &mut Prng, audio: &[f32]) -> Clip {
-    on_air_at(ctx.cnr, ctx, rng, audio)
+    on_air_at(ctx.cnr, ctx, rng, audio, None)
 }
 
-fn on_air_at(cnr: f32, ctx: &Ctx, rng: &mut Prng, audio: &[f32]) -> Clip {
+/// `audio` sent at `cnr` dB by a radio that adds the CTCSS tone `ctcss`.
+fn on_air_at(cnr: f32, ctx: &Ctx, rng: &mut Prng, audio: &[f32], ctcss: Option<Ctcss>) -> Clip {
     let lead = lead(rng);
     let cfg = FmChannelConfig {
         cnr_db: Some(cnr),
         seed: seed(rng),
         lead_silence_s: lead as f32 / FS,
         trail_silence_s: 2.0,
+        ctcss,
         ..FmChannelConfig::by_name(ctx.mode).unwrap()
     };
     let start = lead + samples(cfg.keyup_delay_s);
@@ -258,13 +260,14 @@ fn hum(rng: &mut Prng, f: f32, rms: f32, n: usize) -> Vec<f32> {
         .collect()
 }
 
-/// Trial `t`'s CTCSS tone into the wide transmitter: tones in turn, then the
+/// Trial `t`'s CTCSS tone, which the wide transmitter adds: tones in turn, then the
 /// other deviation.
-fn ctcss(t: u32, n: usize) -> Vec<f32> {
-    let f = CTCSS_HZ[t as usize % CTCSS_HZ.len()];
-    let dev = CTCSS_DEVIATION_HZ[t as usize / CTCSS_HZ.len() % CTCSS_DEVIATION_HZ.len()];
-    let a = dev / FmChannelConfig::wide().deviation_hz;
-    (0..n).map(|i| a * (2.0 * PI * f * i as f32 / FS).sin()).collect()
+fn ctcss(t: u32) -> Ctcss {
+    Ctcss {
+        hz: CTCSS_HZ[t as usize % CTCSS_HZ.len()] as f64,
+        deviation_hz: CTCSS_DEVIATION_HZ[t as usize / CTCSS_HZ.len() % CTCSS_DEVIATION_HZ.len()],
+        phase: 0.0,
+    }
 }
 
 /// White noise above the wide band (8th-order highpass at 7 kHz) at `HISS_RMS`.
@@ -341,17 +344,13 @@ fn voice_under_hum(ctx: &Ctx, rng: &mut Prng, t: u32) -> Clip {
 }
 
 fn burst_with_ctcss(ctx: &Ctx, rng: &mut Prng, t: u32) -> Clip {
-    let mut a = burst_audio(ctx, rng);
-    let tone = ctcss(t, a.len());
-    add(&mut a, &tone);
-    on_air(ctx, rng, &a)
+    let a = burst_audio(ctx, rng);
+    on_air_at(ctx.cnr, ctx, rng, &a, Some(ctcss(t)))
 }
 
 fn voice_with_ctcss(ctx: &Ctx, rng: &mut Prng, t: u32) -> Clip {
-    let mut a = voice(rng, 4.0);
-    let tone = ctcss(t, a.len());
-    add(&mut a, &tone);
-    on_air(ctx, rng, &a)
+    let a = voice(rng, 4.0);
+    on_air_at(ctx.cnr, ctx, rng, &a, Some(ctcss(t)))
 }
 
 /// The squelch opens on hiss and stays open.
@@ -385,7 +384,7 @@ fn silent_carrier(ctx: &Ctx, rng: &mut Prng, _: u32) -> Clip {
 
 /// A keyed carrier with only a CTCSS tone on it.
 fn ctcss_carrier(ctx: &Ctx, rng: &mut Prng, t: u32) -> Clip {
-    on_air(ctx, rng, &ctcss(t, samples(INTERFERENCE_S)))
+    on_air_at(ctx.cnr, ctx, rng, &vec![0.0; samples(INTERFERENCE_S)], Some(ctcss(t)))
 }
 
 /// The strong-carrier cases separate what the carrier's own noise does (at 20 dB
@@ -393,11 +392,11 @@ fn ctcss_carrier(ctx: &Ctx, rng: &mut Prng, t: u32) -> Clip {
 const STRONG_CNR: f32 = 40.0;
 
 fn strong_silent_carrier(ctx: &Ctx, rng: &mut Prng, _: u32) -> Clip {
-    on_air_at(STRONG_CNR, ctx, rng, &vec![0.0; samples(INTERFERENCE_S)])
+    on_air_at(STRONG_CNR, ctx, rng, &vec![0.0; samples(INTERFERENCE_S)], None)
 }
 
 fn strong_ctcss_carrier(ctx: &Ctx, rng: &mut Prng, t: u32) -> Clip {
-    on_air_at(STRONG_CNR, ctx, rng, &ctcss(t, samples(INTERFERENCE_S)))
+    on_air_at(STRONG_CNR, ctx, rng, &vec![0.0; samples(INTERFERENCE_S)], Some(ctcss(t)))
 }
 
 /// The squelch opens on hiss that lies entirely above the band.

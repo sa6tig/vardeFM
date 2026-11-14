@@ -7,6 +7,19 @@ use std::f32::consts::PI;
 /// the state into subnormal numbers, which are very slow on x86 and stay there.
 const FLUSH: f32 = 1e-30;
 
+/// The filter state `z`, or zero when it is tiny (see [`FLUSH`]) or not finite. A NaN
+/// or infinite input would otherwise stay in the state for good; this way the output
+/// is bad only while bad input lasts plus the filter's own ringing.
+#[inline]
+fn settle(z: f32) -> f32 {
+    // NaN fails the comparison, so it is zeroed too.
+    if z.abs() >= FLUSH && z.is_finite() {
+        z
+    } else {
+        0.0
+    }
+}
+
 /// Second-order IIR section (transposed direct form II).
 #[derive(Clone, Debug)]
 pub struct Biquad {
@@ -42,13 +55,8 @@ impl Biquad {
     pub fn process(&mut self, x: f32) -> f32 {
         let y = self.b0 * x + self.z1;
         self.z1 = self.b1 * x - self.a1 * y + self.z2;
-        self.z2 = self.b2 * x - self.a2 * y;
-        if self.z1.abs() < FLUSH {
-            self.z1 = 0.0;
-        }
-        if self.z2.abs() < FLUSH {
-            self.z2 = 0.0;
-        }
+        self.z2 = settle(self.b2 * x - self.a2 * y);
+        self.z1 = settle(self.z1);
         y
     }
 }
@@ -101,6 +109,59 @@ impl Chain {
         let mut c = Self::new();
         for q in BUTTER4_Q {
             c.biquads.push(Biquad::lowpass(fs, f, q));
+        }
+        c
+    }
+
+    /// A response that rises by `db_per_octave` (falls, if negative; -6 to +6) from
+    /// `lo` to `hi` Hz. It levels off over about an octave below `lo`, but keeps rising
+    /// (or falling) for one to two octaves above `hi`, where the last shelf ends. Its gain
+    /// keeps the power of a signal with a flat spectrum from `lo` to `hi`.
+    ///
+    /// Built from one first-order shelf per octave, each stepping the gain by
+    /// `db_per_octave`, so the slope ripples by a fraction of a dB around the
+    /// target. At ±6 dB/octave the shelves merge into a single zero or pole; past
+    /// that a shelf spans more than an octave and the slope no longer holds at the
+    /// band edges, so steeper tilts are refused.
+    pub fn tilt(fs: f32, db_per_octave: f32, lo: f32, hi: f32) -> Self {
+        let mut c = Self::new();
+        if db_per_octave == 0.0 {
+            return c;
+        }
+        assert!(
+            db_per_octave.is_finite() && db_per_octave.abs() <= 6.0,
+            "tilt {db_per_octave} dB/octave: must be within -6..6"
+        );
+        assert!(0.0 < lo && lo < hi && hi < fs / 2.0, "tilt band {lo}..{hi} Hz");
+        // Bilinear prewarp: the analog frequency that lands on `f` Hz after the transform.
+        let warp = |f: f32| 2.0 * fs * (PI * f / fs).tan();
+        let step = 10f32.powf(db_per_octave.abs() / 20.0);
+        let octaves = (hi / lo).log2().ceil() as i32;
+        // The last shelf's top corner must stay clear of Nyquist, where the prewarp
+        // diverges and the shelf could not be built.
+        let top = lo * 2f32.powi(octaves) * step;
+        assert!(top < 0.49 * fs, "tilt band {lo}..{hi} Hz at {db_per_octave} dB/octave needs a shelf up to {top} Hz");
+        let mut corners = Vec::new();
+        // One extra shelf past each edge, so the slope holds all the way to `lo` and `hi`.
+        for k in -1..=octaves {
+            let (lower, upper) = (warp(lo * 2f32.powi(k)), warp(lo * 2f32.powi(k) * step));
+            // H(s) = (1 + s/wz) / (1 + s/wp): rising when the zero sits below the pole.
+            corners.push(if db_per_octave > 0.0 { (lower, upper) } else { (upper, lower) });
+        }
+        // Mean power gain over `lo..hi` on a fine linear grid; the prewarp makes the
+        // analog response at warp(f) the digital response at f.
+        const GRID: usize = 512;
+        let power = (0..GRID)
+            .map(|i| {
+                let w = warp(lo + (hi - lo) * (i as f32 + 0.5) / GRID as f32);
+                corners.iter().map(|&(wz, wp)| (1.0 + (w / wz).powi(2)) / (1.0 + (w / wp).powi(2))).product::<f32>()
+            })
+            .sum::<f32>()
+            / GRID as f32;
+        let g = power.sqrt().recip();
+        for (i, &(wz, wp)) in corners.iter().enumerate() {
+            let n = if i == 0 { g } else { 1.0 };
+            c.first.push(FirstOrder::from_analog(fs, n, n / wz, 1.0, 1.0 / wp));
         }
         c
     }
@@ -171,10 +232,7 @@ impl FirstOrder {
     #[inline]
     pub fn process(&mut self, x: f32) -> f32 {
         let y = self.b0 * x + self.z;
-        self.z = self.b1 * x - self.a1 * y;
-        if self.z.abs() < FLUSH {
-            self.z = 0.0;
-        }
+        self.z = settle(self.b1 * x - self.a1 * y);
         y
     }
 }
@@ -296,6 +354,87 @@ mod tests {
         let mut de = Chain::new();
         de.push_first_order(FirstOrder::deemphasis(fs, 750e-6));
         let _ = Chain::highpass4(fs, 400.0).then(de);
+    }
+
+    #[test]
+    fn tilt_has_its_slope_across_the_band_and_keeps_a_flat_signals_power() {
+        let fs = 48_000.0;
+        let db = |c: &Chain, freq: f32| {
+            let mut c = c.clone();
+            20.0 * tone_gain(&mut |x| c.process(x), freq, fs).log10()
+        };
+        for (lo, hi) in [(300.0, 3000.0), (300.0, 7000.0)] {
+            for slope in [-6.0, -3.0, 3.0, 6.0] {
+                let c = Chain::tilt(fs, slope, lo, hi);
+                // Across the band, in eighth-octave steps, the gain follows the slope,
+                // measured from 1 kHz: within 0.5 dB where the carriers of both modes
+                // lie (422 Hz to 6 kHz), within 1 dB out to the band edges.
+                let at_1k = db(&c, 1000.0);
+                let steps = (8.0 * (hi / lo).log2()).floor() as i32;
+                for freq in (0..=steps).map(|k| lo * 2f32.powf(k as f32 / 8.0)) {
+                    let want = slope * (freq / 1000.0f32).log2();
+                    let got = db(&c, freq) - at_1k;
+                    let tol = if (422.0..=6000.0).contains(&freq) { 0.5 } else { 1.0 };
+                    assert!(
+                        (got - want).abs() < tol,
+                        "{lo}..{hi} {slope} dB/oct at {freq} Hz: {got:.2} dB, want {want:.2}"
+                    );
+                }
+                // Equal tones spread evenly over the band keep their total power.
+                let n = 32;
+                let power = (0..n)
+                    .map(|i| 10f32.powf(db(&c, lo + (hi - lo) * (i as f32 + 0.5) / n as f32) / 10.0))
+                    .sum::<f32>()
+                    / n as f32;
+                assert!(
+                    power.log10().abs() * 10.0 < 0.3,
+                    "{lo}..{hi} {slope} dB/oct: power {:.2} dB",
+                    10.0 * power.log10()
+                );
+            }
+        }
+        assert!(Chain::tilt(fs, 0.0, 300.0, 3000.0).first.is_empty());
+    }
+
+    #[test]
+    fn tilt_refuses_slopes_it_cannot_hold() {
+        for slope in [f32::NAN, f32::INFINITY, 6.5, -7.0] {
+            let r = std::panic::catch_unwind(|| Chain::tilt(48_000.0, slope, 300.0, 3000.0));
+            assert!(r.is_err(), "{slope} dB/octave was accepted");
+        }
+        // A band whose shelves would reach Nyquist is refused rather than bent.
+        assert!(std::panic::catch_unwind(|| Chain::tilt(48_000.0, 6.0, 300.0, 20_000.0)).is_err());
+    }
+
+    /// Every chain in use takes a NaN, an infinity and a run of exact silence, and
+    /// then filters a tone as if none of it had happened.
+    #[test]
+    fn filters_recover_from_bad_input_and_silence() {
+        let fs = 48_000.0;
+        let chains = [
+            ("tilt -6", Chain::tilt(fs, -6.0, 300.0, 7000.0)),
+            ("tilt +6", Chain::tilt(fs, 6.0, 300.0, 3000.0)),
+            ("bandpass", Chain::bandpass4(fs, 20.0, 7000.0)),
+            ("emphasis", {
+                let mut c = Chain::new();
+                c.push_first_order(FirstOrder::preemphasis(fs, 750e-6));
+                c.push_first_order(FirstOrder::deemphasis(fs, 750e-6));
+                c
+            }),
+        ];
+        for (name, fresh) in chains {
+            let mut c = fresh.clone();
+            for x in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                c.process(x);
+            }
+            for _ in 0..10 * 48_000 {
+                c.process(0.0);
+            }
+            let (mut a, mut b) = (fresh.clone(), c);
+            let want = tone_gain(&mut |x| a.process(x), 1000.0, fs);
+            let got = tone_gain(&mut |x| b.process(x), 1000.0, fs);
+            assert!((got - want).abs() < 1e-4, "{name}: 1 kHz gain {got} after bad input, {want} fresh");
+        }
     }
 
     #[test]

@@ -29,7 +29,8 @@ struct ModemArgs {
     /// Data symbols per frame
     #[arg(long, default_value_t = 40, value_parser = at_least_one)]
     symbols: usize,
-    /// TX spectral tilt in dB/octave (negative tilts down the high carriers)
+    /// Modem spectral tilt in dB/octave at both ends, which the receiver expects
+    /// (negative tilts down the high carriers); see --tx-tilt for a radio mismatch
     #[arg(long)]
     tilt: Option<f32>,
     /// TX RMS level, 0..1
@@ -89,11 +90,15 @@ enum Cmd {
         #[arg(long, default_value_t = 10)]
         frames: usize,
         /// Receiver sound-card clock error in ppm
-        #[arg(long, default_value_t = 0.0)]
+        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
         ppm: f32,
         /// Simulated radio key-up time, seconds
         #[arg(long, default_value_t = 0.05)]
         keyup: f32,
+        /// Sending radio's audio response tilt in dB/octave, -6 to 6, at the audio's own
+        /// level (a radio mismatch; --tilt changes the modem at both ends instead)
+        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true, value_parser = radio_tilt)]
+        tx_tilt: f32,
     },
     /// BER table over CNR for every modulation
     Sweep {
@@ -103,11 +108,16 @@ enum Cmd {
         det: DetectorArg,
         #[arg(long, default_value_t = 5)]
         frames: usize,
-        #[arg(long, default_value_t = 0.0)]
+        /// Receiver sound-card clock error in ppm
+        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
         ppm: f32,
         /// Simulated radio key-up time, seconds
         #[arg(long, default_value_t = 0.05)]
         keyup: f32,
+        /// Sending radio's audio response tilt in dB/octave, -6 to 6, at the audio's own
+        /// level (a radio mismatch; --tilt changes the modem at both ends instead)
+        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true, value_parser = radio_tilt)]
+        tx_tilt: f32,
     },
     /// Write test frames to a WAV file (play it into a radio)
     TxWav {
@@ -251,6 +261,10 @@ enum Cmd {
         /// Radio key-up time, seconds
         #[arg(long, default_value_t = 0.05)]
         keyup: f32,
+        /// Sending radio's audio response tilt in dB/octave, -6 to 6, at the audio's own
+        /// level (both directions)
+        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true, value_parser = radio_tilt)]
+        tx_tilt: f32,
         /// Leader before each burst, seconds (must exceed --keyup)
         #[arg(long, default_value_t = 0.1)]
         txdelay: f32,
@@ -323,20 +337,21 @@ fn raw_rate(ofdm: &Ofdm, m: Modulation, nsym: usize) -> f32 {
 
 fn main() {
     let cli = Cli::parse();
+    // Built from the parsed command, where a test can check them.
+    let channel = cli.cmd.sim_channel();
+    let pair = cli.cmd.sim_pair_config();
     match cli.cmd {
-        Cmd::Sim { modem, det, cnr, frames, ppm, keyup } => {
+        Cmd::Sim { modem, det, cnr, frames, ppm, tx_tilt, .. } => {
             let (ofdm, m) = modem.build_rx(&det);
-            let mut cfg = FmChannelConfig::by_name(&modem.mode).unwrap();
-            cfg.cnr_db = cnr;
-            cfg.clock_offset_ppm = ppm;
-            cfg.keyup_delay_s = keyup;
+            let cfg = channel.expect("sim has a channel");
             let st = run_sim(&ofdm, m, modem.symbols, modem.txdelay, &cfg, frames);
             println!(
-                "mode={} mod={} cnr={} ppm={}  raw={:.0} bit/s",
+                "mode={} mod={} cnr={} ppm={} tx_tilt={}  raw={:.0} bit/s",
                 modem.mode,
                 m.name(),
                 cnr.map_or("none".into(), |c| format!("{c} dB")),
                 ppm,
+                tx_tilt,
                 raw_rate(&ofdm, m, modem.symbols)
             );
             println!(
@@ -347,10 +362,14 @@ fn main() {
                 st.snr_sum / st.snr_n.max(1) as f32
             );
         }
-        Cmd::Sweep { modem, det, frames, ppm, keyup } => {
+        Cmd::Sweep { modem, det, frames, ppm, tx_tilt, .. } => {
+            let channel = channel.expect("sweep has a channel");
             let (ofdm, _) = modem.build_rx(&det);
             let cnrs = [6.0, 8.0, 10.0, 12.0, 15.0, 20.0, 25.0, 30.0, 40.0];
-            println!("mode={} symbols/frame={} ppm={} frames/point={}", modem.mode, modem.symbols, ppm, frames);
+            println!(
+                "mode={} symbols/frame={} ppm={} tx_tilt={} frames/point={}",
+                modem.mode, modem.symbols, ppm, tx_tilt, frames
+            );
             print!("{:>8} {:>8}", "mod", "raw b/s");
             for c in cnrs {
                 print!(" {:>8}", format!("{c}dB"));
@@ -360,10 +379,7 @@ fn main() {
             for m in Modulation::ALL {
                 print!("{:>8} {:>8.0}", m.name(), raw_rate(&ofdm, m, modem.symbols));
                 for (ci, &c) in cnrs.iter().enumerate() {
-                    let mut cfg = FmChannelConfig::by_name(&modem.mode).unwrap();
-                    cfg.cnr_db = Some(c);
-                    cfg.clock_offset_ppm = ppm;
-                    cfg.keyup_delay_s = keyup;
+                    let cfg = FmChannelConfig { cnr_db: Some(c), ..channel.clone() };
                     let st = run_sim(&ofdm, m, modem.symbols, modem.txdelay, &cfg, frames);
                     print!(" {:>8.1e}", st.errors as f64 / st.bits as f64);
                     if m == Modulation::Qpsk {
@@ -449,25 +465,11 @@ fn main() {
             radio_cmds::monitor(audio_in.as_deref(), in_channel, &mode, det.detector).unwrap_or_else(|m| die(&m))
         }
         Cmd::Decode { mode, input, det } => radio_cmds::decode(&input, &mode, det.detector).unwrap_or_else(|m| die(&m)),
-        Cmd::SimPair { mode, cnr, ppm, keyup, txdelay, seed, speed, host, a_port, b_port, record, det } => {
+        Cmd::SimPair { cnr, ppm, keyup, txdelay, speed, .. } => {
             if keyup >= txdelay {
                 die("--txdelay must be longer than --keyup");
             }
-            let cfg = SimPairConfig {
-                mode,
-                cnr_db: cnr,
-                ppm,
-                keyup_s: keyup,
-                txdelay_s: txdelay,
-                seed,
-                speed,
-                host,
-                a_port,
-                b_port,
-                record: record.map(Into::into),
-                detector: det.detector,
-                verbose: true,
-            };
+            let cfg = pair.expect("sim-pair has a config");
             let sp = SimPair::start(cfg.clone()).unwrap_or_else(|e| die(&e.to_string()));
             println!(
                 "sim-pair: {} mode, CNR {}, {} ppm, key-up {} s, speed {}x, detector {}",
@@ -507,10 +509,130 @@ fn main() {
 }
 
 /// Parses a count that must be at least 1.
+impl Cmd {
+    /// The simulated FM channel of the sim and sweep commands (sweep sets the CNR of
+    /// each point itself); None for the others.
+    fn sim_channel(&self) -> Option<FmChannelConfig> {
+        let (modem, cnr, ppm, keyup, tx_tilt) = match self {
+            Cmd::Sim { modem, cnr, ppm, keyup, tx_tilt, .. } => (modem, *cnr, ppm, keyup, tx_tilt),
+            Cmd::Sweep { modem, ppm, keyup, tx_tilt, .. } => (modem, None, ppm, keyup, tx_tilt),
+            _ => return None,
+        };
+        Some(FmChannelConfig {
+            cnr_db: cnr,
+            clock_offset_ppm: *ppm,
+            keyup_delay_s: *keyup,
+            tx_tilt_db_per_octave: *tx_tilt,
+            ..FmChannelConfig::by_name(&modem.mode).unwrap_or_else(|| die("unknown mode"))
+        })
+    }
+
+    /// The sim-pair command's link; None for the others.
+    fn sim_pair_config(&self) -> Option<SimPairConfig> {
+        let Cmd::SimPair { mode, cnr, ppm, keyup, tx_tilt, txdelay, seed, speed, host, a_port, b_port, record, det } =
+            self
+        else {
+            return None;
+        };
+        Some(SimPairConfig {
+            mode: mode.clone(),
+            cnr_db: *cnr,
+            ppm: *ppm,
+            keyup_s: *keyup,
+            tx_tilt: *tx_tilt,
+            txdelay_s: *txdelay,
+            seed: *seed,
+            speed: *speed,
+            host: host.clone(),
+            a_port: *a_port,
+            b_port: *b_port,
+            record: record.clone().map(Into::into),
+            detector: det.detector,
+            verbose: true,
+        })
+    }
+}
+
+/// A radio tilt in dB/octave: the simulator models -6 to 6.
+fn radio_tilt(s: &str) -> Result<f32, String> {
+    match s.parse::<f32>() {
+        Ok(t) if t.is_finite() && t.abs() <= 6.0 => Ok(t),
+        Ok(_) => Err("must be within -6..6 dB/octave".into()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 fn at_least_one(s: &str) -> Result<usize, String> {
     match s.parse::<usize>() {
         Ok(n) if n >= 1 => Ok(n),
         Ok(_) => Err("must be at least 1".into()),
         Err(e) => Err(e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Cmd {
+        Cli::try_parse_from(["vardefm"].iter().chain(args)).unwrap().cmd
+    }
+
+    /// Every channel option of sim and sweep reaches the channel the command runs on.
+    #[test]
+    fn sim_and_sweep_options_reach_their_channel() {
+        let opts = ["--mode", "wide", "--ppm", "-20", "--keyup", "0.3", "--tx-tilt", "-3"];
+        for (cmd, cnr) in [("sim", Some(12.5)), ("sweep", None)] {
+            let mut args = vec![cmd];
+            args.extend(opts);
+            if cmd == "sim" {
+                args.extend(["--cnr", "12.5"]);
+            }
+            let c = parse(&args).sim_channel().unwrap();
+            let got = (c.cnr_db, c.clock_offset_ppm, c.keyup_delay_s, c.tx_tilt_db_per_octave, c.deviation_hz);
+            assert_eq!(got, (cnr, -20.0, 0.3, -3.0, FmChannelConfig::wide().deviation_hz), "{cmd}");
+        }
+    }
+
+    /// Every option of sim-pair reaches the link it starts.
+    #[test]
+    fn sim_pair_options_reach_its_config() {
+        let c = parse(&[
+            "sim-pair",
+            "--mode",
+            "wide",
+            "--cnr",
+            "15",
+            "--ppm",
+            "-20",
+            "--keyup",
+            "0.2",
+            "--tx-tilt",
+            "6",
+            "--txdelay",
+            "0.4",
+            "--seed",
+            "7",
+            "--speed",
+            "0",
+            "--host",
+            "0.0.0.0",
+            "--a-port",
+            "9000",
+            "--b-port",
+            "9100",
+        ])
+        .sim_pair_config()
+        .unwrap();
+        let got = (c.mode.as_str(), c.cnr_db, c.ppm, c.keyup_s, c.tx_tilt, c.txdelay_s, c.seed, c.speed);
+        assert_eq!(got, ("wide", Some(15.0), -20.0, 0.2, 6.0, 0.4, 7, 0.0));
+        assert_eq!((c.host.as_str(), c.a_port, c.b_port), ("0.0.0.0", 9000, 9100));
+    }
+
+    #[test]
+    fn tx_tilt_outside_the_modelled_range_is_refused() {
+        for t in ["7", "-6.5", "nan", "inf"] {
+            assert!(Cli::try_parse_from(["vardefm", "sim", "--tx-tilt", t]).is_err(), "{t}");
+        }
     }
 }

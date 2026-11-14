@@ -1,7 +1,8 @@
 //! FM radio channel simulator.
 //!
 //! Models what happens to modem audio between two FM radios:
-//! TX audio filtering, pre-emphasis, deviation limiting, the FM modulator, RF noise,
+//! the sending radio's audio response tilt, TX audio filtering, pre-emphasis, a CTCSS
+//! tone, deviation limiting, the FM modulator, RF noise,
 //! the IF filter, the discriminator (including threshold "clicks" at low signal),
 //! de-emphasis, RX audio filtering, squelch, TX key-up delay, and sound-card clock offset.
 
@@ -22,6 +23,21 @@ pub struct FmChannelConfig {
     /// RX de-emphasis time constant in microseconds. A radio whose value differs from
     /// `tx_emphasis_us` passes the modem audio with a tilted response.
     pub rx_emphasis_us: Option<f32>,
+    /// TX audio response tilt in dB per octave, -6 to +6: a sending radio whose audio
+    /// response does not match the receiver's. The slope holds across `tx_band` down
+    /// to 300 Hz and eases off over the octave below. The tilted audio is scaled back
+    /// to the RMS it had before, as an operator sets the drive level on the signal the
+    /// radio actually sends, so the tilt changes the spectrum but not the RMS
+    /// deviation. Its peaks can change, and the limiter clips them as it would.
+    /// It acts before pre-emphasis and the deviation limiter, as a microphone or
+    /// audio-stage mismatch does; a data port whose mismatch sits after the limiter
+    /// (in the modulator) is not modelled.
+    pub tx_tilt_db_per_octave: f32,
+    /// A CTCSS tone the sending radio adds after its audio response tilt and
+    /// pre-emphasis, before the deviation limiter and the TX audio filter (None for
+    /// none). The tone must lie inside `tx_band`, as on a data port: a radio whose
+    /// voice path filters sub-tones out injects them elsewhere, which is not modelled.
+    pub ctcss: Option<Ctcss>,
     /// TX audio passband in Hz.
     pub tx_band: (f32, f32),
     /// RX audio passband in Hz.
@@ -51,6 +67,8 @@ impl FmChannelConfig {
             deviation_hz: 2_500.0,
             tx_emphasis_us: Some(750.0),
             rx_emphasis_us: Some(750.0),
+            tx_tilt_db_per_octave: 0.0,
+            ctcss: None,
             tx_band: (300.0, 3_000.0),
             rx_band: (300.0, 3_000.0),
             if_bandwidth_hz: 11_000.0,
@@ -87,9 +105,70 @@ impl FmChannelConfig {
     }
 }
 
+/// A CTCSS tone added to the transmitted audio.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Ctcss {
+    pub hz: f64,
+    /// Peak deviation of the tone in Hz.
+    pub deviation_hz: f32,
+    /// Starting phase, in cycles.
+    pub phase: f64,
+}
+
+/// Lowest frequency the TX tilt holds its slope to, Hz; over the octave below, the
+/// response eases off.
+const TILT_LOW_HZ: f32 = 300.0;
+
+/// `audio` through the sending radio's response tilt, at the RMS it had before; None
+/// when there is no tilt.
+fn tx_tilt(cfg: &FmChannelConfig, audio: &[f32]) -> Option<Vec<f32>> {
+    let s = cfg.tx_tilt_db_per_octave;
+    if s == 0.0 {
+        return None;
+    }
+    // The tilt spans the speech band at most: a radio's response does not keep
+    // rising (or falling) to the 20 Hz edge of a data port.
+    let lo = cfg.tx_band.0.max(TILT_LOW_HZ);
+    assert!(lo < cfg.tx_band.1, "TX tilt needs a tx_band reaching above {TILT_LOW_HZ} Hz, not {:?}", cfg.tx_band);
+    let mut tilt = Chain::tilt(cfg.fs, s, lo, cfg.tx_band.1);
+    let mut out: Vec<f32> = audio.iter().map(|&x| tilt.process(x)).collect();
+    let power = |v: &[f32]| v.iter().map(|&x| (x as f64).powi(2)).sum::<f64>();
+    let (before, after) = (power(audio), power(&out));
+    if after > 0.0 {
+        let g = (before / after).sqrt() as f32;
+        out.iter_mut().for_each(|x| *x *= g);
+    }
+    Some(out)
+}
+
+impl Ctcss {
+    /// The tone added to sample `i`, as a fraction of `deviation_hz` full scale.
+    fn sample(&self, i: usize, fs: f32, deviation_hz: f32) -> f32 {
+        let a = self.deviation_hz / deviation_hz;
+        a * (2.0 * std::f64::consts::PI * (self.hz * i as f64 / fs as f64 + self.phase)).sin() as f32
+    }
+
+    /// Panics unless the tone is a real sub-tone the channel `cfg` passes.
+    fn check(&self, cfg: &FmChannelConfig) {
+        let Self { hz, deviation_hz, phase } = *self;
+        assert!(
+            hz.is_finite() && deviation_hz.is_finite() && deviation_hz >= 0.0 && phase.is_finite(),
+            "CTCSS {self:?}: not a tone"
+        );
+        assert!(
+            cfg.tx_band.0 as f64 <= hz && hz < cfg.tx_band.1 as f64,
+            "CTCSS at {hz} Hz: the TX audio band {:?} filters it out",
+            cfg.tx_band
+        );
+    }
+}
+
 /// Pass one transmission (audio at `cfg.fs`, full scale = peak deviation) through the channel.
 pub fn transmit(cfg: &FmChannelConfig, audio: &[f32]) -> Vec<f32> {
     let fs = cfg.fs;
+    if let Some(c) = &cfg.ctcss {
+        c.check(cfg);
+    }
     let lead = (cfg.lead_silence_s * fs) as usize;
     let trail = (cfg.trail_silence_s * fs) as usize;
     let keyup = (cfg.keyup_delay_s * fs) as usize;
@@ -100,11 +179,16 @@ pub fn transmit(cfg: &FmChannelConfig, audio: &[f32]) -> Vec<f32> {
     // --- Transmitter audio chain ---
     let mut tx_chain = Chain::bandpass4(fs, cfg.tx_band.0, cfg.tx_band.1);
     let mut pre = cfg.tx_emphasis_us.map(|us| FirstOrder::preemphasis(fs, us * 1e-6));
+    let tilted = tx_tilt(cfg, audio);
+    let audio = tilted.as_deref().unwrap_or(audio);
     let mut tx_audio = vec![0f32; total];
     for (i, &x) in audio.iter().enumerate() {
         let mut v = x;
         if let Some(p) = &mut pre {
             v = p.process(v);
+        }
+        if let Some(c) = &cfg.ctcss {
+            v += c.sample(i, fs, cfg.deviation_hz);
         }
         v = v.clamp(-cfg.clip_level, cfg.clip_level);
         tx_audio[lead + i] = tx_chain.process(v);
@@ -167,6 +251,19 @@ pub fn transmit(cfg: &FmChannelConfig, audio: &[f32]) -> Vec<f32> {
     out
 }
 
+/// Least-squares fit of `a sin + b cos` at `freq` to `x[seg]` (48 kHz): (a, b).
+#[cfg(test)]
+fn sine_fit(x: &[f32], seg: std::ops::Range<usize>, freq: f64) -> (f64, f64) {
+    let (mut ss, mut cc, mut sc, mut ys, mut yc) = (0f64, 0f64, 0f64, 0f64, 0f64);
+    for i in seg {
+        let (s, c) = (2.0 * std::f64::consts::PI * freq * i as f64 / 48_000.0).sin_cos();
+        (ss, cc, sc) = (ss + s * s, cc + c * c, sc + s * c);
+        (ys, yc) = (ys + x[i] as f64 * s, yc + x[i] as f64 * c);
+    }
+    let det = ss * cc - sc * sc;
+    ((ys * cc - yc * sc) / det, (yc * ss - ys * sc) / det)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,6 +275,112 @@ mod tests {
         let out = transmit(&cfg, &tone);
         let peak = out[24_000..40_000].iter().fold(0f32, |m, v| m.max(v.abs()));
         assert!((peak - 0.3).abs() < 0.05, "peak {peak}");
+    }
+
+    /// Amplitude of the `freq` component of `x[seg]`.
+    fn amplitude(x: &[f32], seg: std::ops::Range<usize>, freq: f64) -> f64 {
+        let (a, b) = sine_fit(x, seg, freq);
+        a.hypot(b)
+    }
+
+    fn quiet_wide(tilt: f32) -> FmChannelConfig {
+        FmChannelConfig {
+            tx_tilt_db_per_octave: tilt,
+            lead_silence_s: 0.0,
+            keyup_delay_s: 0.0,
+            ..FmChannelConfig::wide()
+        }
+    }
+
+    fn tones(freqs: &[f64], amp: f32, n: usize) -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                let t = i as f64 / 48_000.0;
+                // Phases spread by index keep the peaks of the sum low.
+                freqs
+                    .iter()
+                    .enumerate()
+                    .map(|(k, f)| amp * (2.0 * std::f64::consts::PI * f * t + k as f64 * 2.4).sin() as f32)
+                    .sum()
+            })
+            .collect()
+    }
+
+    /// Tones sent together keep their relative levels apart from the tilt: the slope
+    /// from 1 kHz, levelling off below the 300 Hz floor, at the RMS they had.
+    #[test]
+    fn tx_tilt_shapes_tones_by_the_octave_down_to_its_floor_at_the_same_level() {
+        let freqs = [100.0, 300.0, 500.0, 1000.0, 4000.0];
+        let input = tones(&freqs, 0.05, 48_000);
+        let seg = 24_000..44_000;
+        let rms = |v: &[f32]| (v[seg.clone()].iter().map(|x| x * x).sum::<f32>() / seg.len() as f32).sqrt();
+        let flat = transmit(&quiet_wide(0.0), &input);
+        for slope in [-6.0f32, -3.0, 3.0, 6.0] {
+            let out = transmit(&quiet_wide(slope), &input);
+            let db =
+                |f: f64| 20.0 * (amplitude(&out, seg.clone(), f) / amplitude(&flat, seg.clone(), f)).log10() as f32;
+            for (f, octaves) in [(500.0, (0.5f32).log2()), (4000.0, 2.0)] {
+                let got = db(f) - db(1000.0);
+                assert!((got - slope * octaves).abs() < 0.7, "{slope} dB/oct at {f} Hz: {got:.2} dB from 1 kHz");
+            }
+            // The full slope would put 100 Hz 9.5 dB from 300 Hz; the floor eases it.
+            let below = (db(100.0) - db(300.0)) * slope.signum();
+            assert!(-6.5 < below && below < -2.0, "{slope} dB/oct: 100 Hz is {below:.2} dB from 300 Hz");
+            let level = 20.0 * (rms(&out) / rms(&flat)).log10();
+            assert!(level.abs() < 0.3, "{slope} dB/oct changed the level by {level:.2} dB");
+        }
+    }
+
+    /// The tilt shapes the audio before the deviation limiter. Two tones that clip
+    /// when sent flat stop clipping once a tilt makes one of them dominate at the same
+    /// RMS, so no intermodulation product appears; a tilt after the limiter would
+    /// reshape audio that had already clipped.
+    #[test]
+    fn tx_tilt_acts_before_the_limiter() {
+        let input = tones(&[300.0, 4000.0], 0.6, 48_000);
+        let seg = 24_000..44_000;
+        let im_db = |slope: f32| {
+            let out = transmit(&quiet_wide(slope), &input);
+            let main = amplitude(&out, seg.clone(), 300.0).max(amplitude(&out, seg.clone(), 4000.0));
+            20.0 * (amplitude(&out, seg.clone(), 3400.0) / main).log10()
+        };
+        let flat = im_db(0.0);
+        assert!(flat > -40.0, "flat: no clipping to compare with ({flat:.1} dB)");
+        for slope in [-6.0, 6.0] {
+            let im = im_db(slope);
+            assert!(im < -60.0, "{slope} dB/oct: 4000-2*300 Hz product at {im:.1} dB");
+        }
+    }
+
+    /// The CTCSS tone joins after the tilt, so its deviation is what was asked for.
+    #[test]
+    fn ctcss_keeps_its_deviation_through_a_tilt() {
+        let input = tones(&[1000.0, 3000.0], 0.2, 48_000);
+        for slope in [-6.0, 0.0, 6.0] {
+            let cfg = FmChannelConfig {
+                ctcss: Some(Ctcss { hz: 67.0, deviation_hz: 300.0, phase: 0.0 }),
+                ..quiet_wide(slope)
+            };
+            let got = amplitude(&transmit(&cfg, &input), 24_000..44_000, 67.0) * cfg.deviation_hz as f64;
+            assert!((got / 300.0 - 1.0).abs() < 0.06, "{slope} dB/oct: CTCSS deviation {got:.0} Hz");
+        }
+    }
+
+    /// A tone the TX audio band would filter out, or one that is not a tone, is
+    /// refused rather than silently lost.
+    #[test]
+    fn ctcss_the_channel_cannot_carry_is_refused() {
+        let tone = Ctcss { hz: 67.0, deviation_hz: 300.0, phase: 0.0 };
+        let bad = [
+            (FmChannelConfig::narrow(), tone),
+            (FmChannelConfig::wide(), Ctcss { hz: f64::NAN, ..tone }),
+            (FmChannelConfig::wide(), Ctcss { deviation_hz: -1.0, ..tone }),
+            (FmChannelConfig::wide(), Ctcss { hz: 9000.0, ..tone }),
+        ];
+        for (cfg, c) in bad {
+            let cfg = FmChannelConfig { ctcss: Some(c), ..cfg };
+            assert!(std::panic::catch_unwind(|| transmit(&cfg, &[0.0; 480])).is_err(), "{c:?} accepted");
+        }
     }
 }
 
@@ -195,20 +398,7 @@ mod probe {
                 let out = transmit(&cfg, &tone);
                 // least-squares fit of a 1 kHz sine, residual = noise+distortion
                 let seg = 24_000..90_000;
-                let (mut ss, mut cc, mut sc) = (0f64, 0f64, 0f64);
-                let (mut ys, mut yc) = (0f64, 0f64);
-                for i in seg.clone() {
-                    let w = 2.0 * std::f64::consts::PI * 1000.0 * i as f64 / 48_000.0;
-                    let (s, c) = w.sin_cos();
-                    ss += s * s;
-                    cc += c * c;
-                    sc += s * c;
-                    ys += out[i] as f64 * s;
-                    yc += out[i] as f64 * c;
-                }
-                let det = ss * cc - sc * sc;
-                let a = (ys * cc - yc * sc) / det;
-                let b = (yc * ss - ys * sc) / det;
+                let (a, b) = sine_fit(&out, seg.clone(), 1000.0);
                 let (mut sig, mut err) = (0f64, 0f64);
                 for i in seg {
                     let w = 2.0 * std::f64::consts::PI * 1000.0 * i as f64 / 48_000.0;

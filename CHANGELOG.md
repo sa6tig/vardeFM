@@ -7,6 +7,10 @@ run the same minor version.
 ## [Unreleased]
 
 ### Added
+- **TX tilt in the channel simulator.** `sim`, `sweep` and `sim-pair` take `--tx-tilt`,
+  a sending radio whose audio response tilts by -6 to 6 dB/octave against the
+  receiver's, at the audio's own level. Unlike `--tilt`, it does not change the modem.
+  The detector evaluation's `TX_TILT` uses it, and its CTCSS tone joins after the tilt.
 - **Performance gates.** `level_gate` and `fer_gate` are ignored tests, run by hand in
   release mode, that fail when decoding performance moves. Per mode and level, the CNR
   at which 10 % of codewords fail, and per mode and drive level the CNR at which 10 % of
@@ -34,11 +38,20 @@ run the same minor version.
   burst it falls in or shortly before, and cannot leave busy detection deaf; the last
   good sample takes its place. (#10)
 
+### Fixed
+- `sim` and `sweep` accept a negative `--ppm` (`--ppm -20`), as `sim-pair` already did.
+- A filter that gets a NaN or infinite sample recovers once the input is good again
+  instead of putting out NaN for the rest of the run.
+
 ## [0.3.1] - 2026-11-09
 
 On-air compatible with 0.3.0.
 
 ### Added
+- **TX tilt in the channel simulator.** `sim`, `sweep` and `sim-pair` take `--tx-tilt`,
+  a sending radio whose audio response tilts by -6 to 6 dB/octave against the
+  receiver's, at the audio's own level. Unlike `--tilt`, it does not change the modem.
+  The detector evaluation's `TX_TILT` uses it, and its CTCSS tone joins after the tilt.
 - **Receive level advice.** `vardefm modem --levels` prints the receive level every 2 s
   while idle, with advice for the radio's volume knob. The modem always shows each
   received burst's peak level and warns, at most every 30 s, when bursts are too loud or
@@ -107,11 +120,19 @@ rate-adaptation thresholds all changed. Both stations must upgrade.
 ## [0.2.1] - 2026-10-17
 
 ### Added
+- **TX tilt in the channel simulator.** `sim`, `sweep` and `sim-pair` take `--tx-tilt`,
+  a sending radio whose audio response tilts by -6 to 6 dB/octave against the
+  receiver's, at the audio's own level. Unlike `--tilt`, it does not change the modem.
+  The detector evaluation's `TX_TILT` uses it, and its CTCSS tone joins after the tilt.
 - macOS support: release archives for Apple Silicon and Intel, CI tests on macOS.
 
 ## [0.2.0] - 2026-10-17
 
 ### Added
+- **TX tilt in the channel simulator.** `sim`, `sweep` and `sim-pair` take `--tx-tilt`,
+  a sending radio whose audio response tilts by -6 to 6 dB/octave against the
+  receiver's, at the audio's own level. Unlike `--tilt`, it does not change the modem.
+  The detector evaluation's `TX_TILT` uses it, and its CTCSS tone joins after the tilt.
 - Raspberry Pi: GPIO PTT, the `bench` command, multi-core decoding and `--max-level`.
 - The user guide ships as `README.md` inside the release archives.
 
