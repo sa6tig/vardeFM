@@ -21,7 +21,9 @@
 //!   response period for it.
 //! - **Rate adaptation:** each burst names the speed level the peer should use
 //!   next. It is chosen from the measured SNR (normalized for the per-level
-//!   transmit drive) and stepped down after codeword failures or timeouts.
+//!   transmit drive) and stepped down after codeword failures or timeouts. A level
+//!   whose codewords failed is not asked for again for a few bursts, longer each time
+//!   it fails again (see [`LevelHold`]).
 //! - **Disconnect:** after the host's DISCONNECT, once all sent data is
 //!   acknowledged, the station sends `Disc` and the peer answers `DiscAck`. Both
 //!   then report DISCONNECTED.
@@ -54,6 +56,84 @@ pub fn level_by_snr(modem: &Modem, snr_db: f32, rx_level: u8) -> u8 {
         .enumerate()
         .rposition(|(l, &t)| modem.predict_snr_db(snr_db, rx_level, l as u8) >= t + SNR_MARGIN_DB)
         .unwrap_or(0) as u8
+}
+
+/// Clean bursts to wait, after a failure at a level, before asking for that level again.
+const HOLD_BASE: u32 = 2;
+/// Longest wait: the hold doubles each time the level fails again right after it is lifted.
+const HOLD_MAX: u32 = 16;
+/// The hold is lifted early when the SNR clears the held level's threshold by this
+/// much more than usual (the channel has clearly improved).
+const HOLD_ESCAPE_DB: f32 = 3.0;
+
+/// Memory of codeword failures, so that a level the SNR says is fine but which keeps
+/// failing is not asked for on every other burst.
+///
+/// After a burst at level `L` loses a codeword, requests stay below `L` for `hold`
+/// clean bursts. Then `L` may be asked for once more (a probe). If the probe fails too,
+/// the hold doubles (up to [`HOLD_MAX`]); if it decodes, the hold goes back to
+/// [`HOLD_BASE`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LevelHold {
+    /// Lowest level that recently failed: requests stay below it.
+    held: Option<u8>,
+    /// Clean bursts left before `held` is lifted.
+    left: u32,
+    /// Hold length for the next failure at `probe`.
+    hold: u32,
+    /// Level asked for again after its hold was lifted, not yet seen decoding.
+    probe: Option<u8>,
+}
+
+impl LevelHold {
+    /// Update with a burst that carried `ncw > 0` codewords at `level` (`failed` of them
+    /// lost), and limit `req`. `escape` is the level the SNR supports with
+    /// [`HOLD_ESCAPE_DB`] to spare.
+    pub fn update(&mut self, level: u8, ncw: u8, failed: bool, req: u8, escape: u8) -> u8 {
+        if ncw > 0 {
+            if failed {
+                // A probe that fails again doubles the hold. A burst at or above the held
+                // level that was already on its way when the hold began does not.
+                if self.probe == Some(level) {
+                    self.hold = (self.hold * 2).clamp(HOLD_BASE, HOLD_MAX);
+                } else if self.held.is_none_or(|h| level < h) {
+                    self.hold = HOLD_BASE;
+                }
+                self.held = Some(self.held.map_or(level, |h| h.min(level)));
+                self.left = self.hold;
+                self.probe = None;
+            } else {
+                if self.probe.is_some_and(|p| level >= p) {
+                    self.probe = None;
+                    self.hold = HOLD_BASE;
+                }
+                match self.held {
+                    Some(h) if level >= h => {
+                        // The held level decoded after all.
+                        self.held = None;
+                        self.hold = HOLD_BASE;
+                    }
+                    Some(h) => {
+                        self.left = self.left.saturating_sub(1);
+                        if self.left == 0 {
+                            self.held = None;
+                            self.probe = Some(h);
+                        }
+                    }
+                    None => {}
+                }
+            }
+        }
+        if self.held.is_some_and(|h| escape >= h) {
+            self.held = None;
+            self.probe = None;
+            self.hold = HOLD_BASE;
+        }
+        match self.held {
+            Some(h) => req.min(h.saturating_sub(1)),
+            None => req,
+        }
+    }
 }
 
 const SEGMENT_HEADER: usize = 4;
@@ -171,6 +251,7 @@ struct Session {
     peer_level: u8,
     /// Level we ask the peer to use.
     req_level: u8,
+    hold: LevelHold,
     phase: Phase,
     retries: u32,
     closing: Option<f64>,
@@ -446,6 +527,7 @@ impl Link {
             ack_bitmap: 0,
             peer_level: peer_req.min(self.cfg.max_level),
             req_level: req,
+            hold: LevelHold::default(),
             phase: Phase::Idle,
             retries: 0,
             closing: None,
@@ -457,11 +539,13 @@ impl Link {
     fn on_session_burst(&mut self, now: f64, rx: &RxBurst, req: u8) {
         let h = rx.header;
         let turnaround = self.cfg.turnaround_s;
+        let escape = level_by_snr(&self.modem, rx.snr_db - HOLD_ESCAPE_DB, h.level);
+        let failed = rx.payload.iter().any(|p| p.is_none());
         let State::Connected(s) = &mut self.state else { return };
         s.last_heard = now;
         s.retries = 0;
         s.peer_level = h.req_level.min(self.cfg.max_level);
-        s.req_level = req;
+        s.req_level = s.hold.update(h.level, h.ncw, failed, req, escape);
 
         // Acknowledgements for our data.
         if h.ack_burst == s.burst_id {

@@ -321,3 +321,40 @@ fn predicted_snr_matches_the_simulator() {
     let p = modem.predict_snr_db(15.9, 4, 5);
     assert!((p - 15.3).abs() < 1.0, "narrow L4 -> L5 at 14 dB CNR: {p:.1}");
 }
+
+#[test]
+fn failed_level_is_held_then_probed_with_growing_hold() {
+    let mut h = LevelHold::default();
+    // The SNR always says 5, but level 5 always fails: count bursts asked at 5.
+    let (snr_level, escape) = (5, 4);
+    let mut level = 5;
+    let mut at5 = 0;
+    for _ in 0..60 {
+        let failed = level == 5;
+        at5 += failed as u32;
+        level = h.update(level, 24, failed, snr_level.min(if failed { level - 1 } else { 9 }), escape);
+    }
+    // Holds of 2, 4, 8, 16, 16, ... clean bursts between probes.
+    assert!((4..=6).contains(&at5), "probed level 5 {at5} times in 60 bursts");
+}
+
+#[test]
+fn level_hold_lifts_after_a_clean_probe_or_a_better_snr() {
+    let mut h = LevelHold::default();
+    assert_eq!(h.update(4, 8, true, 3, 3), 3);
+    assert_eq!(h.update(3, 8, false, 4, 3), 3);
+    // Second clean burst lifts the hold: level 4 may be asked for again.
+    assert_eq!(h.update(3, 8, false, 4, 3), 4);
+    // The probe decodes: no hold, and the next failure starts from the base hold.
+    assert_eq!(h.update(4, 8, false, 4, 3), 4);
+    assert_eq!(h.update(4, 8, true, 3, 3), 3);
+    assert_eq!(h.update(3, 8, false, 4, 3), 3);
+    assert_eq!(h.update(3, 8, false, 4, 3), 4);
+    // Header-only bursts neither count down nor fail.
+    let mut h = LevelHold::default();
+    h.update(4, 8, true, 3, 3);
+    assert_eq!(h.update(0, 0, false, 6, 3), 3);
+    assert_eq!(h.update(3, 8, false, 6, 3), 3);
+    // An SNR well above the held level's threshold lifts it at once.
+    assert_eq!(h.update(3, 8, false, 6, 5), 6);
+}
