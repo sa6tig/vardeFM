@@ -154,6 +154,11 @@ fn session(mode: &str, cnr: Option<f32>, ppm: f32, seed: u64) {
 }
 
 fn session_fading(mode: &str, cnr: Option<f32>, ppm: f32, seed: u64, fading: Option<Fading>) {
+    session_with(mode, cnr, ppm, seed, fading, 10_000);
+}
+
+/// Full session with `bytes` each way. Returns the simulated seconds the transfer took.
+fn session_with(mode: &str, cnr: Option<f32>, ppm: f32, seed: u64, fading: Option<Fading>, bytes: usize) -> f64 {
     let sp = sim_fading(mode, cnr, ppm, seed, fading);
     let mut a = Host::connect("A", sp.addrs[0]);
     let mut b = Host::connect("B", sp.addrs[1]);
@@ -176,7 +181,7 @@ fn session_fading(mode: &str, cnr: Option<f32>, ppm: f32, seed: u64, fading: Opt
     let t0 = sp.stats();
 
     // Like a BBS: the server (B) sends first, the client answers.
-    let (to_a, to_b) = (payload(10_000, seed as u32), payload(10_000, seed as u32 + 1));
+    let (to_a, to_b) = (payload(bytes, seed as u32), payload(bytes, seed as u32 + 1));
     b.write(&to_a);
     a.wait_rx(1);
     a.write(&to_b);
@@ -193,9 +198,11 @@ fn session_fading(mode: &str, cnr: Option<f32>, ppm: f32, seed: u64, fading: Opt
     let secs = t1.now - t0.now;
     let air = (t1.airtime[0] - t0.airtime[0], t1.airtime[1] - t0.airtime[1]);
     println!(
-        "{mode} cnr={cnr:?} ppm={ppm} fading={fading:?}: 2 x 10 kB in {secs:.1} s ({:.0} bit/s total), airtime A {:.1} s / B {:.1} s, \
+        "{mode} cnr={cnr:?} ppm={ppm} fading={} seed={seed}: 2 x {} kB in {secs:.1} s ({:.0} bit/s total), airtime A {:.1} s / B {:.1} s, \
          bursts {}, disconnect {:.1} s",
-        20_000.0 * 8.0 / secs,
+        fading.map_or("none".into(), |f| f.to_string()),
+        bytes / 1000,
+        2.0 * bytes as f64 * 8.0 / secs,
         air.0,
         air.1,
         t1.bursts[0] + t1.bursts[1] - t0.bursts[0] - t0.bursts[1],
@@ -206,6 +213,7 @@ fn session_fading(mode: &str, cnr: Option<f32>, ppm: f32, seed: u64, fading: Opt
         assert!(h.seen.iter().any(|l| l == "PTT ON") && h.seen.iter().any(|l| l == "PTT OFF"));
     }
     sp.stop();
+    secs
 }
 
 #[test]
@@ -229,6 +237,32 @@ fn narrow_mobile_fading() {
     // Some bursts are lost or partly decoded; ARQ and rate adaptation must still
     // deliver every byte intact.
     session_fading("narrow", Some(30.0), 0.0, 5, Some(Fading::rayleigh(20.0)));
+}
+
+/// Soak test of the ARQ on a mobile path: 50 kB each way under Rayleigh fading, which
+/// loses random codewords and whole bursts, over `SEEDS` seeds (default 8). Every
+/// byte must arrive intact.
+/// `cargo test --release -p vardefm-tnc --test simpair fading_soak -- --ignored --nocapture`
+/// Environment: `SEEDS`, `CNR` (mean, default 22 dB), `FADING` (default rayleigh:20),
+/// `MODE` (narrow or wide).
+#[test]
+#[ignore]
+fn fading_soak() {
+    let var = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.into());
+    let seeds: u64 = var("SEEDS", "8").parse().expect("SEEDS");
+    let cnr: f32 = var("CNR", "22").parse().expect("CNR");
+    let fading: Fading = var("FADING", "rayleigh:20").parse().expect("FADING");
+    let mode = var("MODE", "narrow");
+    assert!(mode == "narrow" || mode == "wide", "MODE must be narrow or wide");
+    let mut secs: Vec<f64> =
+        (0..seeds).map(|s| session_with(&mode, Some(cnr), 0.0, 100 + s, Some(fading), 50_000)).collect();
+    secs.sort_by(f64::total_cmp);
+    println!(
+        "{mode} {fading} at {cnr} dB: {seeds} sessions, transfer time min {:.0} s, median {:.0} s, max {:.0} s",
+        secs[0],
+        secs[secs.len() / 2],
+        secs[secs.len() - 1]
+    );
 }
 
 #[test]
@@ -353,10 +387,22 @@ fn wrong_commands_and_abort() {
 
 #[test]
 fn connect_via_digipeater() {
+    via_digipeater(Some(30.0), None, 6);
+}
+
+#[test]
+fn digipeater_under_fading() {
+    // Each hop fades on its own (Rayleigh, 20 Hz): codewords the digipeater loses go
+    // on as void segments, and the end stations must resend them through it.
+    via_digipeater(Some(24.0), Some(Fading::rayleigh(20.0)), 7);
+}
+
+fn via_digipeater(cnr: Option<f32>, fading: Option<Fading>, seed: u64) {
     // A and B cannot hear each other; LA3DDD sits between them.
     let sp = SimPair::start(SimPairConfig {
-        cnr_db: Some(30.0),
-        seed: 6,
+        cnr_db: cnr,
+        fading,
+        seed,
         speed: 20.0,
         a_port: 0,
         b_port: 0,
@@ -393,7 +439,14 @@ fn connect_via_digipeater() {
     b.expect("DISCONNECTED");
     let st = sp.stats();
     assert!(st.bursts[1] > 0, "the digipeater repeated nothing");
-    println!("via digipeater: airtime A {:.1} s / D1 {:.1} s / B {:.1} s", st.airtime[0], st.airtime[1], st.airtime[2]);
+    println!(
+        "via digipeater, fading {}: {:.0} s, airtime A {:.1} s / D1 {:.1} s / B {:.1} s",
+        fading.map_or("none".into(), |f| f.to_string()),
+        st.now,
+        st.airtime[0],
+        st.airtime[1],
+        st.airtime[2]
+    );
     sp.stop();
 }
 

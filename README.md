@@ -154,6 +154,7 @@ Benchmarks (ignored by default; run in release mode):
 ```sh
 cargo test --release -p vardefm-modem level_table -- --ignored --nocapture   # level vs CNR
 cargo test --release -p vardefm-modem fading_table -- --ignored --nocapture  # same, Rayleigh 5/20/80 Hz
+cargo test --release -p vardefm-tnc --test simpair fading_soak -- --ignored --nocapture  # ARQ soak under fading
 cargo test --release -p vardefm-fec fer_curve -- --ignored --nocapture       # LDPC curves
 ```
 
