@@ -157,6 +157,47 @@ fn an_oversized_request_head_is_refused() {
 }
 
 #[test]
+fn an_answer_is_not_lost_to_request_bytes_left_unread() {
+    // The server answers before reading the body; closing with it unread would reset the
+    // connection and could take the answer with it.
+    let s = server();
+    let addr = s.local_addr();
+    let body = "b".repeat(32 * 1024);
+    let post = format!(
+        "POST /v1/status HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    for _ in 0..20 {
+        assert!(request(addr, &post).0.contains("405"));
+    }
+}
+
+#[test]
+fn a_request_head_sent_a_byte_at_a_time_does_not_hold_the_connection() {
+    let s = server();
+    let mut tcp = TcpStream::connect(s.local_addr()).unwrap();
+    tcp.set_read_timeout(Some(TIMEOUT)).unwrap();
+    let mut writer = tcp.try_clone().unwrap();
+    let started = Instant::now();
+    // Well inside the 2 s head timeout per byte, but the head never ends.
+    let drip = thread::spawn(move || {
+        for b in b"GET /v1/status HTTP/1.1\r\nX: ".iter().chain(std::iter::repeat(&b'a')) {
+            if writer.write_all(&[*b]).is_err() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
+    let mut answer = Vec::new();
+    let _ = tcp.read_to_end(&mut answer);
+    let held = started.elapsed();
+    assert!(answer.is_empty(), "an unfinished head got an answer");
+    assert!(held < Duration::from_secs(4), "held for {held:?}");
+    drop(tcp);
+    drip.join().unwrap();
+}
+
+#[test]
 fn a_stream_opens_with_hello_and_status_then_carries_events_status_and_rows() {
     let s = server();
     let mut ws = connect(s.local_addr());
@@ -188,7 +229,9 @@ fn a_stream_opens_with_hello_and_status_then_carries_events_status_and_rows() {
 fn a_client_that_sends_anything_is_closed_as_read_only() {
     let s = server();
     let mut ws = opened(s.local_addr());
+    // A second message right after the first is still unread when the server closes.
     ws.send(Message::text(r#"{"type":"Connect","call":"LA2BBB-1"}"#)).unwrap();
+    ws.send(Message::text(r#"{"type":"Disconnect"}"#)).unwrap();
     loop {
         match ws.read() {
             Ok(Message::Close(Some(close))) => {
@@ -254,8 +297,7 @@ fn a_client_that_never_reads_loses_rows_counted_and_publishing_does_not_wait() {
     assert!(started.elapsed() < TIMEOUT, "publishing waited on the client");
     assert!(s.client_rows_dropped() > 0);
     assert!(s.client_rows_dropped() < sent);
-    // The server still answers, and reports the count.
-    s.publish_status(Status::default());
+    // The server still answers, and reports the count as it is now, not as last published.
     let (_, body) = get(s.local_addr(), "/v1/status", "");
     let snapshot: StatusSnapshot = serde_json::from_str(&body).unwrap();
     assert_eq!(snapshot.status.client_rows_dropped, s.client_rows_dropped());
@@ -307,9 +349,10 @@ fn a_fast_client_loses_no_rows_while_a_slow_one_does() {
 fn a_client_that_falls_behind_on_events_is_told_how_many_it_lost() {
     let s = server();
     let mut ws = opened(s.local_addr());
-    // Big events, so that the socket fills and the outbox with it while nothing is read.
+    // Big events, so that the socket fills and the outbox with it while nothing is read: 64 MiB,
+    // far beyond what kernel buffers, the outbox and one batch in flight can hold.
     let text = "x".repeat(16 * 1024);
-    let sent = 4 * EVENT_ROOM as u64;
+    let sent = 16 * EVENT_ROOM as u64;
     for t in 0..sent {
         s.publish_event(ApiEvent::Warning { code: format!("{t}"), text: text.clone() });
     }
@@ -346,6 +389,8 @@ fn dropping_the_server_with_a_client_that_reads_nothing_returns_promptly() {
     thread::sleep(Duration::from_millis(200));
     let started = Instant::now();
     drop(s);
-    assert!(started.elapsed() < Duration::from_secs(1), "took {:?}", started.elapsed());
+    // The server waits at most 0.5 s for its threads; the rest is margin for a loaded machine,
+    // and still far below the 5 s a stuck send would take.
+    assert!(started.elapsed() < Duration::from_secs(2), "took {:?}", started.elapsed());
     drop(ws);
 }

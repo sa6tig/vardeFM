@@ -39,8 +39,14 @@ const MAX_CONNECTIONS: usize = 32;
 const MAX_HEAD: usize = 4096;
 /// Most header lines in a request head.
 const MAX_HEADERS: usize = 64;
-/// Time a client has to send its request head, and to take an HTTP answer.
+/// Time a client has to send its whole request head, and to take an HTTP answer.
 const HEAD_TIMEOUT: Duration = Duration::from_secs(2);
+/// Longest an answered connection is read for the rest of its request before it is closed.
+const DRAIN_TIME: Duration = Duration::from_millis(100);
+/// Most bytes read to drain an answered connection.
+const DRAIN_MAX: usize = 64 * 1024;
+/// Longest a stream closed as read-only waits for the client's close.
+const CLOSE_WAIT: Duration = Duration::from_secs(1);
 /// How long a stream thread waits for a client message before it sends what is queued.
 const POLL: Duration = Duration::from_millis(10);
 /// Time a stream client has to take a write; a client that stops reading ends its own stream.
@@ -281,9 +287,10 @@ enum Route {
 }
 
 fn serve(mut stream: TcpStream, shared: &Arc<Shared>) {
-    let _ = stream.set_read_timeout(Some(HEAD_TIMEOUT));
     let _ = stream.set_write_timeout(Some(HEAD_TIMEOUT));
-    let head = match read_head(&mut stream) {
+    let deadline = Instant::now() + HEAD_TIMEOUT;
+    let Ok(timer) = stream.try_clone() else { return };
+    let head = match read_head(&mut stream, deadline, |left| timer.set_read_timeout(Some(left))) {
         Ok(head) => head,
         Err(HeadError::TooLarge) => return respond(&mut stream, "431 Request Header Fields Too Large", "", b""),
         Err(HeadError::Closed) => return,
@@ -291,7 +298,8 @@ fn serve(mut stream: TcpStream, shared: &Arc<Shared>) {
     match route(&head) {
         Route::Status => {
             let snapshot = {
-                let status = lock(&shared.status).clone();
+                let mut status = lock(&shared.status).clone();
+                status.client_rows_dropped = shared.client_rows_dropped.load(Ordering::Relaxed);
                 let recent = lock(&shared.recent);
                 StatusSnapshot::new(status, recent.0.iter().chain(&recent.1).cloned())
             };
@@ -308,9 +316,13 @@ enum HeadError {
     Closed,
 }
 
-/// Reads up to the end of the request head. What follows it, if anything came with it, is
-/// kept too.
-fn read_head(stream: &mut impl Read) -> Result<Vec<u8>, HeadError> {
+/// Reads up to the end of the request head, by `deadline` however the bytes are spread. What
+/// follows the head, if anything came with it, is kept too. `set_timeout` limits the next read.
+fn read_head(
+    stream: &mut impl Read,
+    deadline: Instant,
+    mut set_timeout: impl FnMut(Duration) -> io::Result<()>,
+) -> Result<Vec<u8>, HeadError> {
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
     loop {
@@ -319,6 +331,10 @@ fn read_head(stream: &mut impl Read) -> Result<Vec<u8>, HeadError> {
         }
         if buf.len() >= MAX_HEAD {
             return Err(HeadError::TooLarge);
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() || set_timeout(left).is_err() {
+            return Err(HeadError::Closed);
         }
         let want = (MAX_HEAD - buf.len()).min(chunk.len());
         match stream.read(&mut chunk[..want]) {
@@ -394,6 +410,21 @@ fn respond(stream: &mut TcpStream, status: &str, headers: &str, body: &[u8]) {
     let head = format!("HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n", body.len());
     let _ = stream.write_all(head.as_bytes()).and_then(|()| stream.write_all(body)).and_then(|()| stream.flush());
     let _ = stream.shutdown(Shutdown::Write);
+    // Closing with request bytes unread would reset the connection, and a reset can discard the
+    // answer before the client reads it. Read what is left, for a short while.
+    let deadline = Instant::now() + DRAIN_TIME;
+    let mut sink = [0u8; 1024];
+    let mut drained = 0;
+    while drained < DRAIN_MAX {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() || stream.set_read_timeout(Some(left)).is_err() {
+            break;
+        }
+        match stream.read(&mut sink) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => drained += n,
+        }
+    }
 }
 
 /// The connection with the request head, already read, put back in front.
@@ -468,7 +499,8 @@ fn run(ws: &mut WebSocket<Replay>, client: &Client, shared: &Shared) -> tungsten
         match ws.read() {
             Ok(Message::Text(_) | Message::Binary(_)) => {
                 let reason = "this API is read-only".into();
-                return ws.close(Some(CloseFrame { code: CloseCode::Policy, reason }));
+                ws.close(Some(CloseFrame { code: CloseCode::Policy, reason }))?;
+                return wait_for_close(ws);
             }
             // Reading a close queues the answer; flushing sends it.
             Ok(Message::Close(_)) => return ws.flush(),
@@ -505,6 +537,22 @@ fn run(ws: &mut WebSocket<Replay>, client: &Client, shared: &Shared) -> tungsten
         }
         ws.flush()?;
     }
+}
+
+/// After our close, reads until the client's close: dropping the connection with its messages
+/// unread would reset it, and a reset can discard our close frame before the client reads it.
+fn wait_for_close(ws: &mut WebSocket<Replay>) -> tungstenite::Result<()> {
+    let deadline = Instant::now() + CLOSE_WAIT;
+    while Instant::now() < deadline {
+        match ws.read() {
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(e))
+                if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
+            Err(tungstenite::Error::ConnectionClosed) => return Ok(()),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -585,13 +633,23 @@ mod tests {
         assert!(answer(two_origins).starts_with("403"));
     }
 
+    fn soon() -> Instant {
+        Instant::now() + HEAD_TIMEOUT
+    }
+
+    #[test]
+    fn a_head_past_its_deadline_is_not_read() {
+        let mut text = Cursor::new(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n".to_vec());
+        assert!(matches!(read_head(&mut text, Instant::now(), |_| Ok(())), Err(HeadError::Closed)));
+    }
+
     #[test]
     fn a_head_is_read_to_its_end_and_no_further_than_the_limit() {
         let mut text = Cursor::new(b"GET / HTTP/1.1\r\nHost: x\r\n\r\nrest".to_vec());
-        assert_eq!(read_head(&mut text).ok().unwrap(), b"GET / HTTP/1.1\r\nHost: x\r\n\r\nrest");
+        assert_eq!(read_head(&mut text, soon(), |_| Ok(())).ok().unwrap(), b"GET / HTTP/1.1\r\nHost: x\r\n\r\nrest");
         let mut long = Cursor::new([b"GET / HTTP/1.1\r\nX: ".as_slice(), &[b'a'; 2 * MAX_HEAD]].concat());
-        assert!(matches!(read_head(&mut long), Err(HeadError::TooLarge)));
+        assert!(matches!(read_head(&mut long, soon(), |_| Ok(())), Err(HeadError::TooLarge)));
         let mut cut = Cursor::new(b"GET / HTTP/1.1\r\n".to_vec());
-        assert!(matches!(read_head(&mut cut), Err(HeadError::Closed)));
+        assert!(matches!(read_head(&mut cut, soon(), |_| Ok(())), Err(HeadError::Closed)));
     }
 }
