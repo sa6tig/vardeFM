@@ -141,7 +141,33 @@ vardefm bench
 If it recommends a limit, start the modem with it, e.g. `--max-level 4`. The
 modem then never asks the other station for a faster level, and never sends one.
 
-## 5. What is not done yet
+## 5. Running a digipeater
+
+A VardeFM station can repeat other stations' sessions, so two stations out of each
+other's range can connect through it. Start the modem with the call sign it repeats for:
+
+```
+vardefm modem --audio-in "USB" --audio-out "USB" --ptt vox --digi LA3DDD-9
+```
+
+It needs no host program, and it can still carry its own sessions on the same port.
+While it repeats a busy session, though, its own session is slow and may be dropped.
+A host then connects with `CONNECT <mycall> <target> VIA LA3DDD-9` (up to two
+digipeaters, in order). The digipeater prints an `rpt` line for each burst it repeats.
+
+Every burst goes on the air once per digipeater, so a session through one digipeater
+runs at about half speed, and a lost burst takes longer to recover. The stations at the
+ends wait for the repeats before they retry. If the digipeater is slow, for example a
+Raspberry Pi that takes long to decode, raise `--hop-margin` (default 0.5 s per
+digipeater, at most 10 s) on the two end stations, to the same value on both. An answer
+passes the digipeater twice, so the margin has to be about twice the digipeater's extra
+delay. A long VOX hang on the digipeater is a different problem, and the hop margin does
+not help with it: its neighbours answer 0.2 s after its repeat ends, while it is still
+keyed. Shorten the hang or raise the neighbours' `--txdelay`, as in section 3.
+Digipeating only works between VardeFM stations; VARA FM digipeaters cannot repeat
+VardeFM.
+
+## 6. What is not done yet
 
 - Sound card and CM108 PTT matching is manual when several adapters are
   connected. Dire Wolf matches them automatically on Linux.

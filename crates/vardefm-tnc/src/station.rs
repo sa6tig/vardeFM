@@ -5,7 +5,7 @@
 
 use crate::host::{parse, Command};
 use std::sync::Arc;
-use vardefm_link::{Link, LinkConfig, LinkEvent, TxInfo};
+use vardefm_link::{Link, LinkConfig, LinkEvent, Node, TxInfo};
 use vardefm_modem::{Header, Modem, Receiver, RxBurst};
 
 /// Output for the host application.
@@ -23,6 +23,8 @@ pub struct TxStart {
     pub header: Header,
     pub info: TxInfo,
     pub seconds: f32,
+    /// A digipeater repeat of another station's burst.
+    pub repeat: bool,
 }
 
 const IAMALIVE_S: f64 = 60.0;
@@ -30,7 +32,8 @@ const IAMALIVE_S: f64 = 60.0;
 pub struct Station {
     pub name: String,
     modem: Arc<Modem>,
-    pub link: Link,
+    /// The link and, if set, the digipeater.
+    node: Node,
     rx: Receiver,
     out: Vec<HostOut>,
     transmitting: bool,
@@ -44,7 +47,7 @@ impl Station {
         let bandwidth = if modem.ofdm.p.name == "wide" { "WIDE" } else { "NARROW" };
         Self {
             name: name.to_string(),
-            link: Link::new(modem.clone(), cfg, seed),
+            node: Node::new(Link::new(modem.clone(), cfg, seed)),
             rx: Receiver::new(modem.clone()),
             modem,
             out: Vec::new(),
@@ -59,6 +62,16 @@ impl Station {
         &self.modem
     }
 
+    pub fn link_config(&self) -> &LinkConfig {
+        self.node.link.config()
+    }
+
+    /// Repeat the bursts of sessions routed through any of `calls` (none: off).
+    /// Works without a host and alongside our own sessions.
+    pub fn set_digi(&mut self, calls: &[String]) {
+        self.node.set_digi(calls);
+    }
+
     fn line(&mut self, s: impl Into<String>) {
         self.out.push(HostOut::Line(s.into()));
     }
@@ -71,24 +84,24 @@ impl Station {
         };
         match cmd {
             Command::MyCall(calls) => {
-                self.link.set_mycalls(calls);
+                self.node.link.set_mycalls(calls);
                 self.line("OK");
             }
             Command::Listen(on) => {
-                self.link.set_listen(on);
+                self.node.link.set_listen(on);
                 self.line("OK");
             }
-            Command::Connect { source, target } => match self.link.connect(now, &source, &target) {
+            Command::Connect { source, target, via } => match self.node.link.connect(now, &source, &target, &via) {
                 Ok(()) => self.line("OK"),
                 Err(()) => self.line("WRONG"),
             },
             Command::Disconnect => {
                 self.line("OK");
-                self.link.disconnect(now);
+                self.node.link.disconnect(now);
             }
             Command::Abort => {
                 self.line("OK");
-                self.link.abort(now);
+                self.node.link.abort(now);
             }
             Command::Version => {
                 self.line("OK");
@@ -100,12 +113,12 @@ impl Station {
 
     /// Bytes from the data port (dropped when not connected).
     pub fn host_data(&mut self, data: &[u8]) {
-        self.link.send_data(data);
+        self.node.link.send_data(data);
     }
 
     /// The host closed the command port: drop any session.
     pub fn host_closed(&mut self, now: f64) {
-        self.link.abort(now);
+        self.node.link.abort(now);
     }
 
     /// Periodic housekeeping (IAMALIVE).
@@ -120,7 +133,7 @@ impl Station {
     /// Call only while not transmitting.
     pub fn poll_tx(&mut self, now: f64) -> Option<TxStart> {
         debug_assert!(!self.transmitting);
-        let burst = self.link.poll(now, self.rx.busy())?;
+        let (burst, repeat) = self.node.poll(now, self.rx.busy())?;
         let audio = self.modem.modulate(&burst);
         self.transmitting = true;
         self.rx.reset();
@@ -128,8 +141,18 @@ impl Station {
         Some(TxStart {
             seconds: audio.len() as f32 / self.modem.fs(),
             audio,
+            info: if repeat {
+                TxInfo {
+                    kind: burst.header.kind,
+                    level: burst.header.level,
+                    ncw: burst.payload.len(),
+                    ..TxInfo::default()
+                }
+            } else {
+                self.node.link.last_tx().clone()
+            },
             header: burst.header,
-            info: self.link.last_tx().clone(),
+            repeat,
         })
     }
 
@@ -137,7 +160,7 @@ impl Station {
     pub fn tx_done(&mut self, now: f64) {
         self.transmitting = false;
         self.line("PTT OFF");
-        self.link.tx_done(now);
+        self.node.tx_done(now);
     }
 
     pub fn transmitting(&self) -> bool {
@@ -151,7 +174,7 @@ impl Station {
         }
         let bursts = self.rx.push(samples);
         for b in &bursts {
-            self.link.on_burst(now, b);
+            self.node.on_burst(now, b);
         }
         let busy = self.rx.busy();
         if busy != self.busy_reported {
@@ -163,7 +186,7 @@ impl Station {
 
     /// Everything for the host since the last call, in order.
     pub fn take_output(&mut self) -> Vec<HostOut> {
-        for e in self.link.take_events() {
+        for e in self.node.link.take_events() {
             let o = match e {
                 LinkEvent::Pending => HostOut::Line("PENDING".into()),
                 LinkEvent::CancelPending => HostOut::Line("CANCELPENDING".into()),

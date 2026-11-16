@@ -2,6 +2,8 @@
 //!
 //! See docs/PROTOCOL.md, "Host interface", for the full list and deviations from VARA.
 
+use vardefm_modem::MAX_DIGIS;
+
 /// A parsed host command.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
@@ -10,6 +12,8 @@ pub enum Command {
     Connect {
         source: String,
         target: String,
+        /// Digipeaters, in order from us (at most [`MAX_DIGIS`]).
+        via: Vec<String>,
     },
     Disconnect,
     Abort,
@@ -40,11 +44,20 @@ pub fn parse(line: &str) -> Result<Command, ()> {
         }
         "LISTEN" if args.len() == 1 => on_off(arg(0)).map(Command::Listen),
         "CONNECT" => {
-            // `CONNECT src dst via digi1 digi2` (VARA FM digipeating) is not supported.
-            if args.len() != 2 || !valid_call(args[0]) || !valid_call(args[1]) {
+            // `CONNECT src dst [VIA digi1 [digi2]]`, at most two digipeaters as in VARA FM.
+            let via = match args.get(2) {
+                None if args.len() == 2 => &args[2..],
+                Some(v) if v.eq_ignore_ascii_case("VIA") && (4..=3 + MAX_DIGIS).contains(&args.len()) => &args[3..],
+                _ => return Err(()),
+            };
+            if !args[..2].iter().chain(via).all(|c| valid_call(c)) {
                 return Err(());
             }
-            Ok(Command::Connect { source: args[0].to_ascii_uppercase(), target: args[1].to_ascii_uppercase() })
+            Ok(Command::Connect {
+                source: args[0].to_ascii_uppercase(),
+                target: args[1].to_ascii_uppercase(),
+                via: via.iter().map(|c| c.to_ascii_uppercase()).collect(),
+            })
         }
         "DISCONNECT" if args.is_empty() => Ok(Command::Disconnect),
         "ABORT" if args.is_empty() => Ok(Command::Abort),
@@ -86,17 +99,40 @@ mod tests {
         assert_eq!(parse("LISTEN off"), Ok(Command::Listen(false)));
         assert_eq!(
             parse("CONNECT LA1ABC LA2XYZ-7"),
-            Ok(Command::Connect { source: "LA1ABC".into(), target: "LA2XYZ-7".into() })
+            Ok(Command::Connect { source: "LA1ABC".into(), target: "LA2XYZ-7".into(), via: vec![] })
         );
+        assert_eq!(
+            parse("CONNECT LA1ABC LA2XYZ-7 via la3ddd LA4EEE-2"),
+            Ok(Command::Connect {
+                source: "LA1ABC".into(),
+                target: "LA2XYZ-7".into(),
+                via: vec!["LA3DDD".into(), "LA4EEE-2".into()]
+            })
+        );
+        let one = parse("CONNECT LA1ABC LA2XYZ VIA LA3AAA");
+        assert!(matches!(one, Ok(Command::Connect { via, .. }) if via == ["LA3AAA"]));
         assert_eq!(parse("DISCONNECT"), Ok(Command::Disconnect));
         assert_eq!(parse("ABORT"), Ok(Command::Abort));
         assert_eq!(parse("VERSION"), Ok(Command::Version));
         for ok in ["PUBLIC ON", "COMPRESSION TEXT", "CHAT OFF", "CWID ON", "BW2300", "P2P SESSION", "WINLINK SESSION"] {
             assert_eq!(parse(ok), Ok(Command::Ignored), "{ok}");
         }
-        for bad in
-            ["", "FOO", "LISTEN", "LISTEN MAYBE", "CONNECT LA1ABC", "CONNECT A B via C", "MYCALL X", "MYCALL LA1ABC-0"]
-        {
+        for bad in [
+            "",
+            "FOO",
+            "LISTEN",
+            "LISTEN MAYBE",
+            "CONNECT LA1ABC",
+            "CONNECT A B via C",
+            "CONNECT LA1ABC LA2XYZ VIA",
+            "CONNECT LA1ABC LA2XYZ OVER LA3DDD",
+            "CONNECT LA1ABC LA2XYZ LA3DDD",
+            "CONNECT LA1ABC LA2XYZ VIA LA3/P",
+            "CONNECT LA1ABC LA2XYZ VIA LA3AAA LA3BBB LA3CCC",
+            "CONNECT LA1ABC LA2XYZ VIA LA3AAA LA3BBB LA3CCC LA3DDD",
+            "MYCALL X",
+            "MYCALL LA1ABC-0",
+        ] {
             assert_eq!(parse(bad), Err(()), "{bad}");
         }
     }

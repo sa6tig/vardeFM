@@ -10,7 +10,7 @@ mod busy;
 mod header;
 mod receiver;
 
-pub use header::{Header, Kind, FLAG_POLL};
+pub use header::{Header, Kind, FLAG_POLL, FLAG_ROUTED, FLAG_UP, MAX_DIGIS};
 pub use receiver::{AudioLevel, Receiver, RxBurst};
 pub use vardefm_dsp::OfdmParams;
 
