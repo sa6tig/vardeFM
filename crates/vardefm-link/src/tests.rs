@@ -861,7 +861,8 @@ fn level_hold_forgets_a_probe_the_snr_no_longer_supports() {
     let mut h = LevelHold::default();
     h.update(5, 24, true, 4, flat(20.0));
     h.update(4, 24, false, 5, flat(20.0));
-    assert_eq!(h.update(4, 24, false, 5, flat(20.0)), 5); // hold lifted, level 5 probed
+    // Hold lifted: level 5 is probed.
+    assert_eq!(h.update(4, 24, false, 5, flat(20.0)), 5);
     // The SNR drops: level 5 is not asked for, and the probe is forgotten.
     assert_eq!(h.update(4, 24, false, 3, flat(15.0)), 3);
     // Much later level 5 fails again: the hold starts from the base, not doubled.

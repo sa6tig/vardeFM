@@ -201,9 +201,9 @@ fn run(mode: &str, sc: Scenario, cnr_db: f32, seconds: f64, seed: u64) -> RunRes
                     ..burst.clone()
                 };
                 st[i].node.on_burst(now, &seen);
-                if i == 1 && burst.header.ncw > 0 && connected_at.is_some() {
+                if let Some(c) = connected_at.filter(|_| i == 1 && burst.header.ncw > 0) {
                     bursts.push(RxRec {
-                        t: now - connected_at.unwrap(),
+                        t: now - c,
                         level: burst.header.level,
                         ncw: burst.header.ncw,
                         failed: burst.payload.iter().filter(|p| p.is_none()).count() as u8,
@@ -212,8 +212,8 @@ fn run(mode: &str, sc: Scenario, cnr_db: f32, seconds: f64, seed: u64) -> RunRes
                 }
             }
         }
-        for i in 0..2 {
-            for e in st[i].node.link.take_events() {
+        for (i, s) in st.iter_mut().enumerate() {
+            for e in s.node.link.take_events() {
                 match e {
                     LinkEvent::Connected { .. } if i == 0 && connected_at.is_none() => connected_at = Some(now),
                     LinkEvent::Data(d) if i == 1 && connected_at.is_some() => delivered += d.len(),

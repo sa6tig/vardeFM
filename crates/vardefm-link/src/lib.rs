@@ -103,14 +103,7 @@ pub(crate) struct LevelHold {
 impl LevelHold {
     /// Update with a burst of `ncw` codewords at `level` (`failed`: any of them lost), and
     /// limit `req`. `snr_at(l)` is the burst's SNR predicted for level `l`.
-    pub(crate) fn update(
-        &mut self,
-        level: u8,
-        ncw: u8,
-        failed: bool,
-        req: u8,
-        snr_at: impl Fn(u8) -> f32,
-    ) -> u8 {
+    pub(crate) fn update(&mut self, level: u8, ncw: u8, failed: bool, req: u8, snr_at: impl Fn(u8) -> f32) -> u8 {
         if ncw > 0 {
             if failed {
                 // A probe that fails again doubles the hold. A burst at or above the held
