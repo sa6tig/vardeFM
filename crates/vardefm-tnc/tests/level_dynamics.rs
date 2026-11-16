@@ -42,13 +42,15 @@ const fn sc(name: &'static str, drive_db: [f32; 7], snr_offset_db: f32, snr_jitt
 }
 const D0: [f32; 7] = [0.0; 7];
 
-const SCENARIOS: [Scenario; 7] = [
+const SCENARIOS: [Scenario; 8] = [
     sc("exact", D0, 0.0, 0.0),
     // Real 64QAM drive 2 dB below what the link assumes.
     sc("drive64+2", [0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 2.0], 0.0, 0.0),
-    // Decoding 1.5 / 3 dB worse than the SNR says.
+    // Decoding 1.5 / 3 / 5 dB worse than the SNR says.
     sc("snr+1.5", D0, 1.5, 0.0),
     sc("snr+3", D0, 3.0, 0.0),
+    // Beyond the hold's 3 dB escape margin.
+    sc("snr+5", D0, 5.0, 0.0),
     // Burst-to-burst SNR scatter.
     sc("jitter1", D0, 0.0, 1.0),
     sc("jitter2", D0, 0.0, 2.0),
@@ -320,7 +322,7 @@ fn level_dynamics() {
         println!("{}", summarize(r));
         if let Some(dir) = &trace {
             std::fs::create_dir_all(dir).unwrap();
-            let path = format!("{dir}/{}_{}_{:.0}.csv", r.mode, r.scenario, r.cnr_db);
+            let path = format!("{dir}/{}_{}_{:.1}.csv", r.mode, r.scenario, r.cnr_db);
             let mut s = String::from("t,level,ncw,failed,snr_db\n");
             for x in &r.bursts {
                 s += &format!("{:.2},{},{},{},{:.2}\n", x.t, x.level, x.ncw, x.failed, x.snr_db);
