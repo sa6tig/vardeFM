@@ -10,7 +10,7 @@
 //! Every float is written finite: NaN and infinity go out as 0, because JSON has no such numbers
 //! and serde_json would write `null`, which the schemas refuse.
 
-use crate::waterfall;
+use crate::waterfall::{self, Waterfall};
 use serde::{Deserialize, Serialize, Serializer};
 
 /// Version of the messages. It goes up only on a breaking change; a new field
@@ -74,12 +74,13 @@ pub struct WaterfallFormat {
 }
 
 impl WaterfallFormat {
-    /// The format of [`waterfall::Waterfall`] rows of `bins` bins.
-    pub fn new(bins: u16) -> Self {
+    /// The format of the rows `waterfall` makes.
+    pub fn of(waterfall: &Waterfall) -> Self {
         Self {
             stream: STREAM_WATERFALL,
             format: FORMAT_WATERFALL_U8,
-            bins,
+            // At most `waterfall::MAX_BINS`, which fits.
+            bins: waterfall.bins() as u16,
             bin_hz: waterfall::BIN_HZ,
             db_floor: waterfall::DB_FLOOR,
             db_step: waterfall::DB_STEP,
@@ -100,10 +101,10 @@ pub struct Hello {
 }
 
 impl Hello {
-    /// The `Hello` of this server for `mode` (`narrow` or `wide`), with waterfall rows of
-    /// `bins` bins.
-    pub fn new(mode: &str, bins: u16) -> Self {
-        Self { server: SERVER.to_owned(), mode: mode_name(mode), waterfall: WaterfallFormat::new(bins) }
+    /// The `Hello` of this server for `mode` (`narrow` or `wide`), describing the rows of
+    /// `waterfall`.
+    pub fn new(mode: &str, waterfall: &Waterfall) -> Self {
+        Self { server: SERVER.to_owned(), mode: mode_name(mode), waterfall: WaterfallFormat::of(waterfall) }
     }
 }
 
@@ -321,6 +322,23 @@ pub struct StatusSnapshot {
     /// Latest `Vfm...` events, oldest first.
     #[serde(default)]
     pub vfm_recent: Vec<ApiEvent>,
+}
+
+impl StatusSnapshot {
+    /// The answer for `status` and the recent `events`, oldest first. Each event goes in the list
+    /// it belongs in: `Vfm...` events in `vfm_recent`, gaps and warnings in `recent`. `Hello` and
+    /// `Status` are not events of the past and are left out.
+    pub fn new(status: Status, events: impl IntoIterator<Item = ApiEvent>) -> Self {
+        let (mut recent, mut vfm_recent) = (Vec::new(), Vec::new());
+        for event in events {
+            match event {
+                ApiEvent::Hello(_) | ApiEvent::Status(_) => {}
+                e if e.is_vfm() => vfm_recent.push(e),
+                e => recent.push(e),
+            }
+        }
+        Self { v: API_VERSION, status, recent, vfm_recent }
+    }
 }
 
 /// Header of a binary stream frame: 8 bytes, then the payload.
