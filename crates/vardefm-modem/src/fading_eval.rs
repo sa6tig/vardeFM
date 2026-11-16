@@ -162,17 +162,18 @@ fn noise_calib() {
 ///
 /// `cargo test --release -p vardefm-modem fading_cer -- --ignored --nocapture`
 ///
-/// Environment: `MODES` (narrow,wide), `FADINGS` (rayleigh:20,rayleigh:80), `LEVELS`
-/// (2,4,6), `CNRS` (dB, mean CNR: 17,24,33,45), `TRIALS` (bursts per point, 100), `OUT`.
+/// Environment: `MODES` (narrow,wide), `FADINGS` (rayleigh:5,rayleigh:20,rayleigh:80),
+/// `LEVELS` (0,1,..,6), `CNRS` (dB, mean CNR: 12,14,..,44), `TRIALS` (bursts per point,
+/// 100), `OUT`. The defaults are the sweep of #19 (about 2 minutes on 20 cores).
 #[test]
 #[ignore]
 fn fading_cer() {
     use crate::detect_eval::{env_list, on_every_core, payload_seed, through_channel_with, true_position};
     use std::io::Write;
     let modes = env_modes("narrow,wide");
-    let fadings: Vec<Fading> = env_list("FADINGS", "rayleigh:20,rayleigh:80");
-    let levels: Vec<u8> = env_list("LEVELS", "2,4,6");
-    let cnrs: Vec<f32> = env_list("CNRS", "17,24,33,45");
+    let fadings: Vec<Fading> = env_list("FADINGS", "rayleigh:5,rayleigh:20,rayleigh:80");
+    let levels: Vec<u8> = env_list("LEVELS", "0,1,2,3,4,5,6");
+    let cnrs: Vec<f32> = env_list("CNRS", "12,14,16,18,20,22,24,26,28,30,32,34,36,38,40,42,44");
     let trials: u32 = env_or("TRIALS", 100);
     let mut out = std::env::var("OUT").ok().map(|p| std::fs::File::create(p).unwrap());
     for mode in modes.iter().map(String::as_str) {

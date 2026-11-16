@@ -463,7 +463,7 @@ impl Ofdm {
             .map(|&k| {
                 let (m, t) = self.pilot_pos(k);
                 let (a, b) = (pilot_var[m].max(1e-12), pilot_var[m + 1].max(1e-12));
-                a.powf(1.0 - t) * b.powf(t) * (1.0 + est_noise)
+                a * (b / a).powf(t) * (1.0 + est_noise)
             })
             .collect();
         let noise_var: Vec<f32> = raw_var.iter().map(|v| v.max(1e-6)).collect();
@@ -687,6 +687,11 @@ fn robust_reference(e: &[f32]) -> f32 {
 /// (`noise_calib` in vardefm-modem). On Rayleigh channels it lost fewer codewords
 /// (`fading_cer`).
 fn noise_model(dev: &[Vec<f32>]) -> (Vec<f32>, Vec<f32>) {
+    noise_model_passes(dev, NOISE_FIT_PASSES)
+}
+
+/// [`noise_model`] with `passes` passes of the fit.
+fn noise_model_passes(dev: &[Vec<f32>], passes: usize) -> (Vec<f32>, Vec<f32>) {
     let nsym = dev.len();
     let np = dev.first().map_or(0, |d| d.len());
     let per_pilot = |scale: &[f32]| -> Vec<f32> {
@@ -697,7 +702,7 @@ fn noise_model(dev: &[Vec<f32>]) -> (Vec<f32>, Vec<f32>) {
     if nsym < 3 {
         return (scale, var);
     }
-    for _ in 0..NOISE_FIT_PASSES {
+    for _ in 0..passes {
         // Noise energy per symbol, each pilot relative to its own average.
         let e: Vec<f32> =
             dev.iter().map(|d| d.iter().zip(&var).map(|(x, v)| x / v.max(1e-12)).sum::<f32>() / np as f32).collect();
@@ -734,6 +739,33 @@ mod tests {
         assert!(frame.snr_db > 30.0, "snr {}", frame.snr_db);
         // No symbols is not a frame (the noise model would have no pilots to fit).
         assert!(ofdm.demodulate(&rx, b, 0).is_none());
+    }
+
+    /// A click on the middle pilots of one symbol in twenty: the symbol gets a large
+    /// scale, and the passes take its energy out of those pilots' variance (one pass
+    /// leaves them about twice their clean level, five about 1.1 times).
+    #[test]
+    fn noise_fit_passes_take_a_click_out_of_the_pilot_variance() {
+        let (nsym, np, hit) = (20, 12, 10);
+        let base: Vec<f32> = (0..np).map(|m| 0.01 * (1.0 + m as f32)).collect();
+        let mid = 4..8;
+        let dev: Vec<Vec<f32>> = (0..nsym)
+            .map(|i| (0..np).map(|m| if i == hit && mid.contains(&m) { 201.0 * base[m] } else { base[m] }).collect())
+            .collect();
+        let excess = |var: &[f32]| mid.clone().map(|m| var[m] / base[m]).fold(0f32, f32::max);
+        let (scale1, var1) = noise_model_passes(&dev, 1);
+        let (scale, var) = noise_model(&dev);
+        for s in [&scale1, &scale] {
+            assert!(s[hit] > SCALE_THRESHOLD, "scales {s:?}");
+            assert!(s.iter().enumerate().all(|(i, &x)| i == hit || x == 1.0), "scales {s:?}");
+        }
+        assert!(excess(&var1) > 1.5, "one pass: {:.2}", excess(&var1));
+        assert!(excess(&var) < 1.2, "{NOISE_FIT_PASSES} passes: {:.2}", excess(&var));
+        // Pilots the click missed keep their clean variance, less the click-hit
+        // symbol's share: the fit divides all its pilots by its scale (19/20 here).
+        for m in (0..np).filter(|m| !mid.contains(m)) {
+            assert!((var[m] / base[m] - 1.0).abs() < 0.06, "pilot {m}: {}", var[m] / base[m]);
+        }
     }
 
     #[test]
