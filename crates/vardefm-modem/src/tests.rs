@@ -1,7 +1,7 @@
 use super::*;
 use std::sync::Arc;
 use vardefm_dsp::prng::Prng;
-use vardefm_sim::{transmit, FmChannelConfig};
+use vardefm_sim::{transmit, Fading, FmChannelConfig};
 
 fn modem(mode: &str) -> Arc<Modem> {
     Arc::new(Modem::new(OfdmParams::by_name(mode).unwrap(), 0.1))
@@ -96,31 +96,87 @@ fn decodes_through_noisy_radio() {
 #[ignore]
 fn level_table() {
     for mode in ["narrow", "wide"] {
-        let m = modem(mode);
-        println!("{mode}: net rates {:?}", (0..7).map(|l| m.net_rate(l) as u32).collect::<Vec<_>>());
-        for level in 0..LEVELS.len() as u8 {
-            let mut line = format!("{mode} L{level} {:>10}:", LEVELS[level as usize].name);
-            for cnr in [6.0, 8.0, 10.0, 12.0, 14.0, 17.0, 20.0, 24.0, 28.0, 33.0, 40.0] {
-                let (mut ok, mut total, mut snr, mut nf) = (0, 0, 0.0, 0);
-                for t in 0..4 {
-                    let b = burst(level, m.max_ncw(level).min(4), 100 + t);
-                    let cfg = FmChannelConfig {
-                        cnr_db: Some(cnr),
-                        seed: t as u64 + 1,
-                        ..FmChannelConfig::by_name(mode).unwrap()
-                    };
-                    let got = receive(&mut Receiver::new(m.clone()), &transmit(&cfg, &m.modulate(&b)));
-                    total += b.payload.len();
-                    if let Some(g) = got.first() {
-                        ok += g.payload.iter().filter(|p| p.is_some()).count();
-                        snr += g.snr_db;
-                        nf += 1;
-                    }
-                }
-                line += &format!(" {cnr}:{:.0}%/{:.1}", 100.0 * ok as f32 / total as f32, snr / nf.max(1) as f32);
-            }
-            println!("{line}");
+        print_level_table(mode, None, &[6.0, 8.0, 10.0, 12.0, 14.0, 17.0, 20.0, 24.0, 28.0, 33.0, 40.0], 4);
+    }
+}
+
+/// The level table on Rayleigh fading channels (mobile or portable "picket fencing"),
+/// CNR being the mean CNR. Compare with `level_table`.
+/// `cargo test --release -p vardefm-modem fading_table -- --ignored --nocapture`
+/// `VARDEFM_FADING=rician:20:6` runs one fading spec instead of Rayleigh at 5, 20 and 80 Hz.
+#[test]
+#[ignore]
+fn fading_table() {
+    let specs: Vec<Fading> = match std::env::var("VARDEFM_FADING") {
+        Ok(s) => vec![s.parse().unwrap()],
+        Err(_) => [5.0, 20.0, 80.0].map(Fading::rayleigh).to_vec(),
+    };
+    let cnrs = [10.0, 14.0, 17.0, 20.0, 24.0, 28.0, 33.0, 40.0, 50.0, 60.0];
+    for f in specs {
+        for mode in ["narrow", "wide"] {
+            print_level_table(mode, Some(f), &cnrs, 8);
         }
+    }
+}
+
+/// One row per level: success rate / mean SNR per CNR, then the lowest CNR from which
+/// every burst decoded fully, and the highest reported SNR of any burst with a failed
+/// codeword (what `SNR_THRESHOLDS_DB` in vardefm-link must stay above).
+fn print_level_table(mode: &str, fading: Option<Fading>, cnrs: &[f32], trials: u32) {
+    let m = modem(mode);
+    let fname = fading.map_or("static".into(), |f| f.to_string());
+    println!("{mode} {fname}: net rates {:?}", (0..7).map(|l| m.net_rate(l) as u32).collect::<Vec<_>>());
+    let rows: Vec<String> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..LEVELS.len() as u8)
+            .map(|level| {
+                let m = m.clone();
+                scope.spawn(move || {
+                    let mut line = format!("{mode} L{level} {:>10}:", LEVELS[level as usize].name);
+                    let mut full_from = None;
+                    let mut worst_fail = f32::NEG_INFINITY;
+                    for &cnr in cnrs {
+                        let (mut ok, mut total, mut snr, mut nf) = (0, 0, 0.0, 0);
+                        for t in 0..trials {
+                            let b = burst(level, m.max_ncw(level).min(4), 100 + t);
+                            let cfg = FmChannelConfig {
+                                cnr_db: Some(cnr),
+                                fading,
+                                seed: t as u64 + 1,
+                                ..FmChannelConfig::by_name(mode).unwrap()
+                            };
+                            let got = receive(&mut Receiver::new(m.clone()), &transmit(&cfg, &m.modulate(&b)));
+                            total += b.payload.len();
+                            if let Some(g) = got.first() {
+                                let good = g.payload.iter().filter(|p| p.is_some()).count();
+                                ok += good;
+                                snr += g.snr_db;
+                                nf += 1;
+                                if good < g.payload.len() {
+                                    worst_fail = worst_fail.max(g.snr_db);
+                                }
+                            }
+                        }
+                        if ok < total {
+                            full_from = None;
+                        } else if full_from.is_none() {
+                            full_from = Some(cnr);
+                        }
+                        line +=
+                            &format!(" {cnr}:{:.0}%/{:.1}", 100.0 * ok as f32 / total as f32, snr / nf.max(1) as f32);
+                    }
+                    line += &format!(
+                        " | full from {} | worst failed SNR {}",
+                        full_from.map_or("-".into(), |c| format!("{c} dB")),
+                        if worst_fail.is_finite() { format!("{worst_fail:.1} dB") } else { "-".into() }
+                    );
+                    line
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for line in rows {
+        println!("{line}");
     }
 }
 
