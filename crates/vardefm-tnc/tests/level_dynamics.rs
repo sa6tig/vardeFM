@@ -19,7 +19,7 @@
 
 use std::sync::{Arc, Mutex};
 use std::thread;
-use vardefm_link::{Link, LinkConfig, LinkEvent};
+use vardefm_link::{Link, LinkConfig, LinkEvent, Node};
 use vardefm_modem::{Modem, OfdmParams, Receiver, RxBurst};
 use vardefm_sim::{transmit, FmChannelConfig};
 
@@ -73,8 +73,8 @@ impl Gauss {
 }
 
 /// One station: link, modulator and receiver (as `vardefm_tnc::station`, minus the host protocol).
-struct Node {
-    link: Link,
+struct Station {
+    node: Node,
     rx: Receiver,
     transmitting: bool,
 }
@@ -117,8 +117,8 @@ fn run(mode: &str, sc: Scenario, cnr_db: f32, seconds: f64, seed: u64) -> RunRes
         lp.level_tx_rms[l] *= 10f32.powf(sc.drive_db[l] / 20.0);
     }
     let link_modem = Arc::new(Modem::new(lp, 0.1));
-    let mk = |s: u32| Node {
-        link: Link::new(link_modem.clone(), LinkConfig::default(), s),
+    let mk = |s: u32| Station {
+        node: Node::new(Link::new(link_modem.clone(), LinkConfig::default(), s)),
         rx: Receiver::new(true_modem.clone()),
         transmitting: false,
     };
@@ -130,9 +130,9 @@ fn run(mode: &str, sc: Scenario, cnr_db: f32, seconds: f64, seed: u64) -> RunRes
         lead_silence_s: 0.0,
         ..FmChannelConfig::by_name(mode).unwrap()
     };
-    st[1].link.set_mycalls(vec!["LA2BBB".into()]);
-    st[1].link.set_listen(true);
-    st[0].link.connect(0.0, "LA1AAA", "LA2BBB").unwrap();
+    st[1].node.link.set_mycalls(vec!["LA2BBB".into()]);
+    st[1].node.link.set_listen(true);
+    st[0].node.link.connect(0.0, "LA1AAA", "LA2BBB", &[]).unwrap();
 
     let fs = true_modem.fs() as f64;
     let mut incoming: [Vec<(u64, Vec<f32>)>; 2] = [Vec::new(), Vec::new()];
@@ -151,21 +151,21 @@ fn run(mode: &str, sc: Scenario, cnr_db: f32, seconds: f64, seed: u64) -> RunRes
             break;
         }
         // Keep A's send buffer topped up once connected.
-        if connected_at.is_some() && st[0].link.is_connected() && host_sent - delivered < 64 * 1024 {
-            st[0].link.send_data(&chunk_data);
+        if connected_at.is_some() && st[0].node.link.is_connected() && host_sent - delivered < 64 * 1024 {
+            st[0].node.link.send_data(&chunk_data);
             host_sent += chunk_data.len();
         }
         for i in 0..2 {
             if tx_end[i].is_some_and(|e| e <= t) {
                 tx_end[i] = None;
                 st[i].transmitting = false;
-                st[i].link.tx_done(now);
+                st[i].node.tx_done(now);
             }
         }
         for i in 0..2 {
             if tx_end[i].is_none() {
                 let busy = st[i].rx.busy();
-                if let Some(burst) = st[i].link.poll(now, busy) {
+                if let Some((burst, _)) = st[i].node.poll(now, busy) {
                     let audio = true_modem.modulate(&burst);
                     st[i].transmitting = true;
                     st[i].rx.reset();
@@ -198,7 +198,7 @@ fn run(mode: &str, sc: Scenario, cnr_db: f32, seconds: f64, seed: u64) -> RunRes
                     snr_db: burst.snr_db + sc.snr_offset_db + sc.snr_jitter_db * gauss.next(),
                     ..burst.clone()
                 };
-                st[i].link.on_burst(now, &seen);
+                st[i].node.on_burst(now, &seen);
                 if i == 1 && burst.header.ncw > 0 && connected_at.is_some() {
                     bursts.push(RxRec {
                         t: now - connected_at.unwrap(),
@@ -211,7 +211,7 @@ fn run(mode: &str, sc: Scenario, cnr_db: f32, seconds: f64, seed: u64) -> RunRes
             }
         }
         for i in 0..2 {
-            for e in st[i].link.take_events() {
+            for e in st[i].node.link.take_events() {
                 match e {
                     LinkEvent::Connected { .. } if i == 0 && connected_at.is_none() => connected_at = Some(now),
                     LinkEvent::Data(d) if i == 1 && connected_at.is_some() => delivered += d.len(),
@@ -226,7 +226,7 @@ fn run(mode: &str, sc: Scenario, cnr_db: f32, seconds: f64, seed: u64) -> RunRes
         scenario: sc.name,
         cnr_db,
         bursts,
-        retries: st[0].link.stats.retries,
+        retries: st[0].node.link.stats.retries,
         delivered,
         seconds: connected_at.map_or(0.0, |_| seconds),
     }

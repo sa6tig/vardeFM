@@ -7,6 +7,17 @@ run the same minor version.
 ## [Unreleased]
 
 ### Added
+- **Digipeating.** `CONNECT <mycall> <target> VIA <d1> [<d2>]` connects through up to
+  two VardeFM digipeaters, as in VARA FM. `vardefm modem --digi <call>` makes a
+  station repeat the sessions routed through that call, with or without a host
+  connected. Each digipeater repeats every burst; acknowledgements and retries stay end
+  to end, and a codeword a digipeater could not decode is passed on as void so the
+  sender resends it. The end stations wait longer before retrying, by the repeats' airtime
+  plus `--hop-margin` (default 0.5 s) per digipeater. `sim-pair --digi <call>` puts
+  digipeaters between A and B, which then hear only their neighbours. On air, every burst
+  of a routed session is marked in new header flag bits, and its connect bursts carry a
+  `VFM2` payload; direct sessions are unchanged and still work with older builds, and
+  digipeaters never repeat them. See docs/PROTOCOL.md §3.4.
 - **Performance gates.** `level_gate` and `fer_gate` are ignored tests, run by hand in
   release mode, that fail when decoding performance moves. Per mode and level, the CNR
   at which 10 % of codewords fail, and per mode and drive level the CNR at which 10 % of
@@ -37,11 +48,19 @@ run the same minor version.
   the tone came back abruptly and the band filter read that as busy for 150 ms after
   every burst, which held back the modem's next transmission. A busy hold from before a
   transmission no longer carries over it. (#10)
+- On the radio, session ids and retry delays are seeded from the operating system's
+  randomness. The process id alone could repeat between stations started from the same
+  system image, which then drew the same session ids.
 
 ### Fixed
 - A NaN, an Inf or a sample far beyond full scale from the sound card no longer loses a
   burst it falls in or shortly before, and cannot leave busy detection deaf; the last
   good sample takes its place. (#10)
+- A transfer could stop for good, with the session still connected, after lost bursts
+  and a change of speed level. When data that had arrived ahead of a gap was sent again
+  at a faster level, the receiver acknowledged the longer copy but kept the shorter one,
+  so the sender never sent the difference again. Only the receiving side changes: a
+  station with this fix receives correctly from any version. (#29, thanks @mustig)
 
 ## [0.3.1] - 2026-11-09
 

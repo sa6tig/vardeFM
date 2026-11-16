@@ -110,6 +110,9 @@ vardefm sim-pair --cnr 20
 Station A listens on port 8300 and station B on port 8310. `--cnr` sets the
 simulated signal quality in dB: 30 is excellent, 10 is poor. Stop it with Ctrl-C.
 
+To try a digipeater, add `--digi LA3DDD`: A and B can then reach each other only
+through it, with `CONNECT <A's call> <B's call> VIA LA3DDD`.
+
 ## 3. Connect the radio
 
 You need a sound card interface between the computer and the radio, e.g. a
@@ -185,6 +188,8 @@ Important options:
 | `--host <address>` | `127.0.0.1` | Use `0.0.0.0` to accept programs on other computers. Anyone who can reach the port can transmit, so only do this on a trusted network. |
 | `--quiet` | | Do not print a line per transmission. |
 | `--record <folder>` | | Save every transmission as a WAV file. |
+| `--digi <callsign>` | | Also act as a digipeater for this call sign (repeat for more). Works with no program connected. |
+| `--hop-margin <seconds>` | `0.5` | Extra wait per digipeater on sessions through digipeaters, whether you call or are called. Raise it, on both stations, if a slow digipeater makes transfers retry (at most 10). |
 
 `vardefm modem --help` lists every option.
 
@@ -204,6 +209,10 @@ tested with VardeFM yet. Please report what you find.
 
 The program sets your callsign (`MYCALL`) and connects or listens. VardeFM does
 not need its own callsign setting.
+
+To connect through digipeaters, the program sends `CONNECT <mycall> <target> VIA <digi1>
+[<digi2>]` (at most two). The digipeaters must be VardeFM stations started with `--digi`
+(see docs/RADIO.md).
 
 ## 6. Start automatically on a Raspberry Pi (optional)
 

@@ -42,7 +42,11 @@ impl Kind {
 /// | 3 | ack_burst: burst_id of the last peer burst this one acknowledges |
 /// | 24 | ack_offset: next byte offset expected from the peer (mod 2^24) |
 /// | 24 | bitmap: bit i (LSB = codeword 0) set if codeword i of burst ack_burst decoded |
-/// | 4 | flags: bit 0 = POLL (peer must answer even with nothing to send) |
+/// | 4 | flags: bit 0 = POLL (peer must answer even with nothing to send), bit 1 = UP (called → caller), bits 2-3 = route field |
+///
+/// The route field is 0 on a direct session (all that versions before digipeating
+/// send). On a routed session it is 1 as an end station sends it, plus one for each
+/// digipeater repeat, so every burst of a routed session is marked as such.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Header {
     pub kind: Kind,
@@ -58,10 +62,43 @@ pub struct Header {
 }
 
 pub const FLAG_POLL: u8 = 1;
+/// Direction on a routed (digipeated) session: set on bursts from the called station.
+pub const FLAG_UP: u8 = 2;
+/// Most digipeaters on one path: the 2-bit route field holds 1 + repeats, and 0 means direct.
+pub const MAX_DIGIS: usize = 2;
+const ROUTE_SHIFT: u8 = 2;
+/// Route field 1: a burst of a routed session as an end station sends it.
+pub const FLAG_ROUTED: u8 = 1 << ROUTE_SHIFT;
 
 const FIELDS: [usize; 10] = [3, 8, 3, 5, 3, 3, 3, 24, 24, 4];
 
 impl Header {
+    fn route_field(&self) -> u8 {
+        (self.flags >> ROUTE_SHIFT) & 3
+    }
+
+    /// True if the burst belongs to a routed (digipeated) session.
+    pub fn routed(&self) -> bool {
+        self.route_field() != 0
+    }
+
+    /// How many times a digipeater has repeated this burst (0 on a direct one).
+    pub fn hop(&self) -> u8 {
+        self.route_field().saturating_sub(1)
+    }
+
+    /// Mark the burst routed, repeated `hop` times (at most [`MAX_DIGIS`]).
+    pub fn set_hop(&mut self, hop: u8) {
+        debug_assert!(hop as usize <= MAX_DIGIS);
+        let field = hop.min(MAX_DIGIS as u8) + 1;
+        self.flags = (self.flags & !(3 << ROUTE_SHIFT)) | (field << ROUTE_SHIFT);
+    }
+
+    /// True if the burst comes from the called station (routed sessions only).
+    pub fn up(&self) -> bool {
+        self.flags & FLAG_UP != 0
+    }
+
     fn values(&self) -> [u64; 10] {
         [
             self.kind as u64,
@@ -142,5 +179,28 @@ mod tests {
         let mut bad = p;
         bad[3] ^= 1;
         assert_eq!(Header::unpack(&bad), None);
+    }
+
+    #[test]
+    fn hop_and_direction_flags() {
+        // Route field 0: a direct burst, as every released version sends it.
+        let direct = Header::unpack(&Header { flags: FLAG_POLL, ..Header::default() }.pack()).unwrap();
+        assert!(!direct.routed());
+        assert_eq!(direct.hop(), 0);
+        assert!(!direct.up());
+
+        let mut h = Header { flags: FLAG_POLL | FLAG_UP, ..Header::default() };
+        for hop in 0..=MAX_DIGIS as u8 {
+            h.set_hop(hop);
+            let back = Header::unpack(&h.pack()).unwrap();
+            assert!(back.routed());
+            assert_eq!(back.hop(), hop);
+            assert_eq!((back.flags >> ROUTE_SHIFT) & 3, hop + 1);
+            assert!(back.up());
+            assert_eq!(back.flags & FLAG_POLL, FLAG_POLL);
+        }
+        let mut sent = Header::default();
+        sent.set_hop(0);
+        assert_eq!(sent.flags, FLAG_ROUTED);
     }
 }

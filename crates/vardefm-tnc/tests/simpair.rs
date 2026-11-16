@@ -313,8 +313,14 @@ fn wrong_commands_and_abort() {
     let mut b = Host::connect("B", sp.addrs[1]);
     a.send("FOO BAR");
     assert_eq!(a.reply(), "WRONG");
-    a.send("CONNECT LA1AAA LA2BBB VIA LA3CCC");
-    assert_eq!(a.reply(), "WRONG");
+    for bad in [
+        "CONNECT LA1AAA LA2BBB VIA",
+        "CONNECT LA1AAA LA2BBB VIA LA3AAA LA3BBB LA3CCC",
+        "CONNECT LA1AAA LA2BBB VIA LA3AAA LA3BBB LA3CCC LA3DDD",
+    ] {
+        a.send(bad);
+        assert_eq!(a.reply(), "WRONG", "{bad}");
+    }
     b.command("MYCALL LA2BBB");
     b.command("LISTEN ON");
     a.command("MYCALL LA1AAA");
@@ -325,4 +331,75 @@ fn wrong_commands_and_abort() {
     a.expect("DISCONNECTED");
     b.expect("DISCONNECTED");
     sp.stop();
+}
+
+#[test]
+fn connect_via_digipeater() {
+    // A and B cannot hear each other; LA3DDD sits between them.
+    let sp = SimPair::start(SimPairConfig {
+        cnr_db: Some(30.0),
+        seed: 6,
+        speed: 20.0,
+        a_port: 0,
+        b_port: 0,
+        verbose: std::env::var("VARDEFM_SIM_VERBOSE").is_ok(),
+        digis: vec!["LA3DDD".into()],
+        ..SimPairConfig::default()
+    })
+    .unwrap();
+    let mut a = Host::connect("A", sp.addrs[0]);
+    let mut b = Host::connect("B", sp.addrs[1]);
+    b.command("MYCALL LA2BBB");
+    b.command("LISTEN ON");
+    a.command("MYCALL LA1AAA");
+
+    // Directly, B is out of range.
+    a.command("CONNECT LA1AAA LA2BBB");
+    a.expect("DISCONNECTED");
+
+    a.command("CONNECT LA1AAA LA2BBB via la3ddd");
+    assert_eq!(a.expect("CONNECTED"), "CONNECTED LA1AAA LA2BBB NARROW");
+    b.expect("PENDING");
+    assert_eq!(b.expect("CONNECTED"), "CONNECTED LA1AAA LA2BBB NARROW");
+
+    let (to_a, to_b) = (payload(4_000, 60), payload(4_000, 61));
+    b.write(&to_a);
+    a.wait_rx(1);
+    a.write(&to_b);
+    assert_eq!(a.wait_rx(to_a.len()), to_a, "A received corrupted data");
+    assert_eq!(b.wait_rx(to_b.len()), to_b, "B received corrupted data");
+    a.expect("BUFFER 0");
+
+    a.command("DISCONNECT");
+    a.expect("DISCONNECTED");
+    b.expect("DISCONNECTED");
+    let st = sp.stats();
+    assert!(st.bursts[1] > 0, "the digipeater repeated nothing");
+    println!("via digipeater: airtime A {:.1} s / D1 {:.1} s / B {:.1} s", st.airtime[0], st.airtime[1], st.airtime[2]);
+    sp.stop();
+}
+
+#[test]
+fn start_refuses_bad_digipeater_settings() {
+    let cfg = |digis: &[&str], hop_margin_s: f64| SimPairConfig {
+        a_port: 0,
+        b_port: 0,
+        verbose: false,
+        digis: digis.iter().map(|d| d.to_string()).collect(),
+        hop_margin_s,
+        ..SimPairConfig::default()
+    };
+    let refused = |c: SimPairConfig| SimPair::start(c).err().map(|e| e.to_string());
+    assert_eq!(refused(cfg(&["LA3A", "LA3B", "LA3C"], 0.5)).as_deref(), Some("at most two digipeaters"));
+    for same in [&["LA3DDD", "LA3DDD"], &["LA3DDD", "la3ddd"]] {
+        assert_eq!(refused(cfg(same, 0.5)).as_deref(), Some("each digipeater needs its own call sign"));
+    }
+    for (padded, shown) in [(" LA3DDD", "\" LA3DDD\""), ("LA3DDD ", "\"LA3DDD \""), ("", "\"\"")] {
+        let why = format!("digipeater {shown}: not a valid call sign");
+        assert_eq!(refused(cfg(&["LA3DDD", padded], 0.5)), Some(why));
+    }
+    for margin in [-1.0, 10.5, f64::NAN] {
+        assert_eq!(refused(cfg(&["LA3DDD"], margin)).as_deref(), Some("hop margin must be from 0 to 10 seconds"));
+    }
+    assert!(refused(cfg(&["LA3DDD", "LA4EEE"], 10.0)).is_none());
 }
