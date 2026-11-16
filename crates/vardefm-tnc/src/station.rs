@@ -5,7 +5,7 @@
 
 use crate::host::{parse, Command};
 use std::sync::Arc;
-use vardefm_link::{Link, LinkConfig, LinkEvent, Node, TxInfo};
+use vardefm_link::{Link, LinkConfig, LinkEvent, LinkView, Node, TxInfo};
 use vardefm_modem::{Header, Modem, Receiver, RxBurst};
 
 /// Output for the host application.
@@ -165,6 +165,22 @@ impl Station {
 
     pub fn transmitting(&self) -> bool {
         self.transmitting
+    }
+
+    /// The busy state last reported to the host (`BUSY ON` / `BUSY OFF`).
+    pub fn busy(&self) -> bool {
+        self.busy_reported
+    }
+
+    /// Samples the receiver has been given so far. [`RxBurst::end_sample`] counts in
+    /// these, which skip the audio heard while transmitting.
+    pub fn rx_position(&self) -> u64 {
+        self.rx.position()
+    }
+
+    /// Where the link stands, for monitoring.
+    pub fn link_view(&self) -> LinkView {
+        self.node.link.view()
     }
 
     /// Received audio. Returns any bursts decoded (for logging).
