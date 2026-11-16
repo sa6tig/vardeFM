@@ -777,3 +777,35 @@ fn predicted_snr_matches_the_simulator() {
     let p = modem.predict_snr_db(15.9, 4, 5);
     assert!((p - 15.3).abs() < 1.0, "narrow L4 -> L5 at 14 dB CNR: {p:.1}");
 }
+
+#[test]
+fn direct_ends_retrying_together_recover() {
+    let mut dropped = Vec::new();
+    for seed in 0..40 {
+        let mut net = Net::new(seed, 0.0, 0.0);
+        net.nodes[A].link.connect(0.0, "LA1AAA", "LA2BBB-1", &[]).unwrap();
+        net.run_until(60.0, |n| n.both_connected());
+        net.run_until(60.0, |n| n.now > 15.0);
+        let (a, b) = (data(2000, seed), data(2000, seed + 1));
+        net.nodes[A].link.send_data(&a);
+        net.nodes[1].link.send_data(&b);
+        let lost = |n: &Net| n.has(A, &LinkEvent::Disconnected) || n.has(1, &LinkEvent::Disconnected);
+        let mut starts: Vec<(usize, f64)> = Vec::new();
+        let t0 = net.now;
+        while !(lost(&net) || (net.nodes[A].host_rx == b && net.nodes[1].host_rx == a)) {
+            assert!(net.now - t0 < 300.0, "timed out");
+            net.step();
+            for &(i, s, _) in &net.history {
+                if s > 15.0 && !starts.contains(&(i, s)) {
+                    starts.push((i, s));
+                }
+            }
+        }
+        if lost(&net) {
+            let bursts: Vec<String> = starts.iter().map(|&(i, s)| format!("{}@{:.2}", ["A", "B"][i], s)).collect();
+            println!("seed {seed}: {}", bursts.join(" "));
+            dropped.push(seed);
+        }
+    }
+    assert!(dropped.is_empty(), "sessions dropped for seeds {dropped:?}");
+}
