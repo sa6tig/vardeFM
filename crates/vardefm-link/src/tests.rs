@@ -780,6 +780,9 @@ fn predicted_snr_matches_the_simulator() {
 
 #[test]
 fn direct_ends_retrying_together_recover() {
+    // Two stations that hear each other, no digipeater. Once connected and quiet, both get
+    // 2 kB at the same instant, so both start a burst of their own and lose it to the other.
+    // Their retries must not keep colliding until max_retries drops the session.
     let mut dropped = Vec::new();
     for seed in 0..40 {
         let mut net = Net::new(seed, 0.0, 0.0);
@@ -790,20 +793,8 @@ fn direct_ends_retrying_together_recover() {
         net.nodes[A].link.send_data(&a);
         net.nodes[1].link.send_data(&b);
         let lost = |n: &Net| n.has(A, &LinkEvent::Disconnected) || n.has(1, &LinkEvent::Disconnected);
-        let mut starts: Vec<(usize, f64)> = Vec::new();
-        let t0 = net.now;
-        while !(lost(&net) || (net.nodes[A].host_rx == b && net.nodes[1].host_rx == a)) {
-            assert!(net.now - t0 < 300.0, "timed out");
-            net.step();
-            for &(i, s, _) in &net.history {
-                if s > 15.0 && !starts.contains(&(i, s)) {
-                    starts.push((i, s));
-                }
-            }
-        }
+        net.run_until(300.0, |n| lost(n) || (n.nodes[A].host_rx == b && n.nodes[1].host_rx == a));
         if lost(&net) {
-            let bursts: Vec<String> = starts.iter().map(|&(i, s)| format!("{}@{:.2}", ["A", "B"][i], s)).collect();
-            println!("seed {seed}: {}", bursts.join(" "));
             dropped.push(seed);
         }
     }
