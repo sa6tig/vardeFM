@@ -73,8 +73,9 @@ fn fading_diag() {
 /// Noise-model calibration: per quarter of the band, the measured noise of the
 /// equalized payload cells (payload known) over the noise the receiver predicts for
 /// them (`noise_var[j] * symbol_noise_scale[i]`), summed over bursts. 1 is calibrated;
-/// below 1 the receiver overpredicts. Symbols with scale 1 ("clean") and above 1
-/// ("click") are counted apart.
+/// below 1 the receiver overpredicts. Symbols with a large measured noise ("click")
+/// and the rest ("clean") are counted apart. Bursts that are not detected or not
+/// demodulated are counted and left out.
 ///
 /// `cargo test --release -p vardefm-modem noise_calib -- --ignored --nocapture`
 ///
@@ -96,6 +97,7 @@ fn noise_calib() {
             let mut per = vec![(0f64, 0f64); nd];
             let mut nclick = 0;
             let mut nsyms = 0;
+            let mut missed = 0;
             for t in 0..bursts {
                 let b = burst(level, m.max_ncw(level).min(4), 100 + t);
                 let audio = m.modulate(&b);
@@ -106,12 +108,37 @@ fn noise_calib() {
                     ..FmChannelConfig::by_name(mode).unwrap()
                 };
                 let rx = transmit(&cfg, &audio);
-                let Some(start) = m.ofdm.detect(&rx, 0) else { continue };
+                let Some(start) = m.ofdm.detect(&rx, 0) else {
+                    missed += 1;
+                    continue;
+                };
                 let sent = m.symbols(&b);
                 let hs = m.header_symbols();
-                let Some(f) = m.ofdm.demodulate_known(&rx, start, sent.len(), &sent[..hs]) else { continue };
-                for ((y, x), &scale) in f.symbols.iter().zip(&sent).zip(&f.symbol_noise_scale).skip(hs) {
-                    let c = usize::from(scale > 1.0);
+                let Some(f) = m.ofdm.demodulate_known(&rx, start, sent.len(), &sent[..hs]) else {
+                    missed += 1;
+                    continue;
+                };
+                // A symbol is a click if its measured noise, each carrier relative to
+                // that carrier's median over the burst, is more than twice the burst's
+                // median: classed by what was received, not by the model under test,
+                // so two receivers are compared on (nearly) the same symbols.
+                let err: Vec<Vec<f32>> = f.symbols[hs..]
+                    .iter()
+                    .zip(&sent[hs..])
+                    .map(|(y, x)| y.iter().zip(x).map(|(a, b)| (a - b).norm_sqr()).collect())
+                    .collect();
+                let median = |mut v: Vec<f32>| {
+                    v.sort_by(f32::total_cmp);
+                    v[v.len() / 2]
+                };
+                let carrier_med: Vec<f32> = (0..nd).map(|j| median(err.iter().map(|e| e[j]).collect())).collect();
+                let rel: Vec<f32> = err
+                    .iter()
+                    .map(|e| e.iter().zip(&carrier_med).map(|(x, m)| x / m.max(1e-12)).sum::<f32>() / nd as f32)
+                    .collect();
+                let rel_med = median(rel.clone());
+                for (((y, x), &scale), r) in f.symbols.iter().zip(&sent).zip(&f.symbol_noise_scale).skip(hs).zip(&rel) {
+                    let c = usize::from(*r > 2.0 * rel_med);
                     nclick += c;
                     nsyms += 1;
                     for j in 0..nd {
@@ -146,7 +173,8 @@ fn noise_calib() {
                 );
             }
             println!(
-                "{mode} {fname} L{level} {cnr} dB: clean {} | click ({nclick}/{nsyms} syms) {}",
+                "{mode} {fname} L{level} {cnr} dB: clean {} | click ({nclick}/{nsyms} syms) {} | \
+                 {missed}/{bursts} bursts not detected or demodulated",
                 fmt(&acc[0]),
                 fmt(&acc[1])
             );
@@ -168,7 +196,9 @@ fn noise_calib() {
 #[test]
 #[ignore]
 fn fading_cer() {
-    use crate::detect_eval::{env_list, on_every_core, payload_seed, through_channel_with, true_position};
+    use crate::detect_eval::{
+        codeword_errors, env_list, on_every_core, payload_seed, through_channel_with, true_position,
+    };
     use std::io::Write;
     let modes = env_modes("narrow,wide");
     let fadings: Vec<Fading> = env_list("FADINGS", "rayleigh:5,rayleigh:20,rayleigh:80");
@@ -187,13 +217,7 @@ fn fading_cer() {
                     let errs = on_every_core(trials, |t| {
                         let sent = crate::detect_eval::burst(level, ncw, payload_seed(t));
                         let rx = through_channel_with(&m, mode, cnr, Some(f), &sent, t);
-                        let nsym = m.header_symbols() + ncw * m.symbols_per_codeword(level);
-                        let training = m.header_carriers(&sent.header);
-                        let Some(frame) = m.ofdm.demodulate_known(&rx, truth, nsym, &training) else {
-                            return ncw as u32;
-                        };
-                        let got = m.decode_payload(&sent.header, &frame);
-                        got.iter().zip(&sent.payload).filter(|(g, w)| g.as_ref() != Some(*w)).count() as u32
+                        codeword_errors(&m, &rx, truth, &sent)
                     });
                     let total: u32 = errs.iter().sum();
                     line += &format!(" {cnr}:{total}/{}", trials as usize * ncw);

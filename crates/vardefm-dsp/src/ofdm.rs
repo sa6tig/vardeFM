@@ -682,9 +682,11 @@ fn robust_reference(e: &[f32]) -> f32 {
 /// The two halves are fitted in turn, `NOISE_FIT_PASSES` times. The first per-pilot
 /// variance includes the click-hit symbols at full weight, so the pilots where clicks
 /// land (mid-band, under fast fading) look noisy in every symbol, and a click there
-/// stands out less than it should. With one pass, wide mode at 80 Hz Doppler
-/// underpredicted click-hit symbols mid-band 2.4-3.5 times; with five, 1.2-1.8 times
-/// (`noise_calib` in vardefm-modem). On Rayleigh channels it lost fewer codewords
+/// stands out less than it should. With one pass (and geometric interpolation), wide
+/// mode at 80 Hz Doppler underpredicted the noisiest symbols mid-band 2.6-3.6 times;
+/// with five, 1.3-1.8 times (`noise_calib` in vardefm-modem). In the lowest quarter
+/// of the band, where those symbols were already overpredicted, more so: 0.33 times
+/// the measured noise became 0.11. On Rayleigh channels it lost fewer codewords
 /// (`fading_cer`).
 fn noise_model(dev: &[Vec<f32>]) -> (Vec<f32>, Vec<f32>) {
     noise_model_passes(dev, NOISE_FIT_PASSES)
@@ -765,6 +767,49 @@ mod tests {
         // symbol's share: the fit divides all its pilots by its scale (19/20 here).
         for m in (0..np).filter(|m| !mid.contains(m)) {
             assert!((var[m] / base[m] - 1.0).abs() < 0.06, "pilot {m}: {}", var[m] / base[m]);
+        }
+    }
+
+    /// Noise that falls 20-fold across the first pilot gap (exponentially, flat after
+    /// it), as at the low edge of the wide band: the noise predicted for the data
+    /// carriers in that gap matches the measured noise (0.93-1.24 here). Interpolated
+    /// linearly between the pilots it was overstated, 1.61 times on carrier 2.
+    #[test]
+    fn noise_follows_a_steep_tilt_between_pilots() {
+        let ofdm = Ofdm::new(OfdmParams::wide());
+        let nsym = 80;
+        let data = random_frame(&ofdm, Modulation::Qpsk, nsym, 3);
+        let mut rx = vec![0.0; 1000];
+        rx.extend(ofdm.modulate(&data));
+        rx.extend(vec![0.0; 2000]);
+        let b = ofdm.detect(&rx, 0).expect("frame not detected");
+
+        // Noise symbols aligned with the data symbols, so each FFT window sees one of
+        // them whole: carrier k gets variance 2 * gain[k]^2 times the noise scale.
+        let gap = ofdm.pilot_idx[1] - ofdm.pilot_idx[0];
+        let power = |k: usize| 20f32.powf(1.0 - (k.min(gap) as f32 / gap as f32));
+        let gain: Vec<f32> = (0..ofdm.p.num_carriers).map(|k| power(k).sqrt()).collect();
+        let l = ofdm.p.symbol_len();
+        let mut rng = Prng::new(7);
+        let mut noise = Vec::new();
+        for _ in 0..nsym {
+            let c: Vec<Complex32> = gain.iter().map(|&g| Complex32::new(rng.bpsk(), rng.bpsk()) * g).collect();
+            noise.extend(ofdm.symbol_time(&c));
+        }
+        let g = 0.02 * rms(&rx[b + l..b + (nsym + 1) * l]) / rms(&noise);
+        for (x, n) in rx[b + l..].iter_mut().zip(&noise) {
+            *x += g * n;
+        }
+
+        let f = ofdm.demodulate(&rx, b, nsym).expect("demod failed");
+        // Symbols the fit scaled up (a few, by chance) are left out on both sides.
+        let clean: Vec<usize> = (0..nsym).filter(|&i| f.symbol_noise_scale[i] == 1.0).collect();
+        assert!(clean.len() > nsym * 9 / 10, "scales {:?}", f.symbol_noise_scale);
+        for (j, &k) in ofdm.data_idx.iter().enumerate().take_while(|&(_, &k)| k < ofdm.pilot_idx[1]) {
+            let measured =
+                clean.iter().map(|&i| (f.symbols[i][j] - data[i][j]).norm_sqr()).sum::<f32>() / clean.len() as f32;
+            let ratio = f.noise_var[j] / measured;
+            assert!((0.7..1.4).contains(&ratio), "carrier {k}: predicted / measured {ratio:.2}");
         }
     }
 

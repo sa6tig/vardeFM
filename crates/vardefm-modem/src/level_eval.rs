@@ -67,8 +67,8 @@
 
 use super::*;
 use crate::detect_eval::{
-    burst, env_flag, env_list, env_modes, env_or, header_at, modem, on_every_core, payload_seed, through_channel,
-    true_position,
+    burst, codeword_errors, env_flag, env_list, env_modes, env_or, header_at, modem, on_every_core, payload_seed,
+    through_channel, true_position,
 };
 use vardefm_dsp::prng::Prng;
 
@@ -297,21 +297,13 @@ impl<'a> Case<'a> {
     /// Failed decisions of trial `t` at `cnr` dB, from the true position: whether
     /// the header fails, or how many codewords do.
     fn errors(&self, cnr: f32, t: u32) -> u32 {
-        let (m, ncw) = (self.m, self.ncw);
-        let sent = trial_burst(self.level, ncw, t);
+        let m = self.m;
+        let sent = trial_burst(self.level, self.ncw, t);
         let rx = through_channel(m, self.mode, cnr, &sent, t);
         if let Target::Header(_) = self.target {
             return u32::from(header_at(m, &rx, self.truth) != Some(sent.header));
         }
-        // The sent header's carriers train the channel estimate, as in
-        // `Receiver::step` once the header has decoded.
-        let training = m.header_carriers(&sent.header);
-        let nsym = m.header_symbols() + ncw * m.symbols_per_codeword(self.level);
-        let Some(frame) = m.ofdm.demodulate_known(&rx, self.truth, nsym, &training) else {
-            return ncw as u32;
-        };
-        let got = m.decode_payload(&sent.header, &frame);
-        got.iter().zip(&sent.payload).filter(|(g, w)| g.as_ref() != Some(*w)).count() as u32
+        codeword_errors(m, &rx, self.truth, &sent)
     }
 
     /// Trials and decisions for `bursts` bursts' worth: one per codeword of a level's
