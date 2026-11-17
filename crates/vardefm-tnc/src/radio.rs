@@ -8,19 +8,25 @@
 //!
 //! [`RadioEngine`] holds that logic with the sound card output and PTT behind
 //! traits, so it can be tested without hardware; [`run`] wires it to real devices.
+//!
+//! With `--api`, [`run`] also serves the read-only monitor API (see [`crate::monitor`]):
+//! the engine lists what happened in [`RadioEngine::events`], timed on the receive clock.
 
 use crate::host::valid_call;
 use crate::level::{meter_line, LevelMeter, Verdict};
+use crate::monitor::Monitor;
 use crate::server::{HostIn, HostPort};
 use crate::station::{HostOut, Station};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use vardefm_api::wire::{ApiEvent, VfmBurstRx, VfmBurstTx, WireTime};
+pub use vardefm_api::LoopbackAddr;
 use vardefm_audio::{open_input, open_output, AudioOut, Channel, RATE};
 use vardefm_link::{valid_hop_margin, LinkConfig, MAX_HOP_MARGIN_S};
-use vardefm_modem::{AudioLevel, Modem, OfdmParams, LEVELS};
+use vardefm_modem::{AudioLevel, Header, Modem, OfdmParams, LEVELS};
 use vardefm_ptt::{Ptt, PttSpec};
 
 #[derive(Clone, Debug)]
@@ -51,6 +57,8 @@ pub struct RadioConfig {
     pub digi_calls: Vec<String>,
     /// Extra wait per digipeater hop on our own routed sessions.
     pub hop_margin_s: f64,
+    /// Serve the monitor API on this address (none: off).
+    pub api: Option<LoopbackAddr>,
 }
 
 impl RadioConfig {
@@ -101,6 +109,7 @@ impl Default for RadioConfig {
             show_levels: false,
             digi_calls: Vec::new(),
             hop_margin_s: LinkConfig::default().hop_margin_s,
+            api: None,
         }
     }
 }
@@ -157,9 +166,17 @@ pub struct RadioEngine<S: AudioSink> {
     pub notices: Vec<String>,
     /// Put a receive level line in `notices` every [`LEVEL_WINDOW_S`] seconds while idle.
     pub show_levels: bool,
+    /// What happened, for the monitor API, drained by the caller. Times are on the receive
+    /// clock ([`rx_samples`](Self::rx_samples)).
+    pub events: Vec<ApiEvent>,
     meter: LevelMeter,
     /// When the last level warning went out.
     last_level_warning: Option<f64>,
+    /// The busy state last put in `events`.
+    busy: bool,
+    /// The receiver's position at the last gap, and how far the receive clock was ahead of it
+    /// before the gap: a burst that ended there is timed by that.
+    before_gap: Option<(u64, u64)>,
 }
 
 impl<S: AudioSink> RadioEngine<S> {
@@ -177,8 +194,11 @@ impl<S: AudioSink> RadioEngine<S> {
             log: Vec::new(),
             notices: Vec::new(),
             show_levels: false,
+            events: Vec::new(),
             meter: LevelMeter::new((LEVEL_WINDOW_S * RATE as f32) as usize),
             last_level_warning: None,
+            busy: false,
+            before_gap: None,
         }
     }
 
@@ -210,15 +230,46 @@ impl<S: AudioSink> RadioEngine<S> {
             return;
         }
         self.last_level_warning = Some(now);
-        self.notices.push(format!(
-            "{now:8.2}s {what} peaks at {:.1} dBFS: {} (aim for about -6 dBFS)",
-            level.peak_dbfs,
-            verdict.advice()
-        ));
+        let text = format!("{what} peaks at {:.1} dBFS: {} (aim for about -6 dBFS)", level.peak_dbfs, verdict.advice());
+        self.notices.push(format!("{now:8.2}s {text}"));
+        self.warning("rx_level", text);
+    }
+
+    fn warning(&mut self, code: &str, text: String) {
+        self.events.push(ApiEvent::Warning { code: code.into(), text });
+    }
+
+    /// A log line that is also a warning for the monitor API.
+    fn log_warning(&mut self, now: f64, code: &str, text: String) {
+        self.log.push(format!("{now:8.2}s {text}"));
+        self.warning(code, text);
     }
 
     pub fn now(&self) -> f64 {
         self.rx_pos as f64 / RATE as f64
+    }
+
+    /// Samples received so far: the receive clock. It counts the audio heard while
+    /// transmitting and the audio lost (see [`audio_lost`](Self::audio_lost)) too.
+    pub fn rx_samples(&self) -> u64 {
+        self.rx_pos
+    }
+
+    /// `samples` of received audio were lost before the next chunk: the receive clock
+    /// skips them, and `events` gets a `Gap`.
+    pub fn audio_lost(&mut self, samples: u64) {
+        if samples == 0 {
+            return;
+        }
+        let heard = self.station.rx_position();
+        self.before_gap = Some((heard, self.rx_pos - heard));
+        self.rx_pos += samples;
+        let now = self.now();
+        self.log.push(format!(
+            "{now:8.2}s lost {:.0} ms of received audio: the computer fell behind",
+            samples as f64 * 1000.0 / RATE as f64
+        ));
+        self.events.push(ApiEvent::Gap { t: WireTime(self.rx_pos) });
     }
 
     pub fn transmitting(&self) -> bool {
@@ -248,19 +299,41 @@ impl<S: AudioSink> RadioEngine<S> {
             let done = tx.drained_at.is_some_and(|t| now >= t + self.tail_s);
             if done || now > tx.deadline {
                 if !done {
-                    self.log.push(format!("{now:8.2}s watchdog: transmission overran, unkeying"));
+                    self.log_warning(now, "tx_watchdog", "watchdog: transmission overran, unkeying".into());
                     self.out.flush();
                 }
                 if let Err(e) = self.ptt.set(false) {
-                    self.log.push(format!("{now:8.2}s PTT off failed: {e}"));
+                    self.log_warning(now, "ptt", format!("PTT off failed: {e}"));
                 }
                 self.tx = None;
                 self.station.tx_done(now);
             }
         } else {
             if let Some(c) = chunk {
-                for b in self.station.rx_audio(now, c) {
+                let bursts = self.station.rx_audio(now, c);
+                // The receiver counts only the audio it was given; since the last time it was
+                // not given some (while transmitting, or lost), the receive clock is a fixed
+                // offset ahead. A burst is decoded a little after it ends, so one that ended just
+                // before a gap may come out after it, and takes the offset from before.
+                let (now_ahead, before_gap) = (self.rx_pos - self.station.rx_position(), self.before_gap);
+                let offset = |end: u64| match before_gap {
+                    Some((at, before)) if end <= at => before,
+                    _ => now_ahead,
+                };
+                for b in bursts {
                     let ok = b.payload.iter().filter(|p| p.is_some()).count();
+                    let h = b.header;
+                    let end = b.end_sample + offset(b.end_sample);
+                    self.events.push(ApiEvent::VfmBurstRx(VfmBurstRx {
+                        t: WireTime(end.saturating_sub(body_samples(self.station.modem(), &h))),
+                        t_end: WireTime(end),
+                        kind: format!("{:?}", h.kind),
+                        level: (h.ncw > 0).then_some(h.level),
+                        ncw: h.ncw,
+                        cw_ok: ok as u8,
+                        snr_db: b.snr_db,
+                        peak_dbfs: b.level.peak_dbfs,
+                    }));
                     self.log.push(format!(
                         "{now:8.2}s rx {:<10} cw {ok:>2}/{:<2} SNR {:5.1} dB  peak {:5.1} dBFS",
                         format!("{:?}", b.header.kind),
@@ -269,6 +342,11 @@ impl<S: AudioSink> RadioEngine<S> {
                         b.level.peak_dbfs
                     ));
                     self.level_warning(now, "received burst", b.level);
+                }
+                let busy = self.station.busy();
+                if busy != self.busy {
+                    self.busy = busy;
+                    self.events.push(ApiEvent::VfmBusy { t: WireTime(self.rx_pos), busy });
                 }
                 if let Some(level) = self.meter.push(c) {
                     if self.show_levels {
@@ -292,10 +370,21 @@ impl<S: AudioSink> RadioEngine<S> {
                     t.info.retry,
                     t.seconds
                 ));
+                self.events.push(ApiEvent::VfmBurstTx(VfmBurstTx {
+                    t: WireTime(self.rx_pos),
+                    kind: format!("{:?}", h.kind),
+                    level: (h.ncw > 0).then_some(h.level),
+                    ncw: h.ncw,
+                    bytes: u32::try_from(t.info.bytes).unwrap_or(u32::MAX),
+                    resent_bytes: u32::try_from(t.info.resent_bytes).unwrap_or(u32::MAX),
+                    retry: t.info.retry,
+                    air_s: t.seconds,
+                    repeat: t.repeat,
+                }));
                 self.meter.reset();
                 // Key first, then queue the audio: the leader covers the radio's key-up time.
                 if let Err(e) = self.ptt.set(true) {
-                    self.log.push(format!("{now:8.2}s PTT on failed: {e}"));
+                    self.log_warning(now, "ptt", format!("PTT on failed: {e}"));
                 }
                 let audio: Vec<f32> = t.audio.iter().map(|x| x * self.tx_gain).collect();
                 if let Some(d) = &self.record {
@@ -314,6 +403,13 @@ impl<S: AudioSink> RadioEngine<S> {
         self.out.flush();
         let _ = self.ptt.set(false);
     }
+}
+
+/// Samples of a received burst after the sender's leader, which the receiver does not see the
+/// start of: the two sync symbols, the header and the payload.
+fn body_samples(modem: &Modem, h: &Header) -> u64 {
+    let payload = if h.ncw > 0 { h.ncw as usize * modem.symbols_per_codeword(h.level) } else { 0 };
+    ((2 + modem.header_symbols() + payload) * modem.ofdm.p.symbol_len()) as u64
 }
 
 /// Run until `stop` is set. Returns an error if a device cannot be opened.
@@ -344,12 +440,40 @@ pub fn run(cfg: RadioConfig, stop: Arc<AtomicBool>) -> io::Result<()> {
     if cfg.show_levels {
         println!("  levels   : every {LEVEL_WINDOW_S} s while idle; set the radio volume so bursts peak near -6 dBFS");
     }
+    let mut monitor = cfg.api.map(|addr| Monitor::start(addr, &cfg.mode)).transpose()?;
+    if let Some(m) = &monitor {
+        let a = m.local_addr();
+        println!("  api      : http://{a}/v1/status, ws://{a}/v1/stream");
+    }
 
     let mut engine = RadioEngine::from_config(&cfg, modem, ptt, output, link_seed())?;
     while !stop.load(Ordering::Relaxed) {
         let chunk = input.rx.recv_timeout(Duration::from_millis(50)).ok();
+        if let Some(c) = &chunk {
+            engine.audio_lost(c.lost_before);
+            if let Some(m) = &mut monitor {
+                m.audio(engine.rx_samples(), c.lost_before > 0, &c.samples);
+            }
+        }
         let host_in: Vec<HostIn> = port.inbox.try_iter().collect();
-        for o in engine.step(chunk.as_deref(), host_in) {
+        let started = Instant::now();
+        let out = engine.step(chunk.as_ref().map(|c| &c.samples[..]), host_in);
+        match &mut monitor {
+            Some(m) => {
+                m.modem_step(started.elapsed());
+                m.publish(engine.events.drain(..));
+                if m.status_due() {
+                    m.publish_status(
+                        engine.rx_samples(),
+                        &engine.station.link_view(),
+                        input.overruns.load(Ordering::Acquire),
+                        input.lost_samples.load(Ordering::Relaxed),
+                    );
+                }
+            }
+            None => engine.events.clear(),
+        }
+        for o in out {
             match o {
                 HostOut::Line(l) => port.send_line(&l),
                 HostOut::Data(d) => port.send_data(&d),

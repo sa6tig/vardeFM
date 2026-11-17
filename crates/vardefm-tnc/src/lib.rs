@@ -6,9 +6,11 @@
 //! - [`simpair`]: two stations connected by a simulated FM radio link.
 //! - [`radio`]: one station on a real radio (sound card + PTT).
 //! - [`level`]: receive level meter and volume advice.
+//! - [`monitor`]: the radio's side of the read-only monitor API.
 
 pub mod host;
 pub mod level;
+pub mod monitor;
 pub mod radio;
 pub mod server;
 pub mod simpair;

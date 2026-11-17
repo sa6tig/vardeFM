@@ -11,7 +11,7 @@ use cpal::{FromSample, SampleFormat, SizedSample, Stream, StreamConfig};
 use std::collections::VecDeque;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 
 pub const RATE: u32 = 48_000;
@@ -134,10 +134,19 @@ impl Resampler {
     }
 }
 
+/// 48 kHz mono samples from the sound card.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Chunk {
+    pub samples: Vec<f32>,
+    /// Samples dropped just before these, because the reader fell behind: the audio is not
+    /// continuous from the last chunk unless this is 0.
+    pub lost_before: u64,
+}
+
 /// Capture: 48 kHz mono chunks arrive on `rx`.
 pub struct AudioIn {
     _stream: Stream,
-    pub rx: Receiver<Vec<f32>>,
+    pub rx: Receiver<Chunk>,
     pub name: String,
     /// Device rate (48000 unless resampling).
     pub device_rate: u32,
@@ -174,26 +183,34 @@ pub fn open_input(name: Option<&str>, channel: Channel) -> io::Result<AudioIn> {
 
 /// The capture callback's end of the chunk channel, counting what it has to drop.
 struct ChunkSink {
-    tx: SyncSender<Vec<f32>>,
+    tx: SyncSender<Chunk>,
     overruns: Arc<AtomicU64>,
     lost_samples: Arc<AtomicU64>,
+    /// Samples dropped since the last chunk delivered.
+    lost: u64,
 }
 
 impl ChunkSink {
-    fn new(room: usize) -> (Self, Receiver<Vec<f32>>) {
+    fn new(room: usize) -> (Self, Receiver<Chunk>) {
         let (tx, rx) = sync_channel(room);
-        let sink = Self { tx, overruns: Arc::default(), lost_samples: Arc::default() };
+        let sink = Self { tx, overruns: Arc::default(), lost_samples: Arc::default(), lost: 0 };
         (sink, rx)
     }
 
-    /// Hand over a 48 kHz chunk without waiting; if the reader has fallen behind, drop
-    /// it and count it.
-    fn deliver(&self, chunk: Vec<f32>) {
-        let n = chunk.len() as u64;
-        if self.tx.try_send(chunk).is_err() {
-            // Samples first: a reader that sees the overrun count grow then sees them all.
-            self.lost_samples.fetch_add(n, Ordering::Relaxed);
-            self.overruns.fetch_add(1, Ordering::Release);
+    /// Hand over 48 kHz samples without waiting; if the reader has fallen behind, drop
+    /// them, count them, and tell the reader with the next chunk that does arrive.
+    fn deliver(&mut self, samples: Vec<f32>) {
+        match self.tx.try_send(Chunk { samples, lost_before: self.lost }) {
+            Ok(()) => self.lost = 0,
+            Err(TrySendError::Full(c)) => {
+                let n = c.samples.len() as u64;
+                self.lost += n;
+                // Samples first: a reader that sees the overrun count grow then sees them all.
+                self.lost_samples.fetch_add(n, Ordering::Relaxed);
+                self.overruns.fetch_add(1, Ordering::Release);
+            }
+            // The reader has gone; nothing to tell.
+            Err(TrySendError::Disconnected(_)) => {}
         }
     }
 }
@@ -204,7 +221,7 @@ fn build_in<T>(
     channels: usize,
     ch: usize,
     rate: u32,
-    sink: ChunkSink,
+    mut sink: ChunkSink,
 ) -> io::Result<Stream>
 where
     T: SizedSample,
@@ -345,16 +362,20 @@ mod tests {
 
     #[test]
     fn dropped_chunks_count_their_samples() {
-        let (sink, rx) = ChunkSink::new(1);
+        let (mut sink, rx) = ChunkSink::new(1);
         sink.deliver(vec![0.0; 100]);
         sink.deliver(vec![0.0; 30]);
         sink.deliver(vec![0.0; 7]);
         assert_eq!(sink.overruns.load(Ordering::Acquire), 2);
         assert_eq!(sink.lost_samples.load(Ordering::Relaxed), 37);
-        assert_eq!(rx.try_recv().unwrap().len(), 100);
+        assert_eq!(rx.try_recv().unwrap(), Chunk { samples: vec![0.0; 100], lost_before: 0 });
         sink.deliver(vec![0.0; 5]);
-        assert_eq!(rx.try_recv().unwrap().len(), 5);
-        assert_eq!(sink.overruns.load(Ordering::Acquire), 2);
+        sink.deliver(vec![0.0; 3]);
+        // The chunk after a drop says how much is missing before it; the next one does not.
+        assert_eq!(rx.try_recv().unwrap(), Chunk { samples: vec![0.0; 5], lost_before: 37 });
+        sink.deliver(vec![0.0; 2]);
+        assert_eq!(rx.try_recv().unwrap(), Chunk { samples: vec![0.0; 2], lost_before: 3 });
+        assert_eq!(sink.overruns.load(Ordering::Acquire), 3);
     }
 
     #[test]

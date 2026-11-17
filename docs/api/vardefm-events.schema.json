@@ -27,8 +27,8 @@
       "properties": {
         "v": { "$ref": "#/$defs/v" },
         "type": { "const": "VfmBurstRx" },
-        "t": { "description": "First sample of the burst.", "$ref": "#/$defs/WireTime" },
-        "t_end": { "description": "End of the burst.", "$ref": "#/$defs/WireTime" },
+        "t": { "description": "First sample after the sender's leader: the start of the sync symbols.", "$ref": "#/$defs/WireTime" },
+        "t_end": { "description": "Just past the burst's last symbol.", "$ref": "#/$defs/WireTime" },
         "kind": { "description": "Header kind, such as `Data` or `ConnectReq`.", "type": "string" },
         "level": { "description": "Speed level of the payload; absent if the burst has no codewords.", "$ref": "#/$defs/u8" },
         "ncw": { "description": "Codewords in the burst.", "$ref": "#/$defs/u8" },

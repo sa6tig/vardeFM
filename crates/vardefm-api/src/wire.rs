@@ -203,9 +203,9 @@ pub enum CallbackPriority {
 /// A burst the receiver decoded the header of (`VfmBurstRx`).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct VfmBurstRx {
-    /// First sample of the burst.
+    /// First sample after the sender's leader: the start of the sync symbols.
     pub t: WireTime,
-    /// End of the burst.
+    /// Just past the burst's last symbol.
     pub t_end: WireTime,
     /// Header kind, such as `Data` or `ConnectReq`.
     pub kind: String,

@@ -13,4 +13,6 @@ vardefm-link.workspace = true
 vardefm-sim.workspace = true
 vardefm-audio.workspace = true
 vardefm-ptt.workspace = true
+vardefm-api.workspace = true
 [dev-dependencies]
+serde_json.workspace = true

@@ -67,6 +67,7 @@ crates/vardefm-link    ARQ link layer (connect, reliable byte stream, disconnect
 crates/vardefm-sim     FM radio channel simulator
 crates/vardefm-tnc     VARA-compatible TCP interface, station logic, sim-pair, radio engine
 crates/vardefm-audio   sound card input/output (cpal)
+crates/vardefm-api     read-only monitor API: status, events and a waterfall (docs/api)
 crates/vardefm-ptt     PTT: CM108/CM119/AIOC GPIO (after Dire Wolf), serial RTS/DTR, Hamlib rigctld, Linux GPIO
 crates/vardefm-cli     `vardefm` command-line tool
 packaging/             user guide and udev rules shipped in the release archives

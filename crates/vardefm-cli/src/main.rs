@@ -154,6 +154,10 @@ enum Cmd {
         /// called (0 to 10; for a digipeater that is slow to decode or to key up)
         #[arg(long, default_value_t = 0.5)]
         hop_margin: f64,
+        /// Serve the read-only monitor API (status, events and a waterfall) on this address, which
+        /// must be 127.0.0.1 or [::1] with a port, e.g. 127.0.0.1:8770
+        #[arg(long, value_name = "ADDR")]
+        api: Option<vardefm_tnc::radio::LoopbackAddr>,
     },
     /// Measure whether this computer decodes fast enough for each mode and speed level
     Bench {
@@ -383,6 +387,7 @@ fn main() {
             levels,
             digi,
             hop_margin,
+            api,
         } => {
             let ptt = ptt.parse().unwrap_or_else(|m: String| die(&m));
             let digi_calls = digi_calls(digi, usize::MAX);
@@ -404,6 +409,7 @@ fn main() {
                 show_levels: levels,
                 digi_calls,
                 hop_margin_s: checked_hop_margin(hop_margin),
+                api,
             };
             let stop = radio_cmds::stop_flag();
             if let Err(err) = vardefm_tnc::radio::run(cfg, stop) {

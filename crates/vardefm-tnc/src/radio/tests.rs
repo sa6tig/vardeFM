@@ -231,6 +231,7 @@ fn watchdog_unkeys_a_stuck_sound_card() {
             let held = (step - k) as f64 * 0.01;
             assert!(held < 6.0, "held PTT for {held} s");
             assert!(eng.log.iter().any(|l| l.contains("watchdog")));
+            assert!(warned(&eng, "tx_watchdog"), "{:?}", eng.events);
             return;
         }
     }
@@ -262,6 +263,7 @@ fn clipped_bursts_are_reported() {
     let rx = b.log.iter().find(|l| l.contains(" rx ")).expect("B heard nothing");
     assert!(rx.contains("dBFS"), "{rx}");
     assert!(b.notices.iter().any(|l| l.contains("clipping")), "{:?}", b.notices);
+    assert!(warned(&b, "rx_level"), "{:?}", b.events);
 }
 
 #[test]
@@ -270,6 +272,7 @@ fn good_bursts_are_not_reported() {
     let b = hear_a_call(0.5);
     assert!(b.log.iter().any(|l| l.contains(" rx ")), "B heard nothing");
     assert!(b.notices.is_empty(), "{:?}", b.notices);
+    assert!(!b.events.iter().any(|e| matches!(e, ApiEvent::Warning { .. })), "{:?}", b.events);
 }
 
 #[test]
@@ -412,4 +415,121 @@ fn bad_config_is_refused() {
     }
     let edge = RadioConfig { hop_margin_s: 10.0, max_level: 6, digi_calls: vec!["la3ddd-7".into()], ..ok() };
     assert!(engine_from(&edge).is_ok());
+}
+
+fn warned(eng: &RadioEngine<FakeOut>, code: &str) -> bool {
+    eng.events.iter().any(|e| matches!(e, ApiEvent::Warning { code: c, .. } if c == code))
+}
+
+/// A's first burst as A sent it and B heard it.
+struct Call {
+    /// Where the burst's audio starts on B's receive clock.
+    start: u64,
+    tx: VfmBurstTx,
+    rx: VfmBurstRx,
+    /// B's events.
+    events: Vec<ApiEvent>,
+    /// The step in which B decoded the burst.
+    decoded_in: usize,
+    b: RadioEngine<FakeOut>,
+}
+
+/// A calls B until B has heard A's first burst and the channel is free again. B loses
+/// `gap.1` samples of audio before its step `gap.0`.
+fn a_calls_b(gap: Option<(usize, u64)>) -> Call {
+    let cards: [Shared; 2] = [Arc::default(), Arc::default()];
+    let mut a = engine(&cards[0], 4);
+    let mut b = engine(&cards[1], 5);
+    let mut a_in = vec![HostIn::Line("MYCALL LA1AAA".into()), HostIn::Line("CONNECT LA1AAA LA2BBB".into())];
+    let mut air = vec![0.0f32; CHUNK];
+    let (mut sent, mut decoded_in) = (None, None);
+    let mut events = Vec::new();
+    for step in 0..1000 {
+        a.step(Some(&vec![0.0; CHUNK]), std::mem::take(&mut a_in));
+        if let Some((_, lost)) = gap.filter(|g| g.0 == step) {
+            b.audio_lost(lost);
+        }
+        b.step(Some(&air), Vec::new());
+        if decoded_in.is_none() && b.events.iter().any(|e| matches!(e, ApiEvent::VfmBurstRx(_))) {
+            decoded_in = Some(step);
+        }
+        events.append(&mut b.events);
+        // A's card starts playing the burst in this tick; B hears that in its next step.
+        if sent.is_none() {
+            if let Some(ApiEvent::VfmBurstTx(t)) = a.events.first() {
+                assert_eq!(t.t, WireTime(a.rx_samples()), "keyed now");
+                sent = Some((b.rx_samples(), t.clone()));
+            }
+        }
+        air = cards[0].lock().unwrap().tick();
+        let free = events.iter().rev().find_map(|e| match e {
+            ApiEvent::VfmBusy { busy, .. } => Some(!busy),
+            _ => None,
+        });
+        if decoded_in.is_some() && free == Some(true) {
+            break;
+        }
+    }
+    let (start, tx) = sent.expect("A never keyed");
+    let rx = events.iter().find_map(|e| match e {
+        ApiEvent::VfmBurstRx(r) => Some(r.clone()),
+        _ => None,
+    });
+    let rx = rx.unwrap_or_else(|| panic!("B heard nothing: {events:?}"));
+    Call { start, tx, rx, events, decoded_in: decoded_in.unwrap(), b }
+}
+
+/// A calls B, which lost audio before it heard anything. B's events give the burst's true
+/// place on its receive clock, which counts the lost audio although the receiver never saw it.
+#[test]
+fn burst_events_are_timed_on_the_receive_clock() {
+    const LOST: u64 = 12_345;
+    let mut b = engine(&Arc::default(), 5);
+    b.audio_lost(0);
+    assert!(b.events.is_empty());
+    b.audio_lost(LOST);
+    assert_eq!((b.rx_samples(), &b.events[..]), (LOST, &[ApiEvent::Gap { t: WireTime(LOST) }][..]));
+
+    let Call { start, tx, rx, events, b, .. } = a_calls_b(Some((0, LOST)));
+    assert_eq!(events[0], ApiEvent::Gap { t: WireTime(LOST) });
+    assert_eq!((tx.kind.as_str(), tx.level, tx.ncw, tx.retry, tx.repeat), ("ConnectReq", Some(0), 1, 0, false));
+    assert_eq!((rx.kind.as_str(), rx.level, rx.ncw, rx.cw_ok), ("ConnectReq", Some(0), 1, 1));
+    // The receiver places the burst after the leader to within half a cyclic prefix.
+    let p = &b.station.modem().ofdm.p;
+    let symbol = p.symbol_len() as i64;
+    let leader = (0.15 / p.symbol_duration()).ceil() as i64 * symbol;
+    let near = p.ncp as i64 / 2;
+    let end = start as i64 + (tx.air_s * RATE as f32).round() as i64;
+    let (t, t_end) = (rx.t.0 as i64, rx.t_end.0 as i64);
+    assert!((t - (start as i64 + leader)).abs() < near, "starts {} samples off", t - start as i64 - leader);
+    assert!((t_end - end).abs() < near, "ends {} samples off", t_end - end);
+
+    // The channel went busy during the burst and free after it.
+    let busy: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            ApiEvent::VfmBusy { t, busy } => Some((t.0 as i64, *busy)),
+            _ => None,
+        })
+        .collect();
+    // (The detector may let go for a moment within it, as the host's BUSY lines do.)
+    assert!(busy.iter().enumerate().all(|(i, &(_, on))| on == (i % 2 == 0)), "{busy:?}");
+    assert!(busy.windows(2).all(|w| w[0].0 < w[1].0), "{busy:?}");
+    assert!((start as i64..end).contains(&busy[0].0), "{busy:?}, burst {start}..{end}");
+    assert!(busy.last().unwrap().0 > end, "{busy:?}, burst {start}..{end}");
+}
+
+/// The receiver decodes a burst a little after it ends. Audio lost in between comes after the
+/// burst, and does not move it.
+#[test]
+fn a_gap_after_a_burst_does_not_move_it() {
+    let clean = a_calls_b(None);
+    let gap = a_calls_b(Some((clean.decoded_in, 777)));
+    assert_eq!(gap.decoded_in, clean.decoded_in);
+    assert_eq!((gap.rx.t, gap.rx.t_end), (clean.rx.t, clean.rx.t_end));
+    let at = gap.events.iter().find_map(|e| match e {
+        ApiEvent::Gap { t } => Some(*t),
+        _ => None,
+    });
+    assert!(at.is_some_and(|t| t > gap.rx.t_end), "gap at {at:?}, burst ends at {:?}", gap.rx.t_end);
 }

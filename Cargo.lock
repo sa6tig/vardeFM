@@ -1792,6 +1792,8 @@ name = "vardefm-tnc"
 version = "0.3.1"
 dependencies = [
  "hound",
+ "serde_json",
+ "vardefm-api",
  "vardefm-audio",
  "vardefm-dsp",
  "vardefm-link",
