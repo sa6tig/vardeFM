@@ -1124,3 +1124,33 @@ fn digipeater_carries_its_own_session_while_relaying() {
         assert!(net.nodes[d].node.repeats() >= 4, "seed {seed}: {} repeats", net.nodes[d].node.repeats());
     }
 }
+
+#[test]
+fn view_follows_a_session_from_call_to_close() {
+    let mut net = Net::new(31, 0.0, 0.0);
+    let b = net.b();
+    assert_eq!(net.nodes[A].node.link.view(), LinkView::default());
+    assert_eq!(net.nodes[b].node.link.view().state, LinkState::Listening);
+
+    net.nodes[A].node.link.connect(0.0, "LA1AAA", "LA2BBB-1", &[]).unwrap();
+    let calling = net.nodes[A].node.link.view();
+    assert_eq!(
+        (calling.state, calling.peer.as_deref(), calling.level),
+        (LinkState::Connecting, Some("LA2BBB-1"), None)
+    );
+
+    net.run_until(60.0, |n| n.both_connected());
+    let (va, vb) = (net.nodes[A].node.link.view(), net.nodes[b].node.link.view());
+    assert_eq!((va.state, va.peer.as_deref()), (LinkState::Connected, Some("LA2BBB-1")));
+    assert_eq!((vb.state, vb.peer.as_deref()), (LinkState::Connected, Some("LA1AAA")));
+    assert!(va.level.is_some() && vb.level.is_some());
+
+    net.nodes[A].node.link.send_data(&data(5000, 31));
+    assert_eq!(net.nodes[A].node.link.view().tx_queued, 5000);
+    net.nodes[A].node.link.disconnect(net.now);
+    assert_eq!(net.nodes[A].node.link.view().state, LinkState::Disconnecting);
+
+    net.run_until(300.0, |n| n.both_idle());
+    assert_eq!(net.nodes[A].node.link.view(), LinkView::default());
+    assert_eq!(net.nodes[b].node.link.view().state, LinkState::Listening);
+}

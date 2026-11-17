@@ -143,6 +143,9 @@ pub struct AudioIn {
     pub device_rate: u32,
     /// Chunks dropped because the receiver fell behind.
     pub overruns: Arc<AtomicU64>,
+    /// Samples (at 48 kHz) in those dropped chunks. Updated before `overruns`, so
+    /// after reading `overruns` with `Acquire` this covers at least those chunks.
+    pub lost_samples: Arc<AtomicU64>,
 }
 
 pub fn open_input(name: Option<&str>, channel: Channel) -> io::Result<AudioIn> {
@@ -155,19 +158,44 @@ pub fn open_input(name: Option<&str>, channel: Channel) -> io::Result<AudioIn> {
         Channel::Right if channels > 1 => 1,
         _ => 0,
     };
-    let (tx, rx) = sync_channel(256);
-    let overruns = Arc::new(AtomicU64::new(0));
+    let (sink, rx) = ChunkSink::new(256);
+    let (overruns, lost_samples) = (sink.overruns.clone(), sink.lost_samples.clone());
     let stream_cfg: StreamConfig = cfg.config();
-    let o = overruns.clone();
     let stream = match cfg.sample_format() {
-        SampleFormat::F32 => build_in::<f32>(&dev, &stream_cfg, channels, ch, device_rate, tx, o),
-        SampleFormat::I16 => build_in::<i16>(&dev, &stream_cfg, channels, ch, device_rate, tx, o),
-        SampleFormat::I32 => build_in::<i32>(&dev, &stream_cfg, channels, ch, device_rate, tx, o),
-        SampleFormat::U16 => build_in::<u16>(&dev, &stream_cfg, channels, ch, device_rate, tx, o),
+        SampleFormat::F32 => build_in::<f32>(&dev, &stream_cfg, channels, ch, device_rate, sink),
+        SampleFormat::I16 => build_in::<i16>(&dev, &stream_cfg, channels, ch, device_rate, sink),
+        SampleFormat::I32 => build_in::<i32>(&dev, &stream_cfg, channels, ch, device_rate, sink),
+        SampleFormat::U16 => build_in::<u16>(&dev, &stream_cfg, channels, ch, device_rate, sink),
         f => return Err(err(format!("unsupported sample format {f:?}"))),
     }?;
     stream.play().map_err(err)?;
-    Ok(AudioIn { _stream: stream, rx, name: dev.to_string(), device_rate, overruns })
+    Ok(AudioIn { _stream: stream, rx, name: dev.to_string(), device_rate, overruns, lost_samples })
+}
+
+/// The capture callback's end of the chunk channel, counting what it has to drop.
+struct ChunkSink {
+    tx: SyncSender<Vec<f32>>,
+    overruns: Arc<AtomicU64>,
+    lost_samples: Arc<AtomicU64>,
+}
+
+impl ChunkSink {
+    fn new(room: usize) -> (Self, Receiver<Vec<f32>>) {
+        let (tx, rx) = sync_channel(room);
+        let sink = Self { tx, overruns: Arc::default(), lost_samples: Arc::default() };
+        (sink, rx)
+    }
+
+    /// Hand over a 48 kHz chunk without waiting; if the reader has fallen behind, drop
+    /// it and count it.
+    fn deliver(&self, chunk: Vec<f32>) {
+        let n = chunk.len() as u64;
+        if self.tx.try_send(chunk).is_err() {
+            // Samples first: a reader that sees the overrun count grow then sees them all.
+            self.lost_samples.fetch_add(n, Ordering::Relaxed);
+            self.overruns.fetch_add(1, Ordering::Release);
+        }
+    }
 }
 
 fn build_in<T>(
@@ -176,8 +204,7 @@ fn build_in<T>(
     channels: usize,
     ch: usize,
     rate: u32,
-    tx: SyncSender<Vec<f32>>,
-    overruns: Arc<AtomicU64>,
+    sink: ChunkSink,
 ) -> io::Result<Stream>
 where
     T: SizedSample,
@@ -195,9 +222,7 @@ where
                     None => out.push(x),
                 }
             }
-            if tx.try_send(out).is_err() {
-                overruns.fetch_add(1, Ordering::Relaxed);
-            }
+            sink.deliver(out);
         },
         |e| eprintln!("audio input error: {e}"),
         None,
@@ -317,6 +342,20 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropped_chunks_count_their_samples() {
+        let (sink, rx) = ChunkSink::new(1);
+        sink.deliver(vec![0.0; 100]);
+        sink.deliver(vec![0.0; 30]);
+        sink.deliver(vec![0.0; 7]);
+        assert_eq!(sink.overruns.load(Ordering::Acquire), 2);
+        assert_eq!(sink.lost_samples.load(Ordering::Relaxed), 37);
+        assert_eq!(rx.try_recv().unwrap().len(), 100);
+        sink.deliver(vec![0.0; 5]);
+        assert_eq!(rx.try_recv().unwrap().len(), 5);
+        assert_eq!(sink.overruns.load(Ordering::Acquire), 2);
+    }
 
     #[test]
     fn resampler_keeps_a_tone() {
