@@ -50,6 +50,8 @@ const MIN_PREAMBLE_CORR: f32 = 0.3;
 /// noise scale. Normal symbols almost never get there (the per-symbol estimate averages
 /// 18-24 real noise samples).
 const SCALE_THRESHOLD: f32 = 2.0;
+/// Passes of the noise model's fit (per-symbol scale, then per-pilot variance).
+const NOISE_FIT_PASSES: usize = 5;
 /// TX low-pass cutoff relative to the top carrier frequency.
 const TX_LOWPASS_FACTOR: f32 = 1.15;
 /// Clip-and-filter passes before the final clamp.
@@ -451,13 +453,17 @@ impl Ofdm {
             .collect();
 
         // Noise per data carrier, interpolated from the pilots, plus the noise of the
-        // channel estimate.
+        // channel estimate. The interpolation is geometric (linear in dB): at the low
+        // edge of the wide band the noise falls about 20-fold over the first pilot gap,
+        // and linear interpolation of such a convex profile overstated it on the
+        // carriers in between by up to 4 times (`noise_calib` in vardefm-modem).
         let raw_var: Vec<f32> = self
             .data_idx
             .iter()
             .map(|&k| {
                 let (m, t) = self.pilot_pos(k);
-                (pilot_var[m] * (1.0 - t) + pilot_var[m + 1] * t) * (1.0 + est_noise)
+                let (a, b) = (pilot_var[m].max(1e-12), pilot_var[m + 1].max(1e-12));
+                a * (b / a).powf(t) * (1.0 + est_noise)
             })
             .collect();
         let noise_var: Vec<f32> = raw_var.iter().map(|v| v.max(1e-6)).collect();
@@ -672,23 +678,40 @@ fn robust_reference(e: &[f32]) -> f32 {
 /// typical level: with 9-12 pilots per symbol the estimate is noisy, and the point is
 /// to catch symbols hit by a click, not to fine-tune the rest. (Scaling every symbol by
 /// `max(1, e/mean)` cost a little at the 64QAM levels.)
+///
+/// The two halves are fitted in turn, `NOISE_FIT_PASSES` times. The first per-pilot
+/// variance includes the click-hit symbols at full weight, so the pilots where clicks
+/// land (mid-band, under fast fading) look noisy in every symbol, and a click there
+/// stands out less than it should. With one pass (and geometric interpolation), wide
+/// mode at 80 Hz Doppler underpredicted the noisiest symbols mid-band 2.6-3.6 times;
+/// with five, 1.3-1.8 times (`noise_calib` in vardefm-modem). In the lowest quarter
+/// of the band, where those symbols were already overpredicted, more so: 0.33 times
+/// the measured noise became 0.11. On Rayleigh channels it lost fewer codewords
+/// (`fading_cer`).
 fn noise_model(dev: &[Vec<f32>]) -> (Vec<f32>, Vec<f32>) {
+    noise_model_passes(dev, NOISE_FIT_PASSES)
+}
+
+/// [`noise_model`] with `passes` passes of the fit.
+fn noise_model_passes(dev: &[Vec<f32>], passes: usize) -> (Vec<f32>, Vec<f32>) {
     let nsym = dev.len();
     let np = dev.first().map_or(0, |d| d.len());
     let per_pilot = |scale: &[f32]| -> Vec<f32> {
         (0..np).map(|m| dev.iter().zip(scale).map(|(d, s)| d[m] / s).sum::<f32>() / nsym.max(1) as f32).collect()
     };
-    let ones = vec![1.0; nsym];
-    let var = per_pilot(&ones);
+    let mut scale = vec![1.0; nsym];
+    let mut var = per_pilot(&scale);
     if nsym < 3 {
-        return (ones, var);
+        return (scale, var);
     }
-    // Noise energy per symbol, each pilot relative to its own average.
-    let e: Vec<f32> =
-        dev.iter().map(|d| d.iter().zip(&var).map(|(x, v)| x / v.max(1e-12)).sum::<f32>() / np as f32).collect();
-    let reference = robust_reference(&e);
-    let scale: Vec<f32> = e.iter().map(|x| x / reference).map(|r| if r > SCALE_THRESHOLD { r } else { 1.0 }).collect();
-    let var = per_pilot(&scale);
+    for _ in 0..passes {
+        // Noise energy per symbol, each pilot relative to its own average.
+        let e: Vec<f32> =
+            dev.iter().map(|d| d.iter().zip(&var).map(|(x, v)| x / v.max(1e-12)).sum::<f32>() / np as f32).collect();
+        let reference = robust_reference(&e);
+        scale = e.iter().map(|x| x / reference).map(|r| if r > SCALE_THRESHOLD { r } else { 1.0 }).collect();
+        var = per_pilot(&scale);
+    }
     (scale, var)
 }
 
@@ -718,6 +741,76 @@ mod tests {
         assert!(frame.snr_db > 30.0, "snr {}", frame.snr_db);
         // No symbols is not a frame (the noise model would have no pilots to fit).
         assert!(ofdm.demodulate(&rx, b, 0).is_none());
+    }
+
+    /// A click on the middle pilots of one symbol in twenty: the symbol gets a large
+    /// scale, and the passes take its energy out of those pilots' variance (one pass
+    /// leaves them about twice their clean level, five about 1.1 times).
+    #[test]
+    fn noise_fit_passes_take_a_click_out_of_the_pilot_variance() {
+        let (nsym, np, hit) = (20, 12, 10);
+        let base: Vec<f32> = (0..np).map(|m| 0.01 * (1.0 + m as f32)).collect();
+        let mid = 4..8;
+        let dev: Vec<Vec<f32>> = (0..nsym)
+            .map(|i| (0..np).map(|m| if i == hit && mid.contains(&m) { 201.0 * base[m] } else { base[m] }).collect())
+            .collect();
+        let excess = |var: &[f32]| mid.clone().map(|m| var[m] / base[m]).fold(0f32, f32::max);
+        let (scale1, var1) = noise_model_passes(&dev, 1);
+        let (scale, var) = noise_model(&dev);
+        for s in [&scale1, &scale] {
+            assert!(s[hit] > SCALE_THRESHOLD, "scales {s:?}");
+            assert!(s.iter().enumerate().all(|(i, &x)| i == hit || x == 1.0), "scales {s:?}");
+        }
+        assert!(excess(&var1) > 1.5, "one pass: {:.2}", excess(&var1));
+        assert!(excess(&var) < 1.2, "{NOISE_FIT_PASSES} passes: {:.2}", excess(&var));
+        // Pilots the click missed keep their clean variance, less the click-hit
+        // symbol's share: the fit divides all its pilots by its scale (19/20 here).
+        for m in (0..np).filter(|m| !mid.contains(m)) {
+            assert!((var[m] / base[m] - 1.0).abs() < 0.06, "pilot {m}: {}", var[m] / base[m]);
+        }
+    }
+
+    /// Noise that falls 20-fold across the first pilot gap (exponentially, flat after
+    /// it), as at the low edge of the wide band: the noise predicted for the data
+    /// carriers in that gap matches the measured noise (0.93-1.24 here). Interpolated
+    /// linearly between the pilots it was overstated, 1.61 times on carrier 2.
+    #[test]
+    fn noise_follows_a_steep_tilt_between_pilots() {
+        let ofdm = Ofdm::new(OfdmParams::wide());
+        let nsym = 80;
+        let data = random_frame(&ofdm, Modulation::Qpsk, nsym, 3);
+        let mut rx = vec![0.0; 1000];
+        rx.extend(ofdm.modulate(&data));
+        rx.extend(vec![0.0; 2000]);
+        let b = ofdm.detect(&rx, 0).expect("frame not detected");
+
+        // Noise symbols aligned with the data symbols, so each FFT window sees one of
+        // them whole: carrier k gets variance 2 * gain[k]^2 times the noise scale.
+        let gap = ofdm.pilot_idx[1] - ofdm.pilot_idx[0];
+        let power = |k: usize| 20f32.powf(1.0 - (k.min(gap) as f32 / gap as f32));
+        let gain: Vec<f32> = (0..ofdm.p.num_carriers).map(|k| power(k).sqrt()).collect();
+        let l = ofdm.p.symbol_len();
+        let mut rng = Prng::new(7);
+        let mut noise = Vec::new();
+        for _ in 0..nsym {
+            let c: Vec<Complex32> = gain.iter().map(|&g| Complex32::new(rng.bpsk(), rng.bpsk()) * g).collect();
+            noise.extend(ofdm.symbol_time(&c));
+        }
+        let g = 0.02 * rms(&rx[b + l..b + (nsym + 1) * l]) / rms(&noise);
+        for (x, n) in rx[b + l..].iter_mut().zip(&noise) {
+            *x += g * n;
+        }
+
+        let f = ofdm.demodulate(&rx, b, nsym).expect("demod failed");
+        // Symbols the fit scaled up (a few, by chance) are left out on both sides.
+        let clean: Vec<usize> = (0..nsym).filter(|&i| f.symbol_noise_scale[i] == 1.0).collect();
+        assert!(clean.len() > nsym * 9 / 10, "scales {:?}", f.symbol_noise_scale);
+        for (j, &k) in ofdm.data_idx.iter().enumerate().take_while(|&(_, &k)| k < ofdm.pilot_idx[1]) {
+            let measured =
+                clean.iter().map(|&i| (f.symbols[i][j] - data[i][j]).norm_sqr()).sum::<f32>() / clean.len() as f32;
+            let ratio = f.noise_var[j] / measured;
+            assert!((0.7..1.4).contains(&ratio), "carrier {k}: predicted / measured {ratio:.2}");
+        }
     }
 
     #[test]

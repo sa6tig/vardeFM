@@ -75,21 +75,26 @@ pub(crate) fn header_at(m: &Modem, rx: &[f32], b: usize) -> Option<Header> {
     m.ofdm.demodulate(rx, b, m.header_symbols()).and_then(|f| m.decode_header(&f))
 }
 
-/// Whether the burst at `b`, whose header `h` has decoded, is the one sent: header
-/// equal and every codeword decoded and equal, with the header as channel training
-/// as in `Receiver::step`.
-fn burst_ok(m: &Modem, rx: &[f32], b: usize, h: &Header, sent: &Burst) -> bool {
-    if *h != sent.header {
-        return false;
-    }
+/// Codewords of `sent` that fail to decode from the burst whose preamble B starts at
+/// `b`, with the sent header's carriers as channel training, as in `Receiver::step`
+/// once the header has decoded. All of them when the burst cannot be demodulated.
+pub(crate) fn codeword_errors(m: &Modem, rx: &[f32], b: usize, sent: &Burst) -> u32 {
+    let h = &sent.header;
     if h.ncw == 0 {
-        return true;
+        return 0;
     }
     let nsym = m.header_symbols() + h.ncw as usize * m.symbols_per_codeword(h.level);
     let Some(frame) = m.ofdm.demodulate_known(rx, b, nsym, &m.header_carriers(h)) else {
-        return false;
+        return h.ncw as u32;
     };
-    m.decode_payload(h, &frame).into_iter().zip(&sent.payload).all(|(got, want)| got.as_ref() == Some(want))
+    let got = m.decode_payload(h, &frame);
+    got.iter().zip(&sent.payload).filter(|(g, w)| g.as_ref() != Some(*w)).count() as u32
+}
+
+/// Whether the burst at `b`, whose header `h` has decoded, is the one sent: header
+/// equal and every codeword decoded and equal.
+fn burst_ok(m: &Modem, rx: &[f32], b: usize, h: &Header, sent: &Burst) -> bool {
+    *h == sent.header && codeword_errors(m, rx, b, sent) == 0
 }
 
 /// What the receiver makes of one recording with a given detector.
@@ -154,7 +159,14 @@ pub(crate) fn through_channel(m: &Modem, mode: &str, cnr: f32, sent: &Burst, t: 
 }
 
 /// [`through_channel`] with flat fading (`cnr` is then the mean CNR).
-fn through_channel_with(m: &Modem, mode: &str, cnr: f32, fading: Option<Fading>, sent: &Burst, t: u32) -> Vec<f32> {
+pub(crate) fn through_channel_with(
+    m: &Modem,
+    mode: &str,
+    cnr: f32,
+    fading: Option<Fading>,
+    sent: &Burst,
+    t: u32,
+) -> Vec<f32> {
     let cfg = FmChannelConfig {
         cnr_db: Some(cnr),
         fading,
