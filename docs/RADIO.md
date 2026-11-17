@@ -170,8 +170,8 @@ VardeFM.
 ## 6. Watching the modem
 
 `--api 127.0.0.1:8770` serves a read-only monitor API on that address: counters once a
-second, every burst sent and heard, busy changes, warnings and a waterfall of the received
-audio. It listens on the local computer only. [api/README.md](api/README.md) describes it.
+second, every burst sent and heard, busy changes, warnings, the constellation of each
+received burst and a waterfall of the received audio. It listens on the local computer only. [api/README.md](api/README.md) describes it.
 
 ## 7. What is not done yet
 

@@ -223,6 +223,17 @@ fn a_stream_opens_with_hello_and_status_then_carries_events_status_and_rows() {
     let (header, payload) = StreamHeader::decode(&frame).unwrap();
     assert_eq!(header, StreamHeader { stream: STREAM_WATERFALL, format: FORMAT_WATERFALL_U8, seq: 5, t_low: 7 });
     assert_eq!(payload, [1, 2, 3]);
+
+    // Other frames share the rows' queue, in order.
+    let other = StreamHeader::vfm_constellation(1, WireTime(9)).encode();
+    s.publish_frame([&other[..], &[4, 5]].concat());
+    s.publish_row(&WaterfallRow { seq: 6, t: 10, bins: vec![6] });
+    let next = |ws: &mut WebSocket<TcpStream>| match ws.read().unwrap() {
+        Message::Binary(frame) => frame,
+        m => panic!("{m:?}"),
+    };
+    assert_eq!(next(&mut ws)[..], [&other[..], &[4, 5]].concat()[..]);
+    assert_eq!(StreamHeader::decode(&next(&mut ws)).unwrap().0.seq, 6);
 }
 
 #[test]

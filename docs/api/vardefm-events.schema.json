@@ -20,6 +20,7 @@
       "minimum": 0
     },
     "u8": { "type": "integer", "minimum": 0, "maximum": 255 },
+    "u16": { "type": "integer", "minimum": 0, "maximum": 65535 },
     "u32": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
     "VfmBurstRx": {
       "description": "A burst received.",
@@ -66,6 +67,17 @@
         "busy": { "description": "Busy now.", "type": "boolean" }
       },
       "required": ["v", "type", "t", "busy"]
+    },
+    "VfmConstellationFormat": {
+      "description": "Not a message: the `vfm_constellation` key vardeFM adds to the shared `Hello`, describing its constellation frames. Each is a binary frame with the shared 8-byte header (stream `stream`, format `format`, `t_low` the burst's `t` as in its `VfmBurstRx`), then 8 bytes: level, codewords, scale, bits per symbol, points (u16 LE), data carriers, 0; then per point the in-phase and quadrature values (i8, 1.0 = `scale`) and the carrier index (u8). A client skips binary frames whose stream id it does not know.",
+      "type": "object",
+      "properties": {
+        "stream": { "description": "Stream id the frames carry.", "$ref": "#/$defs/u8" },
+        "format": { "description": "Payload format the frames carry.", "$ref": "#/$defs/u8" },
+        "scale": { "description": "The value of 1.0 in a point.", "$ref": "#/$defs/u8" },
+        "max_points": { "description": "Most points in a frame.", "$ref": "#/$defs/u16" }
+      },
+      "required": ["stream", "format", "scale", "max_points"]
     }
   }
 }

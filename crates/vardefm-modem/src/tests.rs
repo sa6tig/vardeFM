@@ -416,3 +416,59 @@ fn a_non_finite_sample_does_not_hide_a_burst() {
         }
     }
 }
+
+/// Every point of the constellation of `m`.
+fn grid(m: Modulation) -> Vec<Complex32> {
+    let n = m.bits_per_symbol();
+    (0..1usize << n).map(|w| m.map(&(0..n).map(|i| (w >> (n - 1 - i) & 1) as u8).collect::<Vec<_>>())).collect()
+}
+
+#[test]
+fn kept_symbols_are_the_payloads_constellation() {
+    for mode in ["narrow", "wide"] {
+        let m = modem(mode);
+        let mut ack = burst(0, 0, 1);
+        ack.header.kind = Kind::DiscAck;
+        let mut audio = vec![0.0; 3000];
+        for (level, ncw) in [(0, 1), (3, 2), (5, 2)] {
+            audio.extend(m.modulate(&ack));
+            audio.extend(vec![0.0; 7000]);
+            audio.extend(m.modulate(&burst(level, ncw, level as u32 + 7)));
+            audio.extend(vec![0.0; 7000]);
+        }
+        let mut rx = Receiver::new(m.clone());
+        assert!(rx.take_symbols().is_empty());
+        rx.keep_symbols(true);
+        let got = receive(&mut rx, &audio);
+        let kept = rx.take_symbols();
+        assert!(rx.take_symbols().is_empty(), "taken once");
+        // Six bursts, but the acks have no payload.
+        assert_eq!(got.len(), 6, "{mode}");
+        let data: Vec<&RxBurst> = got.iter().filter(|b| b.header.ncw > 0).collect();
+        assert_eq!(kept.len(), data.len(), "{mode}");
+        for (k, b) in kept.iter().zip(data) {
+            let level = b.header.level;
+            assert_eq!(k.end_sample, b.end_sample);
+            assert_eq!(k.symbols.len(), b.header.ncw as usize * m.symbols_per_codeword(level), "{mode} level {level}");
+            let grid = grid(LEVELS[level as usize].modulation);
+            let d: Vec<f32> = k
+                .symbols
+                .iter()
+                .flatten()
+                .map(|y| grid.iter().map(|g| (y - g).norm()).fold(f32::INFINITY, f32::min))
+                .collect();
+            let rms = (d.iter().map(|d| d * d).sum::<f32>() / d.len() as f32).sqrt();
+            // Small next to the grid's spacing. Not zero even with no noise: the wide mode's
+            // louder levels clip in the transmitter, which spreads the points.
+            let spacing = grid.iter().flat_map(|a| grid.iter().map(move |b| (a - b).norm())).filter(|&x| x > 0.0);
+            let spacing = spacing.fold(f32::INFINITY, f32::min);
+            assert!(rms < spacing / 8.0, "{mode} level {level}: rms error {rms}, grid spacing {spacing}");
+        }
+
+        let mut rx = Receiver::new(m.clone());
+        rx.keep_symbols(true);
+        rx.keep_symbols(false);
+        assert_eq!(receive(&mut rx, &audio).len(), 6);
+        assert!(rx.take_symbols().is_empty(), "{mode}: kept while off");
+    }
+}

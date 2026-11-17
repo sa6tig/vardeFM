@@ -26,7 +26,8 @@ use tungstenite::{Bytes, Message, Utf8Bytes, WebSocket};
 pub const RECENT: usize = 64;
 /// Events held for each stream client; the radio reports a few per second.
 pub const EVENT_ROOM: usize = 256;
-/// Waterfall rows held for each stream client: 3.2 s at 10 rows per second.
+/// Binary frames held for each stream client: 3.2 s of waterfall rows at 10 a second, fewer
+/// when constellation frames are among them.
 pub const ROW_ROOM: usize = 32;
 /// Longest message or frame taken from a client, in bytes. Any message closes the stream with
 /// code 1008; a longer one is not read, and drops the connection without that code.
@@ -164,12 +165,19 @@ impl ApiServer {
         });
     }
 
-    /// Sends a waterfall row to the stream clients as a binary frame. A client whose outbox is
-    /// full does not get it, and [`client_rows_dropped`](Self::client_rows_dropped) counts it.
+    /// Sends a waterfall row to the stream clients as a binary frame, as
+    /// [`publish_frame`](Self::publish_frame) does.
     pub fn publish_row(&self, row: &WaterfallRow) {
         let mut frame = Vec::with_capacity(StreamHeader::LEN + row.bins.len());
         frame.extend_from_slice(&StreamHeader::waterfall(row.seq, WireTime(row.t)).encode());
         frame.extend_from_slice(&row.bins);
+        self.publish_frame(frame);
+    }
+
+    /// Sends a binary frame (a [`StreamHeader`] and its payload) to the stream clients, in the
+    /// same queue as the waterfall rows. A client whose queue is full does not get it, and
+    /// [`client_rows_dropped`](Self::client_rows_dropped) counts it.
+    pub fn publish_frame(&self, frame: Vec<u8>) {
         let frame = Bytes::from(frame);
         let dropped = &self.shared.client_rows_dropped;
         self.each_client(|o| {
@@ -181,7 +189,7 @@ impl ApiServer {
         });
     }
 
-    /// Rows lost so far to slow clients, over all clients.
+    /// Binary frames (rows and others) lost so far to slow clients, over all clients.
     pub fn client_rows_dropped(&self) -> u64 {
         self.shared.client_rows_dropped.load(Ordering::Relaxed)
     }
