@@ -8,7 +8,7 @@ cannot reach it through the browser.
 - `GET /v1/status`: the latest `Status`, the last 64 shared events (`recent`) and the last 64
   vardeFM events (`vfm_recent`), as JSON ([status.schema.json](status.schema.json)).
 - `/v1/stream` (WebSocket): `Hello`, then the latest `Status`, then events and a `Status` every
-  second as JSON text, and waterfall rows as binary frames. Each text message is one envelope
+  second as JSON text, and waterfall rows and constellations as binary frames. Each text message is one envelope
   ([envelope.schema.json](envelope.schema.json)). The stream is read-only: a message from the
   client closes it. At most 8 clients.
 
@@ -44,6 +44,25 @@ Ten rows a second. Each row is the spectrum of 4096 samples (Hann window), one b
 row's sequence number mod 65536, the low 32 bits of its first sample, little-endian) followed by
 the bins. After a `Gap` the next row starts at the first sample after it.
 
+## Constellations
+
+Each received burst with a payload is followed by a binary frame on stream 2 holding its
+equalized payload symbols, so a client can draw the burst's constellation. `Hello` describes
+the frames in `vfm_constellation` (stream, format, scale, most points per frame), a key a
+client of the shared messages ignores. A client skips binary frames whose stream id it does not
+know.
+
+The frame starts with the same 8-byte header as a waterfall row; its `t_low` is the burst's `t`,
+as in its `VfmBurstRx`. Then come 8 bytes: speed level, codewords, scale (the value of 1.0,
+48), bits per symbol (1 BPSK, 2 QPSK, 4 16QAM, 6 64QAM), point count (`u16` little-endian),
+data carriers per OFDM symbol, and 0. Then 3 bytes per point: in-phase and quadrature as `i8`
+(divide by the scale; a constellation has unit mean energy, so 64QAM's outer points sit at
+1.08) and the carrier, counted from the lowest of the mode's carriers, pilots included.
+
+The points are whole OFDM symbols in order. A burst with more than 2048 points keeps every
+k-th symbol, so every carrier stays in view. The symbols are copied out of the receiver only
+while `--api` is on.
+
 ## Status fields vardeFM does not fill
 
 These are part of the shared `Status`, and vardeFM always sends them as 0 (or `unknown`):
@@ -62,4 +81,5 @@ queueing them for the clients, each as a percentage of the audio received in the
 commands and data, runs the receiver and the link, and, when a burst starts, scales its audio and
 with `--record` writes it to disk, so with `--record` a long step can be disk time. `overruns` and
 `dropped_frames` count the audio chunks, and their samples, dropped because the modem fell
-behind; `gaps` counts the `Gap`s sent.
+behind; `gaps` counts the `Gap`s sent. `client_rows_dropped` counts every binary frame a slow
+client missed, constellations included: they share the waterfall's queue of 32 frames.

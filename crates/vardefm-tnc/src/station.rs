@@ -6,7 +6,7 @@
 use crate::host::{parse, Command};
 use std::sync::Arc;
 use vardefm_link::{Link, LinkConfig, LinkEvent, LinkView, Node, TxInfo};
-use vardefm_modem::{Header, Modem, Receiver, RxBurst};
+use vardefm_modem::{Header, Modem, Receiver, RxBurst, RxSymbols};
 
 /// Output for the host application.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -181,6 +181,16 @@ impl Station {
     /// Where the link stands, for monitoring.
     pub fn link_view(&self) -> LinkView {
         self.node.link.view()
+    }
+
+    /// Keep the payload symbols of received bursts, for a constellation view (off by default).
+    pub fn keep_symbols(&mut self, on: bool) {
+        self.rx.keep_symbols(on);
+    }
+
+    /// The payload symbols kept since the last call, oldest first; see [`Receiver::take_symbols`].
+    pub fn take_symbols(&mut self) -> Vec<RxSymbols> {
+        self.rx.take_symbols()
     }
 
     /// Received audio. Returns any bursts decoded (for logging).

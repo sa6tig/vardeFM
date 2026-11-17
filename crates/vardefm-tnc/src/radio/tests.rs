@@ -429,17 +429,22 @@ struct Call {
     rx: VfmBurstRx,
     /// B's events.
     events: Vec<ApiEvent>,
+    /// B's constellation frames.
+    constellations: Vec<Vec<u8>>,
     /// The step in which B decoded the burst.
     decoded_in: usize,
     b: RadioEngine<FakeOut>,
 }
 
 /// A calls B until B has heard A's first burst and the channel is free again. For each
-/// `(step, n)` in `gaps`, B loses `n` samples of audio before its step `step`.
-fn a_calls_b(gaps: &[(usize, u64)]) -> Call {
+/// `(step, n)` in `gaps`, B loses `n` samples of audio before its step `step`. B keeps the
+/// symbols it receives if `keep`.
+fn a_calls_b(gaps: &[(usize, u64)], keep: bool) -> Call {
     let cards: [Shared; 2] = [Arc::default(), Arc::default()];
     let mut a = engine(&cards[0], 4);
     let mut b = engine(&cards[1], 5);
+    b.station.keep_symbols(keep);
+    let mut constellations = Vec::new();
     let mut a_in = vec![HostIn::Line("MYCALL LA1AAA".into()), HostIn::Line("CONNECT LA1AAA LA2BBB".into())];
     let mut air = vec![0.0f32; CHUNK];
     let (mut sent, mut decoded_in) = (None, None);
@@ -454,6 +459,7 @@ fn a_calls_b(gaps: &[(usize, u64)]) -> Call {
             decoded_in = Some(step);
         }
         events.append(&mut b.events);
+        constellations.append(&mut b.constellations);
         // A's card starts playing the burst in this tick; B hears that in its next step.
         if sent.is_none() {
             if let Some(ApiEvent::VfmBurstTx(t)) = a.events.first() {
@@ -476,7 +482,7 @@ fn a_calls_b(gaps: &[(usize, u64)]) -> Call {
         _ => None,
     });
     let rx = rx.unwrap_or_else(|| panic!("B heard nothing: {events:?}"));
-    Call { start, tx, rx, events, decoded_in: decoded_in.unwrap(), b }
+    Call { start, tx, rx, events, constellations, decoded_in: decoded_in.unwrap(), b }
 }
 
 /// A calls B, which lost audio before it heard anything. B's events give the burst's true
@@ -490,7 +496,7 @@ fn burst_events_are_timed_on_the_receive_clock() {
     b.audio_lost(LOST);
     assert_eq!((b.rx_samples(), &b.events[..]), (LOST, &[ApiEvent::Gap { t: WireTime(LOST) }][..]));
 
-    let Call { start, tx, rx, events, b, .. } = a_calls_b(&[(0, LOST)]);
+    let Call { start, tx, rx, events, b, .. } = a_calls_b(&[(0, LOST)], false);
     assert_eq!(events[0], ApiEvent::Gap { t: WireTime(LOST) });
     assert_eq!((tx.kind.as_str(), tx.level, tx.ncw, tx.retry, tx.repeat), ("ConnectReq", Some(0), 1, 0, false));
     assert_eq!((rx.kind.as_str(), rx.level, rx.ncw, rx.cw_ok), ("ConnectReq", Some(0), 1, 1));
@@ -524,10 +530,10 @@ fn burst_events_are_timed_on_the_receive_clock() {
 /// after the burst and does not move it.
 #[test]
 fn gaps_after_a_burst_do_not_move_it() {
-    let clean = a_calls_b(&[]);
+    let clean = a_calls_b(&[], false);
     let n = clean.decoded_in;
     for gaps in [&[(n, 777)][..], &[(n - 1, 500), (n, 777)]] {
-        let gap = a_calls_b(gaps);
+        let gap = a_calls_b(gaps, false);
         assert_eq!(gap.decoded_in, n);
         assert_eq!((gap.rx.t, gap.rx.t_end), (clean.rx.t, clean.rx.t_end), "gaps {gaps:?}");
         let at: Vec<_> = gap
@@ -541,4 +547,35 @@ fn gaps_after_a_burst_do_not_move_it() {
         assert_eq!(at.len(), gaps.len());
         assert!(at.iter().all(|&t| t > gap.rx.t_end), "gaps at {at:?}, burst ends at {:?}", gap.rx.t_end);
     }
+}
+
+/// With symbols kept, B sends the constellation of A's burst, timed as its `VfmBurstRx`, in
+/// spite of audio lost before it; without, none.
+#[test]
+fn a_received_burst_has_its_constellation() {
+    use vardefm_api::constellation::{ConstellationFrame, MAX_POINTS, SCALE, STREAM_VFM_CONSTELLATION};
+    use vardefm_api::wire::StreamHeader;
+
+    let call = a_calls_b(&[(0, 4321)], true);
+    assert_eq!(call.constellations.len(), 1);
+    let (header, payload) = StreamHeader::decode(&call.constellations[0]).unwrap();
+    assert_eq!((header.stream, header.seq, header.t_low), (STREAM_VFM_CONSTELLATION, 0, call.rx.t.0 as u32));
+    let f = ConstellationFrame::decode(payload).unwrap();
+    let modem = call.b.station.modem();
+    let carriers = modem.ofdm.data_carriers();
+    assert_eq!((f.level, f.ncw, f.bits_per_symbol, usize::from(f.data_carriers)), (0, 1, 1, carriers));
+    // A level-0 codeword has more points than a frame holds: every other symbol is kept.
+    let symbols = modem.symbols_per_codeword(0);
+    assert!(symbols * carriers > MAX_POINTS && symbols * carriers <= 2 * MAX_POINTS);
+    assert_eq!(f.points.len(), symbols.div_ceil(2) * carriers);
+    let carrier_ids: Vec<u8> = modem.ofdm.data_idx.iter().map(|&c| c as u8).collect();
+    for (n, p) in f.points.iter().enumerate() {
+        assert_eq!(p.carrier, carrier_ids[n % carriers]);
+        // BPSK, heard clean: on the in-phase axis at +-1.
+        let s = SCALE as i8;
+        assert!((p.i.abs() - s).abs() <= 4 && p.q.abs() <= 4, "point {n}: {p:?}");
+    }
+
+    let off = a_calls_b(&[], false);
+    assert!(off.constellations.is_empty());
 }

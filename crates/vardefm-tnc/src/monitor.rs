@@ -90,6 +90,13 @@ impl Monitor {
         }
     }
 
+    /// Publishes binary frames, such as the engine's constellations.
+    pub fn publish_frames(&mut self, frames: impl IntoIterator<Item = Vec<u8>>) {
+        for f in frames {
+            self.server.publish_frame(f);
+        }
+    }
+
     /// True once [`STATUS_EVERY`] has passed since the last `Status`.
     pub fn status_due(&self) -> bool {
         self.last_status.elapsed() >= STATUS_EVERY

@@ -3,6 +3,7 @@
 use crate::busy::BusyDetector;
 use crate::{Header, Modem, LEVELS};
 use std::sync::Arc;
+use vardefm_dsp::Complex32;
 
 /// A received sample beyond this is a glitch: full scale is 1.
 const MAX_SAMPLE: f32 = 4.0;
@@ -42,6 +43,17 @@ impl AudioLevel {
     }
 }
 
+/// The payload symbols of a received burst, for a constellation view (see
+/// [`Receiver::keep_symbols`]).
+#[derive(Clone, Debug)]
+pub struct RxSymbols {
+    /// The [`RxBurst::end_sample`] of the burst they belong to.
+    pub end_sample: u64,
+    /// Equalized data-carrier symbols, one Vec per OFDM symbol of the payload, in the order of
+    /// the modem's data carriers (`Ofdm::data_idx`).
+    pub symbols: Vec<Vec<Complex32>>,
+}
+
 pub struct Receiver {
     modem: Arc<Modem>,
     buf: Vec<f32>,
@@ -55,12 +67,26 @@ pub struct Receiver {
     detector: BusyDetector,
     /// The last good sample pushed.
     last: f32,
+    /// Payload symbols kept since the last [`take_symbols`](Self::take_symbols); `None` when
+    /// they are not kept.
+    kept: Option<Vec<RxSymbols>>,
 }
 
 impl Receiver {
     pub fn new(modem: Arc<Modem>) -> Self {
         let detector = BusyDetector::new(&modem.ofdm.p);
-        Self { modem, buf: Vec::new(), base: 0, search: 0, pending: None, detector, last: 0.0 }
+        Self { modem, buf: Vec::new(), base: 0, search: 0, pending: None, detector, last: 0.0, kept: None }
+    }
+
+    /// Keep the payload symbols of every burst with a payload, for
+    /// [`take_symbols`](Self::take_symbols). Off by default: they are copied only when asked for.
+    pub fn keep_symbols(&mut self, on: bool) {
+        self.kept = on.then(Vec::new);
+    }
+
+    /// The payload symbols kept since the last call, oldest first.
+    pub fn take_symbols(&mut self) -> Vec<RxSymbols> {
+        self.kept.as_mut().map(std::mem::take).unwrap_or_default()
     }
 
     /// Absolute index of the next sample to be pushed.
@@ -154,7 +180,11 @@ impl Receiver {
             };
             let payload = m.decode_payload(&h, &frame);
             let level = self.burst_level(b, nsym);
-            out.push(RxBurst { header: h, payload, snr_db: frame.snr_db, end_sample: self.burst_end(b, nsym), level });
+            let end_sample = self.burst_end(b, nsym);
+            if let Some(kept) = &mut self.kept {
+                kept.push(RxSymbols { end_sample, symbols: frame.symbols[hdr_syms..].to_vec() });
+            }
+            out.push(RxBurst { header: h, payload, snr_db: frame.snr_db, end_sample, level });
             self.search = frame.end.min(self.buf.len());
             return Some(true);
         }

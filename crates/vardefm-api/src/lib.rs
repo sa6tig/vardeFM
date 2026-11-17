@@ -10,7 +10,9 @@
 //! - [`server`]: `GET /v1/status` and the `/v1/stream` WebSocket.
 //! - [`wire`]: the messages, their JSON form and the binary row header.
 //! - [`waterfall`]: rows of the received spectrum, ten a second.
+//! - [`constellation`]: the payload symbols of each received burst.
 
+pub mod constellation;
 pub mod loopback;
 pub mod server;
 pub mod waterfall;

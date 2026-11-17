@@ -10,6 +10,7 @@
 //! Every float is written finite: NaN and infinity go out as 0, because JSON has no such numbers
 //! and serde_json would write `null`, which the schemas refuse.
 
+use crate::constellation::{VfmConstellationFormat, FORMAT_VFM_CONSTELLATION, STREAM_VFM_CONSTELLATION};
 use crate::waterfall::{self, Waterfall};
 use serde::{Deserialize, Serialize, Serializer};
 
@@ -98,13 +99,22 @@ pub struct Hello {
     pub mode: String,
     /// Format of the binary waterfall frames.
     pub waterfall: WaterfallFormat,
+    /// Format of vardeFM's constellation frames. A client that does not know the key ignores
+    /// it, and skips the frames by their stream id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vfm_constellation: Option<VfmConstellationFormat>,
 }
 
 impl Hello {
     /// The `Hello` of this server for `mode` (`narrow` or `wide`), describing the rows of
     /// `waterfall`.
     pub fn new(mode: &str, waterfall: &Waterfall) -> Self {
-        Self { server: SERVER.to_owned(), mode: mode_name(mode), waterfall: WaterfallFormat::of(waterfall) }
+        Self {
+            server: SERVER.to_owned(),
+            mode: mode_name(mode),
+            waterfall: WaterfallFormat::of(waterfall),
+            vfm_constellation: Some(VfmConstellationFormat::current()),
+        }
     }
 }
 
@@ -369,6 +379,11 @@ impl StreamHeader {
     /// The header of a waterfall row.
     pub fn waterfall(seq: u64, t: WireTime) -> Self {
         Self { stream: STREAM_WATERFALL, format: FORMAT_WATERFALL_U8, seq: seq as u16, t_low: t.0 as u32 }
+    }
+
+    /// The header of a constellation frame for the burst at `t`.
+    pub fn vfm_constellation(seq: u64, t: WireTime) -> Self {
+        Self { stream: STREAM_VFM_CONSTELLATION, format: FORMAT_VFM_CONSTELLATION, seq: seq as u16, t_low: t.0 as u32 }
     }
 
     /// The header's bytes.

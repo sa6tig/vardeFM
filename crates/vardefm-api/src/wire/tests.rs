@@ -287,10 +287,47 @@ fn walk(value: &Value, node: &Value, root: &Value, path: &str, out: &mut Vec<Str
     }
 }
 
+/// The schema of one of the Vfm schema's definitions, such as `VfmConstellationFormat`.
+fn vfm_def(name: &str) -> String {
+    let mut root: Value = serde_json::from_str(VFM_EVENTS).unwrap();
+    let root = root.as_object_mut().unwrap();
+    root.remove("oneOf");
+    root.insert("$ref".to_owned(), json!(format!("#/$defs/{name}")));
+    serde_json::to_string(&root).unwrap()
+}
+
+/// `Hello` without vardeFM's own key, and that key.
+fn split_hello(mut json: Value) -> (Value, Value) {
+    let own = json.as_object_mut().unwrap().remove("vfm_constellation").expect("vfm_constellation");
+    (json, own)
+}
+
+#[test]
+fn hello_carries_the_constellation_format_the_vfm_schema_describes() {
+    let format = vfm_def("VfmConstellationFormat");
+    for mode in ["narrow", "wide"] {
+        let (shared, own) = split_hello(wire(ApiEvent::Hello(hello(mode))));
+        assert_eq!(own, json!({"stream": 2, "format": 1, "scale": 48, "max_points": 2048}));
+        assert!(validator(&format).is_valid(&own), "{own}");
+        assert_eq!(unknown_keys(&own, &format), Vec::<String>::new());
+        assert!(validator(SHARED_ENVELOPE).is_valid(&shared));
+    }
+    assert!(!validator(&format).is_valid(&json!({"stream": 2, "format": 1, "scale": 48})));
+    // An older Hello, without the key, still reads.
+    let old = json!({"v": 1, "type": "Hello", "server": "vardefm 0.3.0", "mode": "vardefm-narrow",
+                     "waterfall": wire(ApiEvent::Hello(hello("narrow")))["waterfall"]});
+    let back: Envelope = serde_json::from_value(old).unwrap();
+    assert!(matches!(back.event, ApiEvent::Hello(Hello { vfm_constellation: None, .. })));
+}
+
 #[test]
 fn every_key_sent_is_one_the_schemas_name() {
     for event in shared_events() {
-        let json = wire(event);
+        let json = match event {
+            // vardeFM's own key is checked against the Vfm schema above.
+            ApiEvent::Hello(_) => split_hello(wire(event)).0,
+            _ => wire(event),
+        };
         assert_eq!(unknown_keys(&json, SHARED_ENVELOPE), Vec::<String>::new(), "{json}");
     }
     for event in vfm_events() {

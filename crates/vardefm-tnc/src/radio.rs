@@ -23,6 +23,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use vardefm_api::constellation::Constellation;
 use vardefm_api::wire::{ApiEvent, VfmBurstRx, VfmBurstTx, WireTime};
 pub use vardefm_api::LoopbackAddr;
 use vardefm_audio::{open_input, open_output, AudioOut, Channel, RATE};
@@ -174,6 +175,11 @@ pub struct RadioEngine<S: AudioSink> {
     /// What happened, for the monitor API, drained by the caller. Times are on the receive
     /// clock ([`rx_samples`](Self::rx_samples)).
     pub events: Vec<ApiEvent>,
+    /// Constellation frames of received bursts, for the monitor API, drained by the caller.
+    /// Made only while the station keeps symbols ([`Station::keep_symbols`]); each has the `t` of
+    /// its burst's `VfmBurstRx`.
+    pub constellations: Vec<Vec<u8>>,
+    constellation_seq: u64,
     meter: LevelMeter,
     /// When the last level warning went out.
     last_level_warning: Option<f64>,
@@ -204,6 +210,8 @@ impl<S: AudioSink> RadioEngine<S> {
             last_level_warning: None,
             busy: false,
             gaps: VecDeque::new(),
+            constellations: Vec::new(),
+            constellation_seq: 0,
         }
     }
 
@@ -332,11 +340,27 @@ impl<S: AudioSink> RadioEngine<S> {
                 let offset =
                     |end: u64| self.gaps.iter().find(|&&(at, _)| end <= at).map_or(now_ahead, |&(_, before)| before);
                 let ends: Vec<u64> = bursts.iter().map(|b| b.end_sample + offset(b.end_sample)).collect();
+                let kept = self.station.take_symbols();
                 for (b, end) in bursts.into_iter().zip(ends) {
                     let ok = b.payload.iter().filter(|p| p.is_some()).count();
                     let h = b.header;
+                    let t = WireTime(end.saturating_sub(body_samples(self.station.modem(), &h)));
+                    if let Some(k) = kept.iter().find(|k| k.end_sample == b.end_sample) {
+                        let modem = self.station.modem();
+                        let frame = Constellation {
+                            t,
+                            level: h.level,
+                            ncw: h.ncw,
+                            bits_per_symbol: LEVELS[h.level as usize].modulation.bits_per_symbol() as u8,
+                            carriers: &modem.ofdm.data_idx,
+                            symbols: &k.symbols,
+                        }
+                        .encode(self.constellation_seq);
+                        self.constellation_seq += 1;
+                        self.constellations.push(frame);
+                    }
                     self.events.push(ApiEvent::VfmBurstRx(VfmBurstRx {
-                        t: WireTime(end.saturating_sub(body_samples(self.station.modem(), &h))),
+                        t,
                         t_end: WireTime(end),
                         kind: format!("{:?}", h.kind),
                         level: (h.ncw > 0).then_some(h.level),
@@ -458,6 +482,8 @@ pub fn run(cfg: RadioConfig, stop: Arc<AtomicBool>) -> io::Result<()> {
     }
 
     let mut engine = RadioEngine::from_config(&cfg, modem, ptt, output, link_seed())?;
+    // Copying the symbols out is wasted work with no one to send them to.
+    engine.station.keep_symbols(monitor.is_some());
     while !stop.load(Ordering::Relaxed) {
         let chunk = input.rx.recv_timeout(Duration::from_millis(50)).ok();
         if let Some(c) = &chunk {
@@ -473,6 +499,7 @@ pub fn run(cfg: RadioConfig, stop: Arc<AtomicBool>) -> io::Result<()> {
             Some(m) => {
                 m.modem_step(started.elapsed());
                 m.publish(engine.events.drain(..));
+                m.publish_frames(engine.constellations.drain(..));
                 if m.status_due() {
                     m.publish_status(
                         engine.rx_samples(),
@@ -482,7 +509,10 @@ pub fn run(cfg: RadioConfig, stop: Arc<AtomicBool>) -> io::Result<()> {
                     );
                 }
             }
-            None => engine.events.clear(),
+            None => {
+                engine.events.clear();
+                engine.constellations.clear();
+            }
         }
         for o in out {
             match o {
