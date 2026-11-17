@@ -15,7 +15,8 @@ pub struct RxBurst {
     pub payload: Vec<Option<Vec<u8>>>,
     /// Average SNR per symbol (Es/N0) estimated from the pilots, dB.
     pub snr_db: f32,
-    /// Absolute sample index (since the receiver was created) where the burst ended.
+    /// Absolute sample index (since the receiver was created) just past the burst's last
+    /// symbol.
     pub end_sample: u64,
     /// Received audio level over the burst, dB relative to full scale.
     pub level: AudioLevel,
@@ -109,6 +110,14 @@ impl Receiver {
         out
     }
 
+    /// Absolute index just past the last of `nsym` symbols after preamble B at `b`. A
+    /// [`Frame`](vardefm_dsp::ofdm::Frame)'s `end` is a symbol later: it covers the look-ahead
+    /// the demodulator reads past the burst.
+    fn burst_end(&self, b: usize, nsym: usize) -> u64 {
+        let p = &self.modem.ofdm.p;
+        self.base + (b + p.nfft + nsym * p.symbol_len()) as u64
+    }
+
     /// Sample index (in `buf`) needed to demodulate `nsym` symbols after preamble B at `b`.
     fn needed(&self, b: usize, nsym: usize) -> usize {
         let p = &self.modem.ofdm.p;
@@ -145,13 +154,7 @@ impl Receiver {
             };
             let payload = m.decode_payload(&h, &frame);
             let level = self.burst_level(b, nsym);
-            out.push(RxBurst {
-                header: h,
-                payload,
-                snr_db: frame.snr_db,
-                end_sample: self.base + frame.end as u64,
-                level,
-            });
+            out.push(RxBurst { header: h, payload, snr_db: frame.snr_db, end_sample: self.burst_end(b, nsym), level });
             self.search = frame.end.min(self.buf.len());
             return Some(true);
         }
@@ -178,7 +181,7 @@ impl Receiver {
                             header: h,
                             payload: Vec::new(),
                             snr_db,
-                            end_sample: self.base + f.end as u64,
+                            end_sample: self.burst_end(b, hdr_syms),
                             level: self.burst_level(b, hdr_syms),
                         });
                         self.search = f.end.min(self.buf.len());

@@ -132,6 +132,7 @@ pub fn monitor(audio_in: Option<&str>, channel: Channel, mode: &str) -> Res {
     let mut pos = 0u64;
     while !stop.load(Ordering::Relaxed) {
         let Ok(chunk) = input.rx.recv_timeout(Duration::from_millis(200)) else { continue };
+        let chunk = chunk.samples;
         pos += chunk.len() as u64;
         for b in rx.push(&chunk) {
             print_burst(pos as f64 / RATE as f64, &b);
