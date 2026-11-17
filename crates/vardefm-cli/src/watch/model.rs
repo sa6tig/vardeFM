@@ -5,8 +5,10 @@
 
 use std::collections::VecDeque;
 
-use vardefm_api::constellation::{ConstellationFrame, STREAM_VFM_CONSTELLATION};
-use vardefm_api::wire::{ApiEvent, Envelope, Hello, Status, StreamHeader, VfmBurstRx, VfmBurstTx, STREAM_WATERFALL};
+use vardefm_api::constellation::{ConstellationFrame, FORMAT_VFM_CONSTELLATION, STREAM_VFM_CONSTELLATION};
+use vardefm_api::wire::{
+    ApiEvent, Envelope, Hello, Status, StreamHeader, VfmBurstRx, VfmBurstTx, FORMAT_WATERFALL_U8, STREAM_WATERFALL,
+};
 
 use super::capture::Message;
 
@@ -138,6 +140,8 @@ pub enum Conn {
     Lost(String),
     /// A replay ran to its end.
     Ended,
+    /// The source stopped without saying why: its thread failed.
+    Gone,
 }
 
 /// Everything the stream has said.
@@ -162,6 +166,8 @@ pub struct Model {
     pub latest_t: u64,
     /// Messages that could not be read, such as a newer server's.
     pub unknown: u64,
+    /// Why saving the capture stopped, if it did.
+    pub save_error: Option<String>,
 }
 
 impl Model {
@@ -180,6 +186,7 @@ impl Model {
             warnings: VecDeque::new(),
             latest_t: 0,
             unknown: 0,
+            save_error: None,
         }
     }
 
@@ -257,21 +264,35 @@ impl Model {
             return;
         };
         let t = unwrap_t(header.t_low, self.latest_t);
-        match header.stream {
-            STREAM_WATERFALL => {
-                let wanted = self.hello.as_ref().map(|h| usize::from(h.waterfall.bins));
-                if wanted.is_some_and(|n| n != payload.len()) {
-                    self.unknown += 1;
-                    return;
-                }
-                self.see(t);
-                self.floor.push(payload);
-                self.rows.push_back(Row { t, bins: payload.to_vec() });
-                while self.rows.len() > HISTORY_ROWS {
-                    self.rows.pop_front();
-                }
+        // The stream ids and formats `Hello` announced, or the defaults before a `Hello`.
+        let (fall_stream, fall_format) = self
+            .hello
+            .as_ref()
+            .map_or((STREAM_WATERFALL, FORMAT_WATERFALL_U8), |h| (h.waterfall.stream, h.waterfall.format));
+        let (constel_stream, constel_format) = self
+            .hello
+            .as_ref()
+            .and_then(|h| h.vfm_constellation.as_ref())
+            .map_or((STREAM_VFM_CONSTELLATION, FORMAT_VFM_CONSTELLATION), |c| (c.stream, c.format));
+        if header.stream == fall_stream {
+            // Only the format this tool can draw: one byte of dB per bin, as many as announced.
+            let wanted = self.hello.as_ref().map(|h| usize::from(h.waterfall.bins));
+            if header.format != fall_format
+                || fall_format != FORMAT_WATERFALL_U8
+                || wanted.is_some_and(|n| n != payload.len())
+            {
+                self.unknown += 1;
+                return;
             }
-            STREAM_VFM_CONSTELLATION => match ConstellationFrame::decode(payload) {
+            self.see(t);
+            self.floor.push(payload);
+            self.rows.push_back(Row { t, bins: payload.to_vec() });
+            while self.rows.len() > HISTORY_ROWS {
+                self.rows.pop_front();
+            }
+        } else if header.stream == constel_stream {
+            let known = header.format == constel_format && constel_format == FORMAT_VFM_CONSTELLATION;
+            match known.then(|| ConstellationFrame::decode(payload)).flatten() {
                 Some(frame) => {
                     let burst = self.log.iter().rev().find_map(|line| match &line.entry {
                         Entry::Rx(rx) if line.session == self.session && rx.t.0 == t => Some(rx.clone()),
@@ -280,10 +301,9 @@ impl Model {
                     self.constellation = Some(Shown { t, frame, burst });
                 }
                 None => self.unknown += 1,
-            },
-            // A stream this tool does not know: skip it, as the API asks.
-            _ => {}
+            }
         }
+        // Any other stream is one this tool does not know: skip it, as the API asks.
     }
 
     /// Whether the channel was busy at `t`, from this session's busy changes.

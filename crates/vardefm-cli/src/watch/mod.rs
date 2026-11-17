@@ -24,6 +24,7 @@ use ratatui::DefaultTerminal;
 
 use model::{Conn, Model};
 use source::Feed;
+use source::{MAX_SPEED, MIN_SPEED};
 use view::{ViewOpts, MAX_SPAN_DB, MIN_SPAN_DB};
 
 /// What to watch.
@@ -50,33 +51,45 @@ pub fn run(watch: Watch) -> Result<(), String> {
             (name, handle)
         }
         Watch::Replay { path, speed } => {
-            if !(speed.is_finite() && speed > 0.0) {
-                return Err("--speed must be above 0".into());
+            if !(MIN_SPEED..=MAX_SPEED).contains(&speed) {
+                return Err(format!("--speed must be from {MIN_SPEED} to {MAX_SPEED}"));
             }
             let name = format!("{} (x{speed})", path.display());
             (name, source::replay(path, speed, tx, stop.clone())?)
         }
     };
     let mut model = Model::new(source_name);
-    let terminal = ratatui::init();
-    let result = ui(terminal, &mut model, &rx);
-    ratatui::restore();
+    let result = match ratatui::try_init() {
+        Ok(terminal) => {
+            let result = ui(terminal, &mut model, &rx);
+            ratatui::restore();
+            result
+        }
+        Err(e) => Err(format!("vardefm watch needs a terminal: {e}")),
+    };
     stop.store(true, Ordering::Relaxed);
     drop(rx);
     let _ = handle.join();
     result
 }
 
-/// Applies everything waiting on `rx`. False once the source is gone for good.
-pub fn drain(model: &mut Model, rx: &Receiver<Feed>) -> bool {
+/// Applies everything waiting on `rx`. A source gone without saying it ended (its thread
+/// failed) shows as [`Conn::Gone`].
+pub fn drain(model: &mut Model, rx: &Receiver<Feed>) {
     loop {
         match rx.try_recv() {
             Ok(Feed::Connected) => model.conn = Conn::Connected,
             Ok(Feed::Lost(why)) => model.conn = Conn::Lost(why),
             Ok(Feed::Ended) => model.conn = Conn::Ended,
+            Ok(Feed::SaveFailed(why)) => model.save_error = Some(why),
             Ok(Feed::Msg(msg)) => model.apply(&msg),
-            Err(TryRecvError::Empty) => return true,
-            Err(TryRecvError::Disconnected) => return false,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                if model.conn != Conn::Ended {
+                    model.conn = Conn::Gone;
+                }
+                return;
+            }
         }
     }
 }

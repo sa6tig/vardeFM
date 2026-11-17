@@ -388,3 +388,120 @@ fn warnings_wrap_under_their_heading() {
     assert_eq!(hanging("", 10, 2), Vec::<String>::new());
     assert_eq!(hanging("x", 0, 2), vec!["  x"]);
 }
+
+// ---- review fixes ----
+
+#[test]
+fn a_modem_slow_to_answer_the_handshake_still_connects() {
+    // Answers the WebSocket handshake 600 ms late: longer than the 200 ms read poll.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (tcp, _) = listener.accept().unwrap();
+        std::thread::sleep(Duration::from_millis(600));
+        let mut ws = tungstenite::accept(tcp).unwrap();
+        ws.send(tungstenite::Message::text(serde_json::to_string(&Envelope::new(ApiEvent::Hello(hello()))).unwrap()))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+    });
+    let (tx, rx) = mpsc::channel();
+    let stop = Arc::new(AtomicBool::new(false));
+    let handle = source::live(addr, None, tx, stop.clone()).unwrap();
+    let mut m = Model::new("slow".into());
+    wait_for(&rx, &mut m, |m| m.hello.is_some());
+    assert_eq!(m.conn, super::model::Conn::Connected);
+    stop.store(true, Ordering::Relaxed);
+    handle.join().unwrap();
+    server.join().unwrap();
+}
+
+#[test]
+fn a_failed_save_is_shown_without_dropping_the_connection() {
+    let (tx, rx) = mpsc::channel();
+    let mut m = Model::new("x".into());
+    tx.send(Feed::Connected).unwrap();
+    tx.send(Feed::SaveFailed("disk full".into())).unwrap();
+    tx.send(Feed::Msg(text(ApiEvent::Hello(hello())))).unwrap();
+    drain(&mut m, &rx);
+    assert_eq!(m.conn, super::model::Conn::Connected);
+    assert_eq!(m.save_error.as_deref(), Some("disk full"));
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    terminal.draw(|f| view::draw(f, &m, &ViewOpts::default())).unwrap();
+    let screen: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+    assert!(screen.contains("not saving") && screen.contains("disk full"));
+    assert!(screen.contains("connected") && !screen.contains("retrying"));
+}
+
+#[test]
+fn a_source_that_dies_shows_as_stopped() {
+    let (tx, rx) = mpsc::channel();
+    let mut m = Model::new("x".into());
+    tx.send(Feed::Connected).unwrap();
+    drop(tx);
+    drain(&mut m, &rx);
+    assert_eq!(m.conn, super::model::Conn::Gone);
+    // A replay that said it ended stays ended.
+    let (tx, rx) = mpsc::channel();
+    tx.send(Feed::Ended).unwrap();
+    drop(tx);
+    drain(&mut m, &rx);
+    assert_eq!(m.conn, super::model::Conn::Ended);
+}
+
+#[test]
+fn save_refuses_to_overwrite_a_capture() {
+    let path = std::env::temp_dir().join(format!("vardefm-watch-exists-{}.jsonl", std::process::id()));
+    std::fs::write(&path, "keep me\n").unwrap();
+    let (tx, _rx) = mpsc::channel();
+    let addr = "127.0.0.1:9".parse().unwrap();
+    let err = source::live(addr, Some(path.clone()), tx, Arc::new(AtomicBool::new(true))).unwrap_err();
+    let kept = std::fs::read_to_string(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(kept, "keep me\n");
+}
+
+#[test]
+fn replay_speed_is_checked_and_huge_times_do_not_panic() {
+    for speed in [0.0, 0.001, 1e-20, 2000.0, f64::NAN] {
+        let err = super::run(super::Watch::Replay { path: "unused.jsonl".into(), speed }).unwrap_err();
+        assert!(err.contains("--speed"), "{speed}: {err}");
+    }
+    // A record due in billions of years: the replay waits, and still stops when asked.
+    let path = std::env::temp_dir().join(format!("vardefm-watch-far-{}.jsonl", std::process::id()));
+    std::fs::write(&path, format!("{{\"ms\":0,\"text\":\"x\"}}\n{{\"ms\":{},\"text\":\"y\"}}\n", u64::MAX)).unwrap();
+    let (tx, rx) = mpsc::channel();
+    let stop = Arc::new(AtomicBool::new(false));
+    let handle = source::replay(path.clone(), 1e-20, tx, stop.clone()).unwrap();
+    let mut m = Model::new("far".into());
+    wait_for(&rx, &mut m, |m| m.unknown == 1);
+    stop.store(true, Ordering::Relaxed);
+    handle.join().unwrap();
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn frames_of_an_unknown_format_are_skipped() {
+    let mut m = busy_model();
+    let mut wrong = StreamHeader::waterfall(99, WireTime(500_000)).encode().to_vec();
+    wrong[1] = 7; // format 7, same width
+    wrong.extend([0u8; NARROW_BINS]);
+    m.apply(&Message::Binary(wrong));
+    let mut constel = constellation_frame(600_000);
+    constel[1] = 9;
+    m.apply(&Message::Binary(constel));
+    assert_eq!(m.unknown, 2);
+    assert_eq!(m.rows.len(), 30);
+    assert_eq!(m.constellation.as_ref().unwrap().t, 72_000, "the earlier constellation stays");
+
+    // A Hello that puts the waterfall on stream 5: rows come on 5, and stream 1 is unknown.
+    let mut h = hello();
+    h.waterfall.stream = 5;
+    m.apply(&text(ApiEvent::Hello(h)));
+    let mut on5 = StreamHeader::waterfall(0, WireTime(0)).encode().to_vec();
+    on5[0] = 5;
+    on5.extend([1u8; NARROW_BINS]);
+    m.apply(&Message::Binary(on5));
+    m.apply(&row(1, 4800, 1));
+    assert_eq!(m.rows.len(), 1);
+}

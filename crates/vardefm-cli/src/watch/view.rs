@@ -69,6 +69,7 @@ fn header(model: &Model) -> Line<'static> {
         Conn::Connected => ("connected".to_owned(), Color::Green),
         Conn::Lost(why) => (format!("retrying: {why}"), Color::Red),
         Conn::Ended => ("replay ended".to_owned(), Color::Yellow),
+        Conn::Gone => ("stopped: the source failed".to_owned(), Color::Red),
     };
     let mode = model.hello.as_ref().map_or_else(String::new, |h| format!("  {} {}", h.server, h.mode));
     Line::from(vec![
@@ -219,6 +220,11 @@ fn status_lines(model: &Model, opts: &ViewOpts, width: usize) -> Vec<Line<'stati
     };
     let offset = if opts.floor_offset_db == 0.0 { String::new() } else { format!(" ({:+.0})", opts.floor_offset_db) };
     lines.push(Line::raw(format!("floor {floor}{offset}  span {:.0} dB", opts.span_db)));
+    if let Some(why) = &model.save_error {
+        let red = Style::new().fg(Color::Red);
+        lines.push(Line::styled("not saving: writing the capture failed", red));
+        lines.extend(hanging(why, width, WARNING_INDENT).into_iter().map(|l| Line::styled(l, red)));
+    }
     if model.unknown > 0 {
         lines.push(Line::styled(format!("messages not understood {}", model.unknown), dim));
     }

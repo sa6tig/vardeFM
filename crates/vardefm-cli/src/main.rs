@@ -209,13 +209,13 @@ enum Cmd {
         /// The modem's --api address
         #[arg(default_value = "127.0.0.1:8770")]
         addr: std::net::SocketAddr,
-        /// Also save everything the modem sends to this capture file (JSON lines)
+        /// Also save everything the modem sends to this new capture file (JSON lines)
         #[arg(long, value_name = "FILE", conflicts_with = "replay")]
         save: Option<std::path::PathBuf>,
         /// Replay a capture saved with --save instead of connecting
         #[arg(long, value_name = "FILE")]
         replay: Option<std::path::PathBuf>,
-        /// Replay speed, 1 = as recorded
+        /// Replay speed, 0.01 to 1000; 1 = as recorded
         #[arg(long, default_value_t = 1.0, requires = "replay")]
         speed: f64,
     },

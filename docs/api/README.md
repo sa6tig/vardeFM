@@ -26,8 +26,10 @@ waterfall and the constellation and marks the burst log.
 
 `--save FILE` also writes everything the modem sends to a capture, one JSON object per line:
 `{"ms":...,"text":...}` for a message and `{"ms":...,"bin":...}` (base64) for a binary frame,
-`ms` counted from the start. `vardefm watch --replay FILE [--speed N]` plays a capture back
-without a modem.
+`ms` counted from the start. It refuses a file that already exists. If writing fails later,
+the status pane says so and the view goes on unsaved. `vardefm watch --replay FILE
+[--speed N]` plays a capture back without a modem, `N` from 0.01 to 1000 times as fast as it
+was recorded.
 
 ## Messages
 
