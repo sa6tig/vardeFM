@@ -84,6 +84,11 @@ impl Receiver {
         self.kept = on.then(Vec::new);
     }
 
+    /// Whether payload symbols are kept.
+    pub fn keeps_symbols(&self) -> bool {
+        self.kept.is_some()
+    }
+
     /// The payload symbols kept since the last call, oldest first.
     pub fn take_symbols(&mut self) -> Vec<RxSymbols> {
         self.kept.as_mut().map(std::mem::take).unwrap_or_default()

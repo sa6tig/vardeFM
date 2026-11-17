@@ -230,6 +230,8 @@ impl<S: AudioSink> RadioEngine<S> {
         engine.show_levels = cfg.show_levels;
         engine.record = cfg.record.clone();
         engine.station.set_digi(&cfg.digi_calls);
+        // Constellations go only to the monitor API; without it, copying the symbols is waste.
+        engine.station.keep_symbols(cfg.api.is_some());
         Ok(engine)
     }
 
@@ -482,8 +484,6 @@ pub fn run(cfg: RadioConfig, stop: Arc<AtomicBool>) -> io::Result<()> {
     }
 
     let mut engine = RadioEngine::from_config(&cfg, modem, ptt, output, link_seed())?;
-    // Copying the symbols out is wasted work with no one to send them to.
-    engine.station.keep_symbols(monitor.is_some());
     while !stop.load(Ordering::Relaxed) {
         let chunk = input.rx.recv_timeout(Duration::from_millis(50)).ok();
         if let Some(c) = &chunk {

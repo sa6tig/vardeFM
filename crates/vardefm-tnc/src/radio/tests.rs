@@ -393,6 +393,13 @@ fn default_config_gives_the_links_defaults() {
 }
 
 #[test]
+fn symbols_are_kept_only_for_the_monitor_api() {
+    assert!(!engine_from(&RadioConfig::default()).unwrap().station.keeps_symbols());
+    let api = RadioConfig { api: Some("127.0.0.1:8770".parse().unwrap()), ..RadioConfig::default() };
+    assert!(engine_from(&api).unwrap().station.keeps_symbols());
+}
+
+#[test]
 fn bad_config_is_refused() {
     let ok = RadioConfig::default;
     let bad = [

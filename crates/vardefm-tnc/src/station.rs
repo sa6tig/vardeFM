@@ -188,6 +188,11 @@ impl Station {
         self.rx.keep_symbols(on);
     }
 
+    /// Whether payload symbols are kept.
+    pub fn keeps_symbols(&self) -> bool {
+        self.rx.keeps_symbols()
+    }
+
     /// The payload symbols kept since the last call, oldest first; see [`Receiver::take_symbols`].
     pub fn take_symbols(&mut self) -> Vec<RxSymbols> {
         self.rx.take_symbols()

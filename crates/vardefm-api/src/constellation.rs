@@ -18,7 +18,8 @@
 //! The points are whole OFDM symbols, in order, each carrier by carrier. A long burst is
 //! thinned to at most [`MAX_POINTS`] by keeping every k-th OFDM symbol, so every carrier stays
 //! in view. The carrier is the data carrier's index among all the mode's carriers, pilots
-//! included, counted from the lowest.
+//! included, counted from the lowest. A carrier whose index does not fit a `u8`, or any past the
+//! 255th, is left out (no mode has that many), so the counts always fit their fields.
 
 use crate::wire::{finite, StreamHeader, WireTime};
 use rustfft::num_complex::Complex32;
@@ -82,26 +83,32 @@ pub struct Constellation<'a> {
 impl Constellation<'_> {
     /// The binary frame, with sequence number `seq`.
     pub fn encode(&self, seq: u64) -> Vec<u8> {
-        let per_symbol = self.carriers.len().max(1);
-        let symbols_kept = (MAX_POINTS / per_symbol).max(1);
+        // (position in a symbol, carrier index): at most 255, so a symbol is at most 255 points.
+        let columns: Vec<(usize, u8)> = self
+            .carriers
+            .iter()
+            .enumerate()
+            .filter_map(|(j, &c)| u8::try_from(c).ok().map(|c| (j, c)))
+            .take(usize::from(u8::MAX))
+            .collect();
+        let symbols_kept = MAX_POINTS / columns.len().max(1);
         let every = self.symbols.len().div_ceil(symbols_kept).max(1);
-        let kept: Vec<&Vec<Complex32>> = self.symbols.iter().step_by(every).collect();
-        let points: usize = kept.iter().map(|s| s.len().min(self.carriers.len())).sum();
-
-        let mut frame = Vec::with_capacity(StreamHeader::LEN + PAYLOAD_HEADER_LEN + 3 * points);
-        frame.extend_from_slice(&StreamHeader::vfm_constellation(seq, self.t).encode());
-        let [p0, p1] = (points as u16).to_le_bytes();
-        let carriers = u8::try_from(self.carriers.len()).unwrap_or(u8::MAX);
-        frame.extend_from_slice(&[self.level, self.ncw, SCALE, self.bits_per_symbol, p0, p1, carriers, 0]);
-        for symbol in kept {
-            for (y, &carrier) in symbol.iter().zip(self.carriers) {
-                frame.extend_from_slice(&[
-                    axis(y.re) as u8,
-                    axis(y.im) as u8,
-                    u8::try_from(carrier).unwrap_or(u8::MAX),
-                ]);
+        let mut points = Vec::new();
+        for symbol in self.symbols.iter().step_by(every) {
+            for &(j, carrier) in &columns {
+                if let Some(y) = symbol.get(j) {
+                    points.extend_from_slice(&[axis(y.re) as u8, axis(y.im) as u8, carrier]);
+                }
             }
         }
+        // At most MAX_POINTS: at most `symbols_kept` symbols of `columns.len()` points.
+        let [p0, p1] = ((points.len() / 3) as u16).to_le_bytes();
+
+        let mut frame = Vec::with_capacity(StreamHeader::LEN + PAYLOAD_HEADER_LEN + points.len());
+        frame.extend_from_slice(&StreamHeader::vfm_constellation(seq, self.t).encode());
+        let carriers = columns.len() as u8;
+        frame.extend_from_slice(&[self.level, self.ncw, SCALE, self.bits_per_symbol, p0, p1, carriers, 0]);
+        frame.extend_from_slice(&points);
         frame
     }
 }
