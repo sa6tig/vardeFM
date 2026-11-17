@@ -27,7 +27,8 @@ vardeFM's own ([vardefm-events.schema.json](vardefm-events.schema.json)), which 
 not know them skips:
 
 - `VfmBurstRx`: a burst decoded. `t` is the first sample after the sender's leader (the start of
-  the sync symbols), `t_end` just past its last symbol.
+  the sync symbols), `t_end` just past its last symbol. A burst that spans a `Gap` rarely decodes;
+  if one does, it is timed from after the gap, and its `t` falls in the lost audio.
 - `VfmBurstTx`: a burst keyed up, at `t`.
 - `VfmBusy`: the channel turned busy or free, as the host's `BUSY ON` / `BUSY OFF`.
 
@@ -55,8 +56,10 @@ These are part of the shared `Status`, and vardeFM always sends them as 0 (or `u
 | `capture_priority` | the capture thread's scheduling is not measured (`unknown`) |
 | `link.rx_queued` | received data goes to the host as it arrives |
 
-`cpu` is the time spent stepping the modem (receiver, link and transmitter) and `tap_cpu` the time
-spent making waterfall rows, each as a percentage of the audio received in the same second;
-`longest_push_ms` is the longest single modem step in that second. `overruns` and
+`cpu` is the time spent stepping the modem, and `tap_cpu` the time spent making waterfall rows and
+queueing them for the clients, each as a percentage of the audio received in the same second.
+`longest_push_ms` is the longest single modem step in that second. A step takes in the host's
+commands and data, runs the receiver and the link, and, when a burst starts, scales its audio and
+with `--record` writes it to disk, so with `--record` a long step can be disk time. `overruns` and
 `dropped_frames` count the audio chunks, and their samples, dropped because the modem fell
 behind; `gaps` counts the `Gap`s sent.

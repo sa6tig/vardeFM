@@ -17,6 +17,7 @@ use crate::level::{meter_line, LevelMeter, Verdict};
 use crate::monitor::Monitor;
 use crate::server::{HostIn, HostPort};
 use crate::station::{HostOut, Station};
+use std::collections::VecDeque;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -83,6 +84,10 @@ impl RadioConfig {
         Ok(())
     }
 }
+
+/// Samples a gap is remembered for, to time the bursts that ended before it: far longer than
+/// the receiver takes to decode a burst once it has ended (about a symbol).
+const GAP_MEMORY: u64 = RATE as u64;
 
 /// Seconds per line of `--levels` output.
 pub const LEVEL_WINDOW_S: f32 = 2.0;
@@ -174,9 +179,9 @@ pub struct RadioEngine<S: AudioSink> {
     last_level_warning: Option<f64>,
     /// The busy state last put in `events`.
     busy: bool,
-    /// The receiver's position at the last gap, and how far the receive clock was ahead of it
-    /// before the gap: a burst that ended there is timed by that.
-    before_gap: Option<(u64, u64)>,
+    /// Recent gaps, oldest first: the receiver's position at each, and how far the receive
+    /// clock was ahead of it before the gap. A burst that ended there is timed by that.
+    gaps: VecDeque<(u64, u64)>,
 }
 
 impl<S: AudioSink> RadioEngine<S> {
@@ -198,7 +203,7 @@ impl<S: AudioSink> RadioEngine<S> {
             meter: LevelMeter::new((LEVEL_WINDOW_S * RATE as f32) as usize),
             last_level_warning: None,
             busy: false,
-            before_gap: None,
+            gaps: VecDeque::new(),
         }
     }
 
@@ -262,7 +267,7 @@ impl<S: AudioSink> RadioEngine<S> {
             return;
         }
         let heard = self.station.rx_position();
-        self.before_gap = Some((heard, self.rx_pos - heard));
+        self.gaps.push_back((heard, self.rx_pos - heard));
         self.rx_pos += samples;
         let now = self.now();
         self.log.push(format!(
@@ -314,16 +319,22 @@ impl<S: AudioSink> RadioEngine<S> {
                 // The receiver counts only the audio it was given; since the last time it was
                 // not given some (while transmitting, or lost), the receive clock is a fixed
                 // offset ahead. A burst is decoded a little after it ends, so one that ended just
-                // before a gap may come out after it, and takes the offset from before.
-                let (now_ahead, before_gap) = (self.rx_pos - self.station.rx_position(), self.before_gap);
-                let offset = |end: u64| match before_gap {
-                    Some((at, before)) if end <= at => before,
-                    _ => now_ahead,
-                };
-                for b in bursts {
+                // before a gap may come out after it, and takes the offset from before the first
+                // gap after its end. (A burst that spans a gap rarely decodes, since the receiver
+                // hears the two sides spliced; if one does, it is timed from after the gap, and
+                // its start falls in the lost audio.)
+                let heard = self.station.rx_position();
+                // Gaps the receiver is now well past can no longer come before a burst's end.
+                while self.gaps.front().is_some_and(|&(at, _)| at + GAP_MEMORY < heard) {
+                    self.gaps.pop_front();
+                }
+                let now_ahead = self.rx_pos - heard;
+                let offset =
+                    |end: u64| self.gaps.iter().find(|&&(at, _)| end <= at).map_or(now_ahead, |&(_, before)| before);
+                let ends: Vec<u64> = bursts.iter().map(|b| b.end_sample + offset(b.end_sample)).collect();
+                for (b, end) in bursts.into_iter().zip(ends) {
                     let ok = b.payload.iter().filter(|p| p.is_some()).count();
                     let h = b.header;
-                    let end = b.end_sample + offset(b.end_sample);
                     self.events.push(ApiEvent::VfmBurstRx(VfmBurstRx {
                         t: WireTime(end.saturating_sub(body_samples(self.station.modem(), &h))),
                         t_end: WireTime(end),

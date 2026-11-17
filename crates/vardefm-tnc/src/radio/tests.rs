@@ -434,9 +434,9 @@ struct Call {
     b: RadioEngine<FakeOut>,
 }
 
-/// A calls B until B has heard A's first burst and the channel is free again. B loses
-/// `gap.1` samples of audio before its step `gap.0`.
-fn a_calls_b(gap: Option<(usize, u64)>) -> Call {
+/// A calls B until B has heard A's first burst and the channel is free again. For each
+/// `(step, n)` in `gaps`, B loses `n` samples of audio before its step `step`.
+fn a_calls_b(gaps: &[(usize, u64)]) -> Call {
     let cards: [Shared; 2] = [Arc::default(), Arc::default()];
     let mut a = engine(&cards[0], 4);
     let mut b = engine(&cards[1], 5);
@@ -446,7 +446,7 @@ fn a_calls_b(gap: Option<(usize, u64)>) -> Call {
     let mut events = Vec::new();
     for step in 0..1000 {
         a.step(Some(&vec![0.0; CHUNK]), std::mem::take(&mut a_in));
-        if let Some((_, lost)) = gap.filter(|g| g.0 == step) {
+        for &(_, lost) in gaps.iter().filter(|g| g.0 == step) {
             b.audio_lost(lost);
         }
         b.step(Some(&air), Vec::new());
@@ -490,7 +490,7 @@ fn burst_events_are_timed_on_the_receive_clock() {
     b.audio_lost(LOST);
     assert_eq!((b.rx_samples(), &b.events[..]), (LOST, &[ApiEvent::Gap { t: WireTime(LOST) }][..]));
 
-    let Call { start, tx, rx, events, b, .. } = a_calls_b(Some((0, LOST)));
+    let Call { start, tx, rx, events, b, .. } = a_calls_b(&[(0, LOST)]);
     assert_eq!(events[0], ApiEvent::Gap { t: WireTime(LOST) });
     assert_eq!((tx.kind.as_str(), tx.level, tx.ncw, tx.retry, tx.repeat), ("ConnectReq", Some(0), 1, 0, false));
     assert_eq!((rx.kind.as_str(), rx.level, rx.ncw, rx.cw_ok), ("ConnectReq", Some(0), 1, 1));
@@ -519,17 +519,26 @@ fn burst_events_are_timed_on_the_receive_clock() {
     assert!(busy.last().unwrap().0 > end, "{busy:?}, burst {start}..{end}");
 }
 
-/// The receiver decodes a burst a little after it ends. Audio lost in between comes after the
-/// burst, and does not move it.
+/// The receiver decodes a burst a little after it ends: more than a chunk after, as the
+/// demodulator reads a symbol past the burst. Audio lost in between, in one gap or two, comes
+/// after the burst and does not move it.
 #[test]
-fn a_gap_after_a_burst_does_not_move_it() {
-    let clean = a_calls_b(None);
-    let gap = a_calls_b(Some((clean.decoded_in, 777)));
-    assert_eq!(gap.decoded_in, clean.decoded_in);
-    assert_eq!((gap.rx.t, gap.rx.t_end), (clean.rx.t, clean.rx.t_end));
-    let at = gap.events.iter().find_map(|e| match e {
-        ApiEvent::Gap { t } => Some(*t),
-        _ => None,
-    });
-    assert!(at.is_some_and(|t| t > gap.rx.t_end), "gap at {at:?}, burst ends at {:?}", gap.rx.t_end);
+fn gaps_after_a_burst_do_not_move_it() {
+    let clean = a_calls_b(&[]);
+    let n = clean.decoded_in;
+    for gaps in [&[(n, 777)][..], &[(n - 1, 500), (n, 777)]] {
+        let gap = a_calls_b(gaps);
+        assert_eq!(gap.decoded_in, n);
+        assert_eq!((gap.rx.t, gap.rx.t_end), (clean.rx.t, clean.rx.t_end), "gaps {gaps:?}");
+        let at: Vec<_> = gap
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                ApiEvent::Gap { t } => Some(*t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(at.len(), gaps.len());
+        assert!(at.iter().all(|&t| t > gap.rx.t_end), "gaps at {at:?}, burst ends at {:?}", gap.rx.t_end);
+    }
 }

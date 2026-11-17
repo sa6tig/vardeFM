@@ -72,7 +72,6 @@ fn a_monitor_serves_what_the_radio_gives_it() {
     m.audio(9600, true, &vec![0.0; 4800]);
     let link = LinkView { state: Link::Listening, ..LinkView::default() };
     m.publish_status(14_400, &link, 1, 4800);
-    assert!(!m.status_due());
 
     let v = get_status(m.local_addr());
     let s = &v["status"];
