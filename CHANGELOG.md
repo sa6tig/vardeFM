@@ -7,6 +7,9 @@ run the same minor version.
 ## [Unreleased]
 
 ### Added
+- **`vardefm watch`**: a terminal view of a modem's monitor API (`vardefm modem --api`):
+  burst log, status, waterfall and the latest burst's constellation. `--save` writes the
+  stream to a capture and `--replay` plays one back without a modem. See docs/api/README.md.
 - **Digipeating.** `CONNECT <mycall> <target> VIA <d1> [<d2>]` connects through up to
   two VardeFM digipeaters, as in VARA FM. `vardefm modem --digi <call>` makes a
   station repeat the sessions routed through that call, with or without a host

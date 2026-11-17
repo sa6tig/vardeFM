@@ -203,6 +203,22 @@ enum Cmd {
         #[arg(long, default_value = "narrow")]
         mode: String,
     },
+    /// Watch a modem's monitor API in the terminal: burst log, status, waterfall and
+    /// constellation (start the modem with --api ADDR)
+    Watch {
+        /// The modem's --api address
+        #[arg(default_value = "127.0.0.1:8770")]
+        addr: std::net::SocketAddr,
+        /// Also save everything the modem sends to this capture file (JSON lines)
+        #[arg(long, value_name = "FILE", conflicts_with = "replay")]
+        save: Option<std::path::PathBuf>,
+        /// Replay a capture saved with --save instead of connecting
+        #[arg(long, value_name = "FILE")]
+        replay: Option<std::path::PathBuf>,
+        /// Replay speed, 1 = as recorded
+        #[arg(long, default_value_t = 1.0, requires = "replay")]
+        speed: f64,
+    },
     /// Decode VardeFM bursts from a 48 kHz WAV recording
     Decode {
         #[arg(long, default_value = "narrow")]
@@ -432,6 +448,13 @@ fn main() {
         }
         Cmd::Monitor { audio_in, in_channel, mode } => {
             radio_cmds::monitor(audio_in.as_deref(), in_channel, &mode).unwrap_or_else(|m| die(&m))
+        }
+        Cmd::Watch { addr, save, replay, speed } => {
+            let watch = match replay {
+                Some(path) => vardefm_cli::watch::Watch::Replay { path, speed },
+                None => vardefm_cli::watch::Watch::Live { addr, save },
+            };
+            vardefm_cli::watch::run(watch).unwrap_or_else(|m| die(&m))
         }
         Cmd::Decode { mode, input } => radio_cmds::decode(&input, &mode).unwrap_or_else(|m| die(&m)),
         Cmd::SimPair {

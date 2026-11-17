@@ -12,6 +12,23 @@ cannot reach it through the browser.
   ([envelope.schema.json](envelope.schema.json)). The stream is read-only: a message from the
   client closes it. At most 8 clients.
 
+## Watching in a terminal
+
+`vardefm watch [ADDR]` (default `127.0.0.1:8770`) shows the stream in the terminal: the burst
+log and the modem's status on top, the waterfall below with the latest burst's constellation
+beside it. Time runs left to right in the waterfall, one column per row (0.1 s), the highest
+frequency at the top; a strip under it marks received bursts (green, red if a codeword failed),
+sent bursts (yellow) and busy time (grey). The colour scale starts at the noise floor, the
+lowest tenth of the last 5 s of bins, and spans 60 dB: the up and down keys move it, `+` and
+`-` change the span, `a` resets both, `q` quits. Times are seconds on the modem's receive clock.
+If the modem is not there or goes away, it retries every second; a new `Hello` clears the
+waterfall and the constellation and marks the burst log.
+
+`--save FILE` also writes everything the modem sends to a capture, one JSON object per line:
+`{"ms":...,"text":...}` for a message and `{"ms":...,"bin":...}` (base64) for a binary frame,
+`ms` counted from the start. `vardefm watch --replay FILE [--speed N]` plays a capture back
+without a modem.
+
 ## Messages
 
 Shared with other modems that serve this API:

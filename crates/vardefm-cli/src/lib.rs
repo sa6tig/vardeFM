@@ -1,6 +1,8 @@
 //! Helpers shared by the `vardefm` tool and the integration tests:
 //! known test payloads, frame generation, error counting and WAV I/O.
 
+pub mod watch;
+
 use num_complex::Complex32;
 use std::path::Path;
 use vardefm_dsp::prng::Prng;
