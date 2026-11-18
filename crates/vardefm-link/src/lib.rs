@@ -160,6 +160,34 @@ pub struct LinkStats {
     pub codewords_failed: u64,
 }
 
+/// Where the link stands, for monitoring.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LinkState {
+    /// Not listening and not connected.
+    #[default]
+    Idle,
+    /// Not connected, but answers connect requests.
+    Listening,
+    /// Calling a peer.
+    Connecting,
+    /// Connected to a peer.
+    Connected,
+    /// Connected, but closing: sending what is queued, then the disconnect.
+    Disconnecting,
+}
+
+/// A snapshot of the link for monitoring (see [`Link::view`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LinkView {
+    pub state: LinkState,
+    /// The peer's call sign: the station called while connecting, then the remote end.
+    pub peer: Option<String>,
+    /// Level of our transmissions (the one the peer asked for), while connected.
+    pub level: Option<u8>,
+    /// Bytes from the host not yet acknowledged by the peer.
+    pub tx_queued: u64,
+}
+
 /// The digipeaters of a session, in order from the calling station.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Route {
@@ -327,6 +355,25 @@ impl Link {
 
     pub fn is_idle(&self) -> bool {
         matches!(self.state, State::Idle)
+    }
+
+    /// Where the link stands, its peer, level and queue.
+    pub fn view(&self) -> LinkView {
+        match &self.state {
+            State::Idle => LinkView {
+                state: if self.listen { LinkState::Listening } else { LinkState::Idle },
+                ..LinkView::default()
+            },
+            State::Connecting { target, .. } => {
+                LinkView { state: LinkState::Connecting, peer: Some(target.clone()), ..LinkView::default() }
+            }
+            State::Connected(s) => LinkView {
+                state: if s.closing.is_some() { LinkState::Disconnecting } else { LinkState::Connected },
+                peer: Some(s.remote.clone()),
+                level: Some(s.peer_level),
+                tx_queued: s.tx_buf.len() as u64,
+            },
+        }
     }
 
     pub fn last_tx(&self) -> &TxInfo {
