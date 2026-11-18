@@ -5,6 +5,10 @@
 //!   goes to the left, right or both channels.
 //! - If a device cannot run at 48 kHz, audio is resampled in software (cubic).
 //!   Most USB radio interfaces support 48 kHz natively, which is better.
+//! - Input can instead come over TCI from wfview or ExpertSDR: the device name `tci`
+//!   or `tci:HOST:PORT` (see [`tci`]).
+
+pub mod tci;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample, Stream, StreamConfig};
@@ -134,18 +138,37 @@ impl Resampler {
     }
 }
 
+/// What produces an [`AudioIn`]'s chunks; held only to keep it running.
+#[allow(dead_code)]
+enum Source {
+    Cpal(Stream),
+    Tci(tci::Reader),
+}
+
 /// Capture: 48 kHz mono chunks arrive on `rx`.
 pub struct AudioIn {
-    _stream: Stream,
+    _source: Source,
     pub rx: Receiver<Vec<f32>>,
     pub name: String,
     /// Device rate (48000 unless resampling).
     pub device_rate: u32,
-    /// Chunks dropped because the receiver fell behind.
+    /// Chunks dropped because the receiver fell behind; for TCI, also packets lost to errors.
     pub overruns: Arc<AtomicU64>,
 }
 
+/// Open a sound card by (part of) its name, or TCI if `name` is `tci[:HOST:PORT]`.
+/// For TCI, `Channel::Both` averages the two channels.
 pub fn open_input(name: Option<&str>, channel: Channel) -> io::Result<AudioIn> {
+    if let Some(addr) = name.and_then(tci::addr_from_name) {
+        let o = tci::open(addr, channel, tci::Timing::default())?;
+        return Ok(AudioIn {
+            _source: Source::Tci(o.reader),
+            rx: o.rx,
+            name: format!("TCI ws://{addr}/"),
+            device_rate: RATE,
+            overruns: o.overruns,
+        });
+    }
     let host = cpal::default_host();
     let dev = pick(host.input_devices().map_err(err)?, host.default_input_device(), name, "input")?;
     let cfg = choose_config(dev.supported_input_configs().map_err(err)?.collect(), dev.default_input_config().ok())?;
@@ -167,7 +190,7 @@ pub fn open_input(name: Option<&str>, channel: Channel) -> io::Result<AudioIn> {
         f => return Err(err(format!("unsupported sample format {f:?}"))),
     }?;
     stream.play().map_err(err)?;
-    Ok(AudioIn { _stream: stream, rx, name: dev.to_string(), device_rate, overruns })
+    Ok(AudioIn { _source: Source::Cpal(stream), rx, name: dev.to_string(), device_rate, overruns })
 }
 
 fn build_in<T>(

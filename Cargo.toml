@@ -27,6 +27,7 @@ vardefm-ptt = { path = "crates/vardefm-ptt" }
 vardefm-audio = { path = "crates/vardefm-audio" }
 cpal = "0.18"
 serialport = { version = "4.10", default-features = false }
+tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
 hidapi = { version = "2.6", default-features = false, features = ["windows-native", "linux-native-basic-udev"] }
 
 [profile.release]

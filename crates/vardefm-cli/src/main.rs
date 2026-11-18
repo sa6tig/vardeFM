@@ -105,7 +105,8 @@ enum Cmd {
         /// narrow (mic/speaker) or wide (9600 data port)
         #[arg(long, default_value = "narrow")]
         mode: String,
-        /// Input sound card (any unique part of its name; default: system default)
+        /// Input sound card (any unique part of its name; default: system default),
+        /// or tci[:HOST:PORT] for TCI from wfview or ExpertSDR (default 127.0.0.1:50001)
         #[arg(long)]
         audio_in: Option<String>,
         /// Output sound card (default: system default)
@@ -192,6 +193,8 @@ enum Cmd {
     },
     /// Show the receive level and decode any VardeFM bursts heard
     Monitor {
+        /// Input sound card (any unique part of its name; default: system default),
+        /// or tci[:HOST:PORT] for TCI from wfview or ExpertSDR (default 127.0.0.1:50001)
         #[arg(long)]
         audio_in: Option<String>,
         #[arg(long, default_value = "left")]
