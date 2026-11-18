@@ -144,13 +144,19 @@ fn is_timeout(e: &tungstenite::Error) -> bool {
 /// Connect, handshake and ask for RX audio. Reads time out after `timing.read`.
 /// `on_tcp` sees the socket before the handshake, so it can be shut down from outside.
 fn connect(addr: &str, timing: Timing, on_tcp: impl FnOnce(&TcpStream) -> io::Result<()>) -> io::Result<Ws> {
-    let sa = addr
-        .to_socket_addrs()
-        .map_err(|e| err(format!("TCI address {addr}: {e}")))?
-        .next()
-        .ok_or_else(|| err(format!("TCI address {addr} resolves to nothing")))?;
-    let tcp = TcpStream::connect_timeout(&sa, timing.connect)
-        .map_err(|e| err(format!("cannot reach the TCI server at {addr}: {e}")))?;
+    // Try every address: `localhost` may give `::1` first while the server listens on IPv4 only.
+    let mut last = err(format!("TCI address {addr} resolves to nothing"));
+    let mut tcp = None;
+    for sa in addr.to_socket_addrs().map_err(|e| err(format!("TCI address {addr}: {e}")))? {
+        match TcpStream::connect_timeout(&sa, timing.connect) {
+            Ok(s) => {
+                tcp = Some(s);
+                break;
+            }
+            Err(e) => last = err(format!("cannot reach the TCI server at {addr}: {e}")),
+        }
+    }
+    let tcp = tcp.ok_or(last)?;
     on_tcp(&tcp)?;
     tcp.set_nodelay(true)?;
     tcp.set_read_timeout(Some(timing.connect))?;
@@ -692,6 +698,35 @@ mod tests {
     }
 
     #[test]
+    fn bad_packet_right_after_reconnect() {
+        let addr = server(|n, ws| {
+            commands(ws);
+            if n == 0 {
+                send_audio(ws, &[(0.5, 0.5); 2048]);
+            } else {
+                std::thread::sleep(Duration::from_millis(200));
+                // int16: an error, standing for its 2048 frames.
+                ws.send(Message::binary(packet(1, 0, RATE, 0, &[(0.0, 0.0); 2048]))).unwrap();
+                send_audio(ws, &[(0.25, 0.25); 2048]);
+                hold(ws);
+            }
+        });
+        let o = open(&addr, Channel::Left, Timing { read: Duration::from_secs(5), ..fast() }).unwrap();
+        let mut all = Vec::new();
+        while !all.contains(&0.25) {
+            all.extend(o.rx.recv_timeout(Duration::from_secs(5)).expect("audio after reconnect"));
+        }
+        all.extend(take(&o.rx, 2048 - all.iter().filter(|&&x| x == 0.25).count()).concat());
+        assert!(all[..2048].iter().all(|&x| x == 0.5));
+        let zeros = all[2048..].iter().take_while(|&&x| x == 0.0).count();
+        assert_eq!(all.len(), 2048 + zeros + 2048, "one run of zeros, then the good packet");
+        // The bad packet's 2048 frames, plus the gap of about backoff (100 ms) + server delay (200 ms).
+        let ms = zeros as f64 * 1000.0 / RATE as f64;
+        assert!(ms > 2048.0 * 1000.0 / RATE as f64 + 150.0, "{ms:.0} ms of zeros");
+        assert_eq!(o.overruns.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn modem_burst_decodes_through_tci() {
         use vardefm_modem::{Burst, Header, Kind, Modem, OfdmParams, Receiver as ModemRx};
         let modem = Arc::new(Modem::new(OfdmParams::by_name("narrow").unwrap(), 0.1));
@@ -724,7 +759,8 @@ mod tests {
             }
             hold(ws);
         });
-        let o = open(&addr, Channel::Right, fast()).unwrap();
+        // A long read timeout: a stall would otherwise reconnect and replay the burst.
+        let o = open(&addr, Channel::Right, Timing { read: Duration::from_secs(5), ..fast() }).unwrap();
         let mut rx = ModemRx::new(modem);
         let mut got = Vec::new();
         for c in take(&o.rx, total) {
