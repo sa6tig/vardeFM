@@ -237,6 +237,84 @@ fn watchdog_unkeys_a_stuck_sound_card() {
     panic!("never unkeyed");
 }
 
+/// A TCI connection lost in the middle of a transmission must not leave the radio keyed.
+/// The engine's clock is the input sample count; the TCI input keeps it moving with zeros
+/// while the audio is missing, so the PTT tail runs out as usual (not only the watchdog).
+#[test]
+fn tci_loss_during_tx_still_unkeys() {
+    use std::net::TcpListener;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Instant;
+    use tungstenite::Message;
+
+    let cut = Arc::new(AtomicBool::new(false));
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let c = cut.clone();
+    std::thread::spawn(move || {
+        for (n, s) in listener.incoming().enumerate() {
+            let Ok(mut ws) = tungstenite::accept(s.unwrap()) else { continue };
+            loop {
+                match ws.read() {
+                    Ok(Message::Text(t)) if t.starts_with("audio_start") => break,
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+            if n > 0 {
+                continue; // later connections close at once: the audio never comes back
+            }
+            // wfview-style RX audio: 48 kHz float32 stereo silence, 2048 frames per packet,
+            // in real time, until the radio keys.
+            let mut pkt = vec![0u8; 64 + 2048 * 8];
+            for (i, w) in [(1usize, 48_000u32), (2, 3), (5, 4096), (6, 1)] {
+                pkt[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
+            }
+            let start = Instant::now();
+            let mut sent = 0u32;
+            while !c.load(Ordering::Relaxed) {
+                if ws.send(Message::binary(pkt.clone())).is_err() {
+                    break;
+                }
+                sent += 1;
+                let due = start + Duration::from_secs_f64(sent as f64 * 2048.0 / 48_000.0);
+                std::thread::sleep(due.saturating_duration_since(Instant::now()));
+            }
+            let _ = ws.close(None);
+            let _ = ws.flush();
+        }
+    });
+
+    let input = vardefm_audio::open_input(Some(&format!("tci:{addr}")), Channel::Left).unwrap();
+    let card: Shared = Arc::default();
+    let mut eng = engine(&card, 4);
+    let mut host_in = vec![HostIn::Line("MYCALL LA1AAA".into()), HostIn::Line("CONNECT LA1AAA LA9ZZZ".into())];
+    let start = Instant::now();
+    let mut ticks = 0;
+    let mut keyed_at = None;
+    while start.elapsed() < Duration::from_secs(20) {
+        let chunk = input.rx.recv_timeout(Duration::from_millis(20)).ok();
+        eng.step(chunk.as_deref(), std::mem::take(&mut host_in));
+        // The sound card plays in wall time, whatever the input does.
+        let due = (start.elapsed().as_millis() / 10) as usize;
+        while ticks < due {
+            card.lock().unwrap().tick();
+            ticks += 1;
+        }
+        let ptt = card.lock().unwrap().ptt;
+        if ptt && keyed_at.is_none() {
+            keyed_at = Some(Instant::now());
+            cut.store(true, Ordering::Relaxed);
+        }
+        if let (Some(k), false) = (keyed_at, ptt) {
+            assert!(k.elapsed() < Duration::from_secs(4), "held PTT for {:?}", k.elapsed());
+            assert!(!eng.log.iter().any(|l| l.contains("watchdog")), "{:?}", eng.log);
+            return;
+        }
+    }
+    panic!("PTT still keyed after 20 s: {:?}", eng.log);
+}
+
 /// Station A calls; B hears A's audio scaled by `gain` and clipped at full scale.
 fn hear_a_call(gain: f32) -> RadioEngine<FakeOut> {
     let cards: [Shared; 2] = [Arc::default(), Arc::default()];

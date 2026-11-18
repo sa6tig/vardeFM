@@ -152,7 +152,7 @@ pub struct AudioIn {
     pub name: String,
     /// Device rate (48000 unless resampling).
     pub device_rate: u32,
-    /// Chunks dropped because the receiver fell behind; for TCI, also packets lost to errors.
+    /// Chunks dropped because the receiver fell behind; for TCI, also packets with errors.
     pub overruns: Arc<AtomicU64>,
 }
 

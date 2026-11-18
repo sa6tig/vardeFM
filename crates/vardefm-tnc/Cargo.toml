@@ -14,3 +14,4 @@ vardefm-sim.workspace = true
 vardefm-audio.workspace = true
 vardefm-ptt.workspace = true
 [dev-dependencies]
+tungstenite.workspace = true

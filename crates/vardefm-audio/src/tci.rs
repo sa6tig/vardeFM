@@ -10,11 +10,14 @@
 //! - wfview streams audio only when its Audio System is TCI, the radio was connected after
 //!   that setting changed, and the rig sends its audio over the network (not USB).
 //! - A connection that is closed, or brings no RX audio for 5 s (even if other packets
-//!   still arrive), is dropped and retried with a backoff. While the audio is missing,
-//!   zeros are sent at wall-clock pace, so the sample count (the modem's clock, which also
-//!   times PTT release and the transmit watchdog) keeps moving. The clock still stands
-//!   still for up to 5 s before the audio counts as missing, and for up to 3 s during each
-//!   connect attempt. The zeros then catch up. The address is resolved once, when opening.
+//!   still arrive), is dropped and retried with a backoff, without limit, until the input
+//!   is dropped. While the audio is missing, zeros are sent at wall-clock pace (at least
+//!   every 250 ms on an open connection), so the sample count (the modem's clock, which also
+//!   times PTT release and the transmit watchdog) keeps moving. The clock still stands still
+//!   for up to 5 s before the audio counts as missing, and for up to 3 s during each connect
+//!   attempt. The zeros then catch up. The address is resolved once, when opening.
+//! - On Windows a read that times out can make the next read fail (os error 997); here that
+//!   only costs a reconnect while the audio is already missing.
 //!
 //! The TCI port has no authentication: anyone who can reach it can key the radio.
 
@@ -36,22 +39,25 @@ const HEADER_BYTES: usize = 64;
 const TYPE_RX_AUDIO: u32 = 1;
 const FORMAT_FLOAT32: u32 = 3;
 const MIN_BACKOFF: Duration = Duration::from_millis(100);
-const MAX_BACKOFF: Duration = Duration::from_secs(1);
+/// Longest wait between zero fills while the audio is missing on an open connection.
+const FILL_TICK: Duration = Duration::from_millis(250);
+/// How often a connection that stays down is reported.
+const DOWN_NOTE_EVERY: Duration = Duration::from_secs(30);
 /// Longest time one bad packet may stand for (a wfview packet is 43 ms).
 const MAX_BAD_FRAMES: usize = RATE as usize;
 /// Frames per chunk of filler zeros. Large, so catching up after a 5 s silence takes
-/// about 10 chunks and cannot fill the queue.
+/// about 10 chunks of the queue's 256.
 const FILL_CHUNK: usize = RATE as usize / 2;
 
 type Ws = WebSocket<TcpStream>;
 
-/// The TCI address in an `--audio-in` value: `tci` or `tci:HOST:PORT` (any case).
+/// The TCI address in an `--audio-in` value: `tci` (the default address) or `tci:HOST:PORT`
+/// (any case). `tci:` alone gives an empty address, which [`open`] refuses.
 pub fn addr_from_name(name: &str) -> Option<&str> {
     if name.eq_ignore_ascii_case("tci") {
         return Some(DEFAULT_ADDR);
     }
-    let rest = name.get(..4).filter(|p| p.eq_ignore_ascii_case("tci:")).map(|_| &name[4..])?;
-    Some(if rest.is_empty() { DEFAULT_ADDR } else { rest })
+    name.get(..4).filter(|p| p.eq_ignore_ascii_case("tci:")).map(|_| &name[4..])
 }
 
 /// Time limits; tests shorten them.
@@ -63,11 +69,18 @@ pub(crate) struct Timing {
     pub first: Duration,
     /// Time without RX audio after which a connection counts as lost.
     pub read: Duration,
+    /// Longest wait between reconnects (the backoff starts at 100 ms and doubles).
+    pub max_backoff: Duration,
 }
 
 impl Default for Timing {
     fn default() -> Self {
-        Self { connect: Duration::from_secs(3), first: Duration::from_secs(5), read: Duration::from_secs(5) }
+        Self {
+            connect: Duration::from_secs(3),
+            first: Duration::from_secs(5),
+            read: Duration::from_secs(5),
+            max_backoff: Duration::from_secs(1),
+        }
     }
 }
 
@@ -78,8 +91,10 @@ enum Packet {
     Skip,
     /// A frame shorter than the header.
     Short,
-    /// Mono samples from the chosen channel; `nonfinite` if any were NaN or infinite (now 0).
-    Audio { mono: Vec<f32>, nonfinite: bool },
+    /// Mono samples from the chosen channel. `damaged` if any were NaN or infinite (now 0),
+    /// if the packet holds fewer samples than its `length` says (the rest are zeros), or if
+    /// `length` is odd, so not whole stereo frames.
+    Audio { mono: Vec<f32>, damaged: bool },
     /// RX audio that cannot be used, standing for `frames` frames at 48 kHz (at most 1 s).
     Bad { frames: usize, why: String },
 }
@@ -112,31 +127,37 @@ fn parse_packet(b: &[u8], channel: Channel) -> Packet {
         _ => 4,
     };
     let body = &b[HEADER_BYTES..];
-    // `length` counts samples (wfview: floats, not frames). Trust only the bytes present.
+    // `length` counts samples (wfview: floats, not frames). Stereo is assumed: the client asks
+    // for 2 channels, and wfview always sends 2 but leaves the `channels` word unset, so it
+    // cannot be checked. An odd `length` shows at least that it is not whole stereo frames.
+    // Trust only the bytes present.
     let samples = (length as usize).min(body.len() / bytes_per_sample);
     let frames = samples / 2;
+    // Frames the header promises but the packet lacks, as zeros (bounded like a bad packet).
+    let missing = ((length as usize / 2).saturating_sub(frames)).min(MAX_BAD_FRAMES);
     if rate != RATE || format != FORMAT_FLOAT32 {
         let frames = if rate == 0 { frames } else { (frames as u64 * RATE as u64 / rate as u64) as usize };
         return Packet::Bad { frames: frames.min(MAX_BAD_FRAMES), why: format!("{rate} Hz {}", format_name(format)) };
     }
-    let mut nonfinite = false;
+    let mut damaged = missing > 0 || length % 2 == 1;
     let mut sample = |i: usize| {
         let x = f32::from_le_bytes(body[4 * i..4 * i + 4].try_into().unwrap());
         if x.is_finite() {
             x
         } else {
-            nonfinite = true;
+            damaged = true;
             0.0
         }
     };
-    let mono = (0..frames)
+    let mut mono: Vec<f32> = (0..frames)
         .map(|f| match channel {
             Channel::Left => sample(2 * f),
             Channel::Right => sample(2 * f + 1),
             Channel::Both => 0.5 * (sample(2 * f) + sample(2 * f + 1)),
         })
         .collect();
-    Packet::Audio { mono, nonfinite }
+    mono.resize(frames + missing, 0.0);
+    Packet::Audio { mono, damaged }
 }
 
 fn is_timeout(e: &tungstenite::Error) -> bool {
@@ -199,11 +220,11 @@ fn connect(
             Err(HandshakeError::Failure(e)) => return Err(err(format!("TCI handshake with {addr}: {e}"))),
         }
     };
-    ws.get_ref().set_write_timeout(Some(left()?))?;
     // wfview ignores the first three (it always sends 48 kHz float32 stereo); ExpertSDR honours them.
     for cmd in
         ["audio_samplerate:48000;", "audio_stream_sample_type:float32;", "audio_stream_channels:2;", "audio_start:0;"]
     {
+        ws.get_ref().set_write_timeout(Some(left()?))?;
         ws.send(Message::text(cmd)).map_err(|e| err(format!("TCI {addr}: {e}")))?;
     }
     ws.get_ref().set_read_timeout(Some(timing.read))?;
@@ -231,7 +252,7 @@ fn first_packet(ws: &mut Ws, addr: &str, channel: Channel, wait: Duration) -> io
         match ws.read() {
             Ok(Message::Binary(b)) => match parse_packet(&b, channel) {
                 Packet::Skip | Packet::Short => {}
-                Packet::Audio { mono, nonfinite } => return Ok((mono, nonfinite)),
+                Packet::Audio { mono, damaged } => return Ok((mono, damaged)),
                 Packet::Bad { why, .. } => {
                     return Err(err(format!("the TCI server at {addr} sends {why}; VardeFM needs 48000 Hz float32")))
                 }
@@ -283,12 +304,15 @@ pub(crate) struct Opened {
 
 /// Connect, wait for the first audio packet, then stream on a thread.
 pub(crate) fn open(addr: &str, channel: Channel, timing: Timing) -> io::Result<Opened> {
+    if addr.is_empty() {
+        return Err(err("no address after tci: (use tci alone for 127.0.0.1:50001, or tci:HOST:PORT)"));
+    }
     let addrs = resolve(addr)?;
     let mut ws = connect(addr, &addrs, timing, |_| Ok(()))?;
-    let (first, nonfinite) = first_packet(&mut ws, addr, channel, timing.first)?;
+    let (first, damaged) = first_packet(&mut ws, addr, channel, timing.first)?;
     ws.get_ref().set_read_timeout(Some(timing.read))?;
     let (tx, rx) = sync_channel(256);
-    let overruns = Arc::new(AtomicU64::new(nonfinite as u64));
+    let overruns = Arc::new(AtomicU64::new(damaged as u64));
     let _ = tx.try_send(first);
     let (stop_tx, stop_rx) = mpsc::channel();
     let shared = Arc::new(Shared { sock: Mutex::new(Some(ws.get_ref().try_clone()?)) });
@@ -380,8 +404,8 @@ impl Worker {
                     self.overruns.fetch_add(1, Ordering::Relaxed);
                     Step::Nothing
                 }
-                Packet::Audio { mono, nonfinite } => {
-                    if nonfinite {
+                Packet::Audio { mono, damaged } => {
+                    if damaged {
                         self.overruns.fetch_add(1, Ordering::Relaxed);
                     }
                     Step::Audio(mono)
@@ -391,6 +415,8 @@ impl Worker {
                     Step::Audio(vec![0.0; frames])
                 }
             },
+            // A read timeout only means the wait set by `run_inner` is over.
+            Err(e) if is_timeout(&e) => Step::Nothing,
             Ok(Message::Close(_)) | Err(_) => Step::Down,
             Ok(_) => Step::Nothing,
         }
@@ -412,7 +438,13 @@ impl Worker {
         let mut lost = false;
         let mut backoff = MIN_BACKOFF;
         let mut last_err = String::new();
+        // When to report next that the audio is still missing.
+        let mut next_note = Instant::now();
         loop {
+            if lost && Instant::now() >= next_note {
+                eprintln!("TCI audio from {} still missing after {:.0} s", self.addr, last.elapsed().as_secs_f64());
+                next_note += DOWN_NOTE_EVERY;
+            }
             let Some(w) = ws.as_mut() else {
                 self.fill(last.elapsed(), &mut filled)?;
                 match self.stop.recv_timeout(backoff) {
@@ -420,7 +452,7 @@ impl Worker {
                     _ => return None,
                 }
                 // Reset only by RX audio: a server that accepts and then sends none backs off too.
-                backoff = (backoff * 2).min(MAX_BACKOFF);
+                backoff = (backoff * 2).min(self.timing.max_backoff);
                 self.fill(last.elapsed(), &mut filled)?;
                 match connect(&self.addr, &self.addrs, self.timing, |tcp| self.register(tcp)) {
                     Ok(w) => {
@@ -441,10 +473,18 @@ impl Worker {
                 }
                 continue;
             };
-            let step = match self.read(w) {
-                // Other packets (TX_CHRONO, text) keep the socket busy without bringing audio.
-                Step::Nothing if Instant::now() >= audio_due => Step::Down,
-                s => s,
+            // Wait for the next frame no longer than until the audio is due, and while it is
+            // missing, no longer than until the next zero fill. Other packets (TX_CHRONO,
+            // text) keep the socket busy without bringing audio, so the deadline is ours.
+            let left = audio_due.saturating_duration_since(Instant::now());
+            let step = if left.is_zero() {
+                Step::Down
+            } else {
+                let wait = if lost { left.min(FILL_TICK) } else { left };
+                match w.get_ref().set_read_timeout(Some(wait)) {
+                    Ok(()) => self.read(w),
+                    Err(_) => Step::Down,
+                }
             };
             let chunk = match step {
                 Step::Audio(c) => c,
@@ -460,6 +500,7 @@ impl Worker {
                     }
                     if !lost {
                         eprintln!("TCI audio from {} lost; reconnecting", self.addr);
+                        next_note = Instant::now() + DOWN_NOTE_EVERY;
                     }
                     lost = true;
                     ws = None;
@@ -471,6 +512,7 @@ impl Worker {
             if lost {
                 // Top up the zeros to the full gap, from arrival times. Only across a loss:
                 // within a working connection, network jitter would show up as false gaps.
+                // Top-up zeros dropped on a full queue are not sent again.
                 lost = false;
                 backoff = MIN_BACKOFF;
                 let span = ((now - last).as_secs_f64() * RATE as f64) as usize;
@@ -554,7 +596,22 @@ mod tests {
             connect: Duration::from_millis(500),
             first: Duration::from_millis(300),
             read: Duration::from_millis(300),
+            max_backoff: Duration::from_millis(200),
         }
+    }
+
+    /// The modem's clock (all samples so far) against wall time since the first packet,
+    /// `t0`, after `secs`: never ahead, and behind by at most one backoff plus a connect.
+    fn assert_wall_pace(rx: &Receiver<Vec<f32>>, t0: Instant, secs: f64) {
+        let mut got = 0;
+        while t0.elapsed().as_secs_f64() < secs {
+            if let Ok(c) = rx.recv_timeout(Duration::from_millis(20)) {
+                got += c.len();
+            }
+        }
+        got += rx.try_iter().map(|c| c.len()).sum::<usize>();
+        let s = got as f64 / RATE as f64;
+        assert!(s > secs - 0.35 && s < secs + 0.1, "{s:.2} s of audio after {secs} s");
     }
 
     fn open_err(addr: &str, timing: Timing) -> String {
@@ -579,7 +636,8 @@ mod tests {
     #[test]
     fn names() {
         assert_eq!(addr_from_name("tci"), Some(DEFAULT_ADDR));
-        assert_eq!(addr_from_name("TCI:"), Some(DEFAULT_ADDR));
+        assert_eq!(addr_from_name("TCI:"), Some(""));
+        assert!(open_err("", fast()).contains("no address"));
         assert_eq!(addr_from_name("Tci:10.0.0.5:50001"), Some("10.0.0.5:50001"));
         assert_eq!(addr_from_name("USB Audio"), None);
         assert_eq!(addr_from_name("tcix"), None);
@@ -589,10 +647,22 @@ mod tests {
     #[test]
     fn parse_bounds_length_and_skips() {
         let mut p = rx_audio(&[(0.1, 0.2), (0.3, 0.4)]);
-        p[20..24].copy_from_slice(&100u32.to_le_bytes()); // length beyond the bytes present
-        assert_eq!(parse_packet(&p, Channel::Left), Packet::Audio { mono: vec![0.1, 0.3], nonfinite: false });
-        p.truncate(p.len() - 4); // half a frame: rounded down
-        assert_eq!(parse_packet(&p, Channel::Right), Packet::Audio { mono: vec![0.2], nonfinite: false });
+        assert_eq!(parse_packet(&p, Channel::Left), Packet::Audio { mono: vec![0.1, 0.3], damaged: false });
+        // Truncated: `length` promises 4 frames, 2 are present. The rest become zeros, as an error.
+        p[20..24].copy_from_slice(&8u32.to_le_bytes());
+        assert_eq!(parse_packet(&p, Channel::Left), Packet::Audio { mono: vec![0.1, 0.3, 0.0, 0.0], damaged: true });
+        // Half a frame present: rounded down, the rest zeros.
+        p.truncate(p.len() - 4);
+        assert_eq!(parse_packet(&p, Channel::Right), Packet::Audio { mono: vec![0.2, 0.0, 0.0, 0.0], damaged: true });
+        // An odd `length` is not whole stereo frames.
+        let mut p = rx_audio(&[(0.1, 0.2), (0.3, 0.4)]);
+        p[20..24].copy_from_slice(&3u32.to_le_bytes());
+        assert_eq!(parse_packet(&p, Channel::Left), Packet::Audio { mono: vec![0.1], damaged: true });
+        // A huge `length` stands for at most 1 s.
+        p[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(
+            matches!(parse_packet(&p, Channel::Left), Packet::Audio { mono, damaged: true } if mono.len() == RATE as usize + 2)
+        );
         assert_eq!(parse_packet(&packet(3, 0, RATE, 3, &[(0.0, 0.0)]), Channel::Left), Packet::Skip);
         assert_eq!(parse_packet(&packet(1, 1, RATE, 3, &[(0.0, 0.0)]), Channel::Left), Packet::Skip);
         assert_eq!(parse_packet(&[0; 10], Channel::Left), Packet::Short);
@@ -639,13 +709,27 @@ mod tests {
                 send_audio(ws, &[(0.5, 0.5)]);
             }
         });
-        let o = open(&addr, Channel::Left, fast()).unwrap();
-        // Zeros at wall-clock pace, give or take one backoff (at most 1 s) and a chunk.
+        // The real maximum backoff, to see it grow.
+        let o = open(&addr, Channel::Left, Timing { max_backoff: Duration::from_secs(1), ..fast() }).unwrap();
         let s = samples_in(&o.rx, 1.5) as f64 / RATE as f64;
-        assert!(s > 0.9 && s < 2.1, "{s:.2} s of audio in 1.5 s");
+        // Behind by at most one backoff (up to 800 ms in this window), never ahead.
+        assert!(s > 0.6 && s < 1.6, "{s:.2} s of audio in 1.5 s");
         // Backoff 100, 200, 400, 800 ms: not a reconnect every 100 ms, though each handshake succeeds.
         let n = conns.load(Ordering::Relaxed);
         assert!(n <= 6, "{n} connections in 1.5 s");
+    }
+
+    #[test]
+    fn steady_zeros_while_lost() {
+        // Every connection after the first closes at once.
+        let addr = server(|n, ws| {
+            commands(ws);
+            if n == 0 {
+                send_audio(ws, &[(0.5, 0.5)]);
+            }
+        });
+        let o = open(&addr, Channel::Left, fast()).unwrap();
+        assert_wall_pace(&o.rx, Instant::now(), 1.5);
     }
 
     #[test]
@@ -663,10 +747,38 @@ mod tests {
             }
         });
         let o = open(&addr, Channel::Left, fast()).unwrap();
+        assert_wall_pace(&o.rx, Instant::now(), 1.5);
+    }
+
+    #[test]
+    fn audio_timeout_counts_from_the_audio_and_silent_reconnects_still_fill() {
+        // Audio, one TX_CHRONO packet 0.8 s later, then silence. Later connections stay silent.
+        let addr = server(|n, ws| {
+            commands(ws);
+            if n == 0 {
+                send_audio(ws, &[(0.5, 0.5)]);
+                std::thread::sleep(Duration::from_millis(800));
+                let _ = ws.send(Message::binary(packet(3, 0, RATE, FORMAT_FLOAT32, &[(0.0, 0.0); 4])));
+            }
+            hold(ws);
+        });
+        let o = open(&addr, Channel::Left, Timing { read: Duration::from_secs(1), ..fast() }).unwrap();
+        let t0 = Instant::now();
         assert_eq!(o.rx.recv_timeout(Duration::from_secs(1)).unwrap(), vec![0.5]);
-        // After the 300 ms audio timeout, zeros at wall-clock pace.
-        let s = samples_in(&o.rx, 1.5) as f64 / RATE as f64;
-        assert!(s > 0.9 && s < 2.1, "{s:.2} s of audio in 1.5 s");
+        // Lost 1 s after the audio, not 1 s after the TX_CHRONO packet (1.8 s).
+        let zeros = o.rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(t0.elapsed() < Duration::from_millis(1300), "first zeros after {:?}", t0.elapsed());
+        // The new connections stay open and silent: zeros at least every 250 ms, not only
+        // after each 1 s read timeout. (The fill from t0 covers the first 1 s pause.)
+        let mut got = 1 + zeros.len();
+        while t0.elapsed() < Duration::from_secs(3) {
+            if let Ok(c) = o.rx.recv_timeout(Duration::from_millis(20)) {
+                got += c.len();
+            }
+        }
+        got += o.rx.try_iter().map(|c| c.len()).sum::<usize>();
+        let s = got as f64 / RATE as f64;
+        assert!(s > 3.0 - 0.35 && s < 3.0 + 0.1, "{s:.2} s of audio after 3 s");
     }
 
     #[test]
@@ -684,7 +796,7 @@ mod tests {
                 held.push(s);
             }
         });
-        // Real timing: each handshake read waits 2 s.
+        // Real timing: the stalled handshake would wait out the 3 s connect deadline.
         let o = open(&addr, Channel::Left, Timing::default()).unwrap();
         std::thread::sleep(Duration::from_millis(400)); // past the 100 ms backoff, into the handshake
         let t = Instant::now();
@@ -721,7 +833,8 @@ mod tests {
 
     #[test]
     fn silent_server_fails_with_a_hint() {
-        // TX_CHRONO only, as wfview sends when its Audio System is not TCI.
+        // TX_CHRONO only: a server that streams other packets but no RX audio. (Whether wfview
+        // sends TX_CHRONO without RX audio, e.g. when its Audio System is not TCI, is unverified.)
         let addr = server(|_, ws| {
             commands(ws);
             ws.send(Message::binary(packet(3, 0, RATE, 3, &[(0.0, 0.0)]))).unwrap();
@@ -741,9 +854,10 @@ mod tests {
         let e = open_err(&addr, fast());
         assert!(e.contains("44100 Hz float32"), "{e}");
 
-        // Port 1 is privileged and normally closed. Only check that the open fails: a port
-        // that was free a moment ago could be taken by another test's server.
-        open_err("127.0.0.1:1", fast());
+        // Port 1 is privileged and normally closed. A port that was free a moment ago could be
+        // taken by another test's server.
+        let e = open_err("127.0.0.1:1", fast());
+        assert!(e.contains("cannot reach") || e.contains("no answer"), "{e}");
     }
 
     #[test]
@@ -823,18 +937,22 @@ mod tests {
                 hold(ws);
             }
         });
+        let start = Instant::now();
         let o = open(&addr, Channel::Left, Timing { read: Duration::from_secs(5), ..fast() }).unwrap();
         let mut all = Vec::new();
         while !all.contains(&0.25) {
             all.extend(o.rx.recv_timeout(Duration::from_secs(5)).expect("audio after reconnect"));
         }
+        let elapsed = start.elapsed().as_secs_f64();
         all.extend(take(&o.rx, 2048 - all.iter().filter(|&&x| x == 0.25).count()).concat());
         assert!(all[..2048].iter().all(|&x| x == 0.5));
         let zeros = all[2048..].iter().take_while(|&&x| x == 0.0).count();
         assert_eq!(all.len(), 2048 + zeros + 2048, "one run of zeros, then the good packet");
         // The bad packet's 2048 frames, plus the gap of about backoff (100 ms) + server delay (200 ms).
         let ms = zeros as f64 * 1000.0 / RATE as f64;
-        assert!(ms > 2048.0 * 1000.0 / RATE as f64 + 150.0, "{ms:.0} ms of zeros");
+        // The zeros (gap plus bad packet) span the wall time between the last good packet
+        // and the bad one: never more than the whole run.
+        assert!(ms > 2048.0 * 1000.0 / RATE as f64 + 150.0 && ms < elapsed * 1000.0, "{ms:.0} ms of zeros");
         assert_eq!(o.overruns.load(Ordering::Relaxed), 1);
     }
 
