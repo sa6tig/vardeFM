@@ -1,0 +1,420 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "StatusSnapshot",
+  "description": "Answer to `GET /v1/status`.",
+  "type": "object",
+  "properties": {
+    "recent": {
+      "description": "Latest gap and warning events, oldest first.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ApiEvent"
+      }
+    },
+    "status": {
+      "description": "Latest counters.",
+      "$ref": "#/$defs/Status"
+    },
+    "v": {
+      "description": "`API_VERSION` of the sender.",
+      "type": "integer",
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0
+    },
+    "vfm_recent": {
+      "description": "Latest vardeFM events (`Vfm...`, see `vardefm-events.schema.json`), oldest first.",
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    }
+  },
+  "required": [
+    "v",
+    "status",
+    "recent"
+  ],
+  "$defs": {
+    "ApiEvent": {
+      "description": "A shared message of the server; JSON text on a stream.",
+      "oneOf": [
+        {
+          "description": "First message on a stream.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "Hello"
+            }
+          },
+          "$ref": "#/$defs/Hello",
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "description": "Counters, about once per second.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "Status"
+            }
+          },
+          "$ref": "#/$defs/Status",
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "description": "The audio had a discontinuity.",
+          "type": "object",
+          "properties": {
+            "t": {
+              "description": "First sample after it.",
+              "$ref": "#/$defs/WireTime"
+            },
+            "type": {
+              "type": "string",
+              "const": "Gap"
+            }
+          },
+          "required": [
+            "type",
+            "t"
+          ]
+        },
+        {
+          "description": "Something a person should know.",
+          "type": "object",
+          "properties": {
+            "code": {
+              "description": "Stable identifier.",
+              "type": "string"
+            },
+            "text": {
+              "description": "Description, for people.",
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "Warning"
+            }
+          },
+          "required": [
+            "type",
+            "code",
+            "text"
+          ]
+        }
+      ]
+    },
+    "CallbackPriority": {
+      "description": "Scheduling of the audio backend's capture thread.",
+      "oneOf": [
+        {
+          "description": "Not seen yet, or not measured.",
+          "type": "string",
+          "const": "unknown"
+        },
+        {
+          "description": "Real-time.",
+          "type": "string",
+          "const": "realtime"
+        },
+        {
+          "description": "Promotion to real-time was refused.",
+          "type": "string",
+          "const": "denied"
+        },
+        {
+          "description": "A normal time-sharing thread.",
+          "type": "string",
+          "const": "normal"
+        }
+      ]
+    },
+    "Hello": {
+      "description": "First message on a stream.",
+      "type": "object",
+      "properties": {
+        "mode": {
+          "description": "Modem mode the server runs, such as `vardefm-narrow`.",
+          "type": "string"
+        },
+        "server": {
+          "description": "Server name and version.",
+          "type": "string"
+        },
+        "waterfall": {
+          "description": "Format of the binary waterfall frames.",
+          "$ref": "#/$defs/WaterfallFormat"
+        }
+      },
+      "required": [
+        "server",
+        "mode",
+        "waterfall"
+      ]
+    },
+    "LinkState": {
+      "description": "Where the ARQ session stands.",
+      "oneOf": [
+        {
+          "description": "Not listening and not connected.",
+          "type": "string",
+          "const": "idle"
+        },
+        {
+          "description": "Answers connect requests.",
+          "type": "string",
+          "const": "listening"
+        },
+        {
+          "description": "Calling a peer.",
+          "type": "string",
+          "const": "connecting"
+        },
+        {
+          "description": "Connected to a peer.",
+          "type": "string",
+          "const": "connected"
+        },
+        {
+          "description": "Ending the connection.",
+          "type": "string",
+          "const": "disconnecting"
+        }
+      ]
+    },
+    "LinkStatus": {
+      "description": "A snapshot of the ARQ session.",
+      "type": "object",
+      "properties": {
+        "level": {
+          "description": "Level of our transmissions, while connected.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        },
+        "peer": {
+          "description": "The peer's call sign, once known.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rx_queued": {
+          "description": "Bytes from the peer not yet read by the host.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "state": {
+          "description": "Where the session stands.",
+          "$ref": "#/$defs/LinkState"
+        },
+        "tx_queued": {
+          "description": "Bytes from the host not yet acknowledged by the peer.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "state",
+        "tx_queued",
+        "rx_queued"
+      ]
+    },
+    "Status": {
+      "description": "Monitor counters. Those that count since the start only ever grow.",
+      "type": "object",
+      "properties": {
+        "capture_priority": {
+          "description": "Scheduling of the audio backend's capture thread; `unknown` when not measured.",
+          "$ref": "#/$defs/CallbackPriority",
+          "default": "unknown"
+        },
+        "client_rows_dropped": {
+          "description": "Waterfall rows dropped because a client was slow, over all clients.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "cpu": {
+          "description": "Time in the modem, as a percentage of the audio's duration.",
+          "type": "number",
+          "format": "float"
+        },
+        "device_errors": {
+          "description": "Other audio backend errors.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "device_xruns": {
+          "description": "Overruns the audio backend reported.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "dropped_frames": {
+          "description": "Samples in those chunks.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "events_dropped": {
+          "description": "Events dropped between the radio loop and the server.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "gaps": {
+          "description": "Discontinuities in the audio.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "link": {
+          "description": "The ARQ session.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LinkStatus"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "longest_push_ms": {
+          "description": "Longest single step of the modem, in ms.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "mode": {
+          "description": "Modem mode the server runs.",
+          "type": "string"
+        },
+        "overruns": {
+          "description": "Audio chunks dropped because the modem fell behind.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "resample_cpu": {
+          "description": "Time in the resampler, as a percentage of the audio's duration; 0 for a 48 kHz device.",
+          "type": "number",
+          "format": "float"
+        },
+        "rows_dropped": {
+          "description": "Waterfall rows dropped between the radio loop and the server.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "t": {
+          "description": "Stream time reached.",
+          "$ref": "#/$defs/WireTime"
+        },
+        "tap_cpu": {
+          "description": "Time making waterfall rows, as a percentage of the audio's duration.",
+          "type": "number",
+          "format": "float"
+        },
+        "xrun_frames": {
+          "description": "Frames those overruns lost, estimated.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "t",
+        "mode",
+        "cpu",
+        "tap_cpu",
+        "resample_cpu",
+        "longest_push_ms",
+        "overruns",
+        "dropped_frames",
+        "device_xruns",
+        "xrun_frames",
+        "device_errors",
+        "gaps",
+        "events_dropped",
+        "rows_dropped",
+        "client_rows_dropped"
+      ]
+    },
+    "WaterfallFormat": {
+      "description": "What a client needs to read the binary waterfall frames; sent in `Hello`.",
+      "type": "object",
+      "properties": {
+        "bin_hz": {
+          "description": "Bin spacing, in Hz.",
+          "type": "number",
+          "format": "float"
+        },
+        "bins": {
+          "description": "Bins per row; bin `k` is at `k * bin_hz`.",
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "db_floor": {
+          "description": "Level of value 0, in dBFS; a value `v` is `db_floor + v * db_step`.",
+          "type": "number",
+          "format": "float"
+        },
+        "db_step": {
+          "description": "Level per value step, in dB.",
+          "type": "number",
+          "format": "float"
+        },
+        "format": {
+          "description": "Payload format the frames carry, see `FORMAT_WATERFALL_U8`.",
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        },
+        "rows_per_s": {
+          "description": "Rows per second the server makes.",
+          "type": "number",
+          "format": "float"
+        },
+        "stream": {
+          "description": "Stream id the frames carry, see `STREAM_WATERFALL`.",
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        }
+      },
+      "required": [
+        "stream",
+        "format",
+        "bins",
+        "bin_hz",
+        "db_floor",
+        "db_step",
+        "rows_per_s"
+      ]
+    },
+    "WireTime": {
+      "description": "A time on the 48 kHz receive clock, in samples since the radio started.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    }
+  }
+}

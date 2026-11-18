@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "VfmEnvelope",
+  "description": "vardeFM's own messages on the monitor API (wire version 1): the same envelope as the shared messages, with a `type` that starts with `Vfm`. The shared messages are described by `envelope.schema.json`. Times are samples at 48 kHz on the receive clock.",
+  "oneOf": [
+    { "$ref": "#/$defs/VfmBurstRx" },
+    { "$ref": "#/$defs/VfmBurstTx" },
+    { "$ref": "#/$defs/VfmBusy" }
+  ],
+  "$defs": {
+    "v": {
+      "description": "API version of the sender.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 65535
+    },
+    "WireTime": {
+      "description": "A time on the 48 kHz receive clock, in samples since the radio started.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "u8": { "type": "integer", "minimum": 0, "maximum": 255 },
+    "u32": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+    "VfmBurstRx": {
+      "description": "A burst received.",
+      "type": "object",
+      "properties": {
+        "v": { "$ref": "#/$defs/v" },
+        "type": { "const": "VfmBurstRx" },
+        "t": { "description": "First sample of the burst.", "$ref": "#/$defs/WireTime" },
+        "t_end": { "description": "End of the burst.", "$ref": "#/$defs/WireTime" },
+        "kind": { "description": "Header kind, such as `Data` or `ConnectReq`.", "type": "string" },
+        "level": { "description": "Speed level of the payload; absent if the burst has no codewords.", "$ref": "#/$defs/u8" },
+        "ncw": { "description": "Codewords in the burst.", "$ref": "#/$defs/u8" },
+        "cw_ok": { "description": "Codewords that decoded and passed their CRC.", "$ref": "#/$defs/u8" },
+        "snr_db": { "description": "The receiver's in-band SNR per symbol (Es/N0), in dB.", "type": "number" },
+        "peak_dbfs": { "description": "Peak audio level over the burst, in dBFS.", "type": "number" }
+      },
+      "required": ["v", "type", "t", "t_end", "kind", "ncw", "cw_ok", "snr_db", "peak_dbfs"]
+    },
+    "VfmBurstTx": {
+      "description": "A burst keyed up.",
+      "type": "object",
+      "properties": {
+        "v": { "$ref": "#/$defs/v" },
+        "type": { "const": "VfmBurstTx" },
+        "t": { "description": "Key-up time.", "$ref": "#/$defs/WireTime" },
+        "kind": { "description": "Header kind, such as `Data` or `ConnectReq`.", "type": "string" },
+        "level": { "description": "Speed level of the payload; absent if the burst has no codewords.", "$ref": "#/$defs/u8" },
+        "ncw": { "description": "Codewords in the burst.", "$ref": "#/$defs/u8" },
+        "bytes": { "description": "Payload bytes, resent bytes included.", "$ref": "#/$defs/u32" },
+        "resent_bytes": { "description": "Payload bytes sent before.", "$ref": "#/$defs/u32" },
+        "retry": { "description": "Consecutive retry number, 0 for a first attempt.", "$ref": "#/$defs/u32" },
+        "air_s": { "description": "Airtime, in seconds.", "type": "number" },
+        "repeat": { "description": "A digipeater repeat of another station's burst.", "type": "boolean" }
+      },
+      "required": ["v", "type", "t", "kind", "ncw", "bytes", "resent_bytes", "retry", "air_s", "repeat"]
+    },
+    "VfmBusy": {
+      "description": "The channel turned busy or free.",
+      "type": "object",
+      "properties": {
+        "v": { "$ref": "#/$defs/v" },
+        "type": { "const": "VfmBusy" },
+        "t": { "description": "When the receiver noticed.", "$ref": "#/$defs/WireTime" },
+        "busy": { "description": "Busy now.", "type": "boolean" }
+      },
+      "required": ["v", "type", "t", "busy"]
+    }
+  }
+}
