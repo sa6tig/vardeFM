@@ -9,8 +9,11 @@
 //!   format, length and type words are read.
 //! - wfview streams audio only when its Audio System is TCI, the radio was connected after
 //!   that setting changed, and the rig sends its audio over the network (not USB).
-//! - A dropped connection is retried with a backoff. The time lost is filled with zeros, so
-//!   the sample count (the modem's clock) stays close to wall time.
+//! - A dropped or silent connection is retried with a backoff. While it is down, zeros are
+//!   sent at wall-clock pace, so the sample count (the modem's clock, which also times PTT
+//!   release and the transmit watchdog) keeps moving. The clock still stands still while a
+//!   connection is silent but not yet counted as lost (up to 5 s), and during one connect
+//!   attempt (up to about 4 s). The zeros then catch up.
 //!
 //! The TCI port has no authentication: anyone who can reach it can key the radio.
 
@@ -32,10 +35,11 @@ const TYPE_RX_AUDIO: u32 = 1;
 const FORMAT_FLOAT32: u32 = 3;
 const MIN_BACKOFF: Duration = Duration::from_millis(100);
 const MAX_BACKOFF: Duration = Duration::from_secs(1);
-/// Longest gap filled with zeros after a reconnect.
-const MAX_GAP_FRAMES: usize = 10 * RATE as usize;
-/// Frames per chunk of gap zeros (one wfview packet).
-const GAP_CHUNK: usize = 2048;
+/// Longest time one bad packet may stand for (a wfview packet is 43 ms).
+const MAX_BAD_FRAMES: usize = RATE as usize;
+/// Frames per chunk of filler zeros. Large, so catching up after a 5 s silence takes
+/// about 10 chunks and cannot fill the queue.
+const FILL_CHUNK: usize = RATE as usize / 2;
 
 type Ws = WebSocket<TcpStream>;
 
@@ -70,9 +74,11 @@ impl Default for Timing {
 enum Packet {
     /// Another stream type or receiver.
     Skip,
+    /// A frame shorter than the header.
+    Short,
     /// Mono samples from the chosen channel; `nonfinite` if any were NaN or infinite (now 0).
     Audio { mono: Vec<f32>, nonfinite: bool },
-    /// RX audio that cannot be used, standing for `frames` frames at 48 kHz.
+    /// RX audio that cannot be used, standing for `frames` frames at 48 kHz (at most 1 s).
     Bad { frames: usize, why: String },
 }
 
@@ -92,7 +98,7 @@ fn format_name(f: u32) -> String {
 
 fn parse_packet(b: &[u8], channel: Channel) -> Packet {
     if b.len() < HEADER_BYTES {
-        return Packet::Bad { frames: 0, why: format!("a {}-byte packet, shorter than the header", b.len()) };
+        return Packet::Short;
     }
     let (receiver, rate, format, length, kind) = (word(b, 0), word(b, 1), word(b, 2), word(b, 5), word(b, 6));
     if kind != TYPE_RX_AUDIO || receiver != 0 {
@@ -109,7 +115,7 @@ fn parse_packet(b: &[u8], channel: Channel) -> Packet {
     let frames = samples / 2;
     if rate != RATE || format != FORMAT_FLOAT32 {
         let frames = if rate == 0 { frames } else { (frames as u64 * RATE as u64 / rate as u64) as usize };
-        return Packet::Bad { frames, why: format!("{rate} Hz {}", format_name(format)) };
+        return Packet::Bad { frames: frames.min(MAX_BAD_FRAMES), why: format!("{rate} Hz {}", format_name(format)) };
     }
     let mut nonfinite = false;
     let mut sample = |i: usize| {
@@ -136,7 +142,8 @@ fn is_timeout(e: &tungstenite::Error) -> bool {
 }
 
 /// Connect, handshake and ask for RX audio. Reads time out after `timing.read`.
-fn connect(addr: &str, timing: Timing) -> io::Result<Ws> {
+/// `on_tcp` sees the socket before the handshake, so it can be shut down from outside.
+fn connect(addr: &str, timing: Timing, on_tcp: impl FnOnce(&TcpStream) -> io::Result<()>) -> io::Result<Ws> {
     let sa = addr
         .to_socket_addrs()
         .map_err(|e| err(format!("TCI address {addr}: {e}")))?
@@ -144,6 +151,7 @@ fn connect(addr: &str, timing: Timing) -> io::Result<Ws> {
         .ok_or_else(|| err(format!("TCI address {addr} resolves to nothing")))?;
     let tcp = TcpStream::connect_timeout(&sa, timing.connect)
         .map_err(|e| err(format!("cannot reach the TCI server at {addr}: {e}")))?;
+    on_tcp(&tcp)?;
     tcp.set_nodelay(true)?;
     tcp.set_read_timeout(Some(timing.connect))?;
     tcp.set_write_timeout(Some(timing.connect))?;
@@ -179,7 +187,7 @@ fn first_packet(ws: &mut Ws, addr: &str, channel: Channel, wait: Duration) -> io
         ws.get_ref().set_read_timeout(Some(left))?;
         match ws.read() {
             Ok(Message::Binary(b)) => match parse_packet(&b, channel) {
-                Packet::Skip => {}
+                Packet::Skip | Packet::Short => {}
                 Packet::Audio { mono, nonfinite } => return Ok((mono, nonfinite)),
                 Packet::Bad { why, .. } => {
                     return Err(err(format!("the TCI server at {addr} sends {why}; VardeFM needs 48000 Hz float32")))
@@ -199,6 +207,7 @@ struct Shared {
 }
 
 /// Owns the reader thread. Dropping it stops the thread and closes the connection.
+/// Dropping during a reconnect's TCP connect can take up to `Timing::connect` (2 s).
 pub(crate) struct Reader {
     /// Dropped first on shutdown: the worker sees the disconnect and stops.
     stop: Option<Sender<()>>,
@@ -222,17 +231,6 @@ fn stopped(stop: &mpsc::Receiver<()>) -> bool {
     matches!(stop.try_recv(), Err(TryRecvError::Disconnected))
 }
 
-/// Keep a handle to `ws`'s socket for shutdown. False if the reader is being dropped.
-fn store(shared: &Shared, stop: &mpsc::Receiver<()>, ws: &Ws) -> bool {
-    let mut g = shared.sock.lock().unwrap();
-    // Checked under the lock, so no socket is stored after drop has taken the old one.
-    if stopped(stop) {
-        return false;
-    }
-    *g = ws.get_ref().try_clone().ok();
-    true
-}
-
 /// Opened TCI input: the reader and its outputs, for [`crate::AudioIn`].
 pub(crate) struct Opened {
     pub reader: Reader,
@@ -242,7 +240,7 @@ pub(crate) struct Opened {
 
 /// Connect, wait for the first audio packet, then stream on a thread.
 pub(crate) fn open(addr: &str, channel: Channel, timing: Timing) -> io::Result<Opened> {
-    let mut ws = connect(addr, timing)?;
+    let mut ws = connect(addr, timing, |_| Ok(()))?;
     let (first, nonfinite) = first_packet(&mut ws, addr, channel, timing.first)?;
     ws.get_ref().set_read_timeout(Some(timing.read))?;
     let (tx, rx) = sync_channel(256);
@@ -286,33 +284,78 @@ impl Worker {
         }
     }
 
+    /// Queue `n` zeros. False if `AudioIn` is gone.
+    fn zeros(&self, n: usize) -> bool {
+        (0..n).step_by(FILL_CHUNK).all(|i| self.send(vec![0.0; FILL_CHUNK.min(n - i)]))
+    }
+
+    /// Queue zeros until `filled` covers the wall time `since` the last packet.
+    fn fill(&self, since: Duration, filled: &mut usize) -> bool {
+        let due = (since.as_secs_f64() * RATE as f64) as usize;
+        let n = due.saturating_sub(*filled);
+        *filled += n;
+        self.zeros(n)
+    }
+
+    /// Keep a new socket for [`Reader`]'s drop to shut down. Fails if the reader is being dropped.
+    fn register(&self, tcp: &TcpStream) -> io::Result<()> {
+        let mut g = self.shared.sock.lock().unwrap();
+        // Checked under the lock, so no socket is stored after drop has taken the old one.
+        if stopped(&self.stop) {
+            return Err(err("TCI reader stopping"));
+        }
+        *g = Some(tcp.try_clone()?);
+        Ok(())
+    }
+
     fn run(self, ws: Ws) {
         let mut ws = Some(ws);
         // Arrival of the latest packet; the first one arrived just before this thread started.
         let mut last = Instant::now();
+        // Zeros queued since `last`, while the connection was down.
+        let mut filled = 0usize;
         let mut lost = false;
         let mut backoff = MIN_BACKOFF;
+        let mut last_err = String::new();
         loop {
             let Some(w) = ws.as_mut() else {
+                if !self.fill(last.elapsed(), &mut filled) {
+                    return;
+                }
                 match self.stop.recv_timeout(backoff) {
                     Err(RecvTimeoutError::Timeout) => {}
                     _ => return,
                 }
-                match connect(&self.addr, self.timing) {
+                if !self.fill(last.elapsed(), &mut filled) {
+                    return;
+                }
+                match connect(&self.addr, self.timing, |tcp| self.register(tcp)) {
                     Ok(w) => {
-                        if !store(&self.shared, &self.stop, &w) {
-                            return;
-                        }
                         ws = Some(w);
                         backoff = MIN_BACKOFF;
+                        last_err.clear();
                     }
-                    Err(_) => backoff = (backoff * 2).min(MAX_BACKOFF),
+                    Err(e) => {
+                        if stopped(&self.stop) {
+                            return;
+                        }
+                        let msg = e.to_string();
+                        if msg != last_err {
+                            eprintln!("TCI reconnect failed: {msg}");
+                            last_err = msg;
+                        }
+                        backoff = (backoff * 2).min(MAX_BACKOFF);
+                    }
                 }
                 continue;
             };
             let chunk = match w.read() {
                 Ok(Message::Binary(b)) => match parse_packet(&b, self.channel) {
                     Packet::Skip => continue,
+                    Packet::Short => {
+                        self.overruns.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                     Packet::Audio { mono, nonfinite } => {
                         if nonfinite {
                             self.overruns.fetch_add(1, Ordering::Relaxed);
@@ -325,6 +368,9 @@ impl Worker {
                     }
                 },
                 Ok(Message::Close(_)) | Err(_) => {
+                    if stopped(&self.stop) {
+                        return;
+                    }
                     if !lost {
                         eprintln!("TCI audio from {} lost; reconnecting", self.addr);
                     }
@@ -337,19 +383,17 @@ impl Worker {
             };
             let now = Instant::now();
             if lost {
-                // Count the gap from arrival times, only across a reconnect: within one
-                // connection, network jitter would show up as false gaps.
+                // Top up the zeros to the full gap, from arrival times. Only across a
+                // reconnect: within one connection, network jitter would show up as false gaps.
                 lost = false;
-                let span = (now - last).as_secs_f64() * RATE as f64;
-                let gap = (span as i64 - chunk.len() as i64).clamp(1, MAX_GAP_FRAMES as i64) as usize;
-                eprintln!("TCI audio from {} back; {} ms filled with silence", self.addr, gap * 1000 / RATE as usize);
-                for n in (0..gap).step_by(GAP_CHUNK) {
-                    if !self.send(vec![0.0; GAP_CHUNK.min(gap - n)]) {
-                        return;
-                    }
+                let span = ((now - last).as_secs_f64() * RATE as f64) as usize;
+                if !self.zeros(span.saturating_sub(chunk.len() + filled)) {
+                    return;
                 }
+                eprintln!("TCI audio from {} back after {:.1} s", self.addr, (now - last).as_secs_f64());
             }
             last = now;
+            filled = 0;
             if !chunk.is_empty() && !self.send(chunk) {
                 return;
             }
@@ -465,7 +509,69 @@ mod tests {
         assert_eq!(parse_packet(&p, Channel::Right), Packet::Audio { mono: vec![0.2], nonfinite: false });
         assert_eq!(parse_packet(&packet(3, 0, RATE, 3, &[(0.0, 0.0)]), Channel::Left), Packet::Skip);
         assert_eq!(parse_packet(&packet(1, 1, RATE, 3, &[(0.0, 0.0)]), Channel::Left), Packet::Skip);
-        assert!(matches!(parse_packet(&[0; 10], Channel::Left), Packet::Bad { frames: 0, .. }));
+        assert_eq!(parse_packet(&[0; 10], Channel::Left), Packet::Short);
+        // A bad rate stands for at most 1 s, however small the rate.
+        assert!(matches!(
+            parse_packet(&packet(1, 0, 1, 3, &[(0.0, 0.0); 4]), Channel::Left),
+            Packet::Bad { frames, .. } if frames == RATE as usize
+        ));
+    }
+
+    #[test]
+    fn short_frames_are_skipped_on_open() {
+        let addr = server(|_, ws| {
+            commands(ws);
+            ws.send(Message::binary(vec![0u8; 10])).unwrap();
+            send_audio(ws, &[(0.5, 0.5)]);
+            hold(ws);
+        });
+        let o = open(&addr, Channel::Left, fast()).unwrap();
+        assert_eq!(o.rx.recv_timeout(Duration::from_secs(1)).unwrap(), vec![0.5]);
+    }
+
+    #[test]
+    fn clock_keeps_moving_while_lost() {
+        // One packet, then every connection closes at once: the server never comes back.
+        let addr = server(|n, ws| {
+            commands(ws);
+            if n == 0 {
+                send_audio(ws, &[(0.5, 0.5)]);
+            }
+        });
+        let o = open(&addr, Channel::Left, fast()).unwrap();
+        let start = Instant::now();
+        let mut got = 0;
+        while start.elapsed() < Duration::from_secs(1) {
+            if let Ok(c) = o.rx.recv_timeout(Duration::from_millis(50)) {
+                got += c.len();
+            }
+        }
+        // Zeros at wall-clock pace, give or take one backoff (at most 1 s) and a chunk.
+        let s = got as f64 / RATE as f64;
+        assert!(s > 0.4 && s < 1.6, "{s:.2} s of audio in 1 s");
+    }
+
+    #[test]
+    fn drop_during_reconnect_handshake_returns_promptly() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let mut ws = tungstenite::accept(listener.accept().unwrap().0).unwrap();
+            commands(&mut ws);
+            send_audio(&mut ws, &[(0.5, 0.5)]);
+            drop(ws);
+            // Later connections: accept TCP but never answer the WebSocket handshake.
+            let mut held = Vec::new();
+            for s in listener.incoming() {
+                held.push(s);
+            }
+        });
+        // Real timing: each handshake read waits 2 s.
+        let o = open(&addr, Channel::Left, Timing::default()).unwrap();
+        std::thread::sleep(Duration::from_millis(400)); // past the 100 ms backoff, into the handshake
+        let t = Instant::now();
+        drop(o);
+        assert!(t.elapsed() < Duration::from_millis(500), "{:?}", t.elapsed());
     }
 
     #[test]
@@ -517,9 +623,9 @@ mod tests {
         let e = open_err(&addr, fast());
         assert!(e.contains("44100 Hz float32"), "{e}");
 
-        let free = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().to_string();
-        let e = open_err(&free, fast());
-        assert!(e.contains("cannot reach"), "{e}");
+        // Port 1 is privileged and normally closed. Only check that the open fails: a port
+        // that was free a moment ago could be taken by another test's server.
+        open_err("127.0.0.1:1", fast());
     }
 
     #[test]
