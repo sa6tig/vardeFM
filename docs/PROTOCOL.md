@@ -243,7 +243,12 @@ and checked by the `fer_gate` test. That file is the reference; roughly, the poi
   level's SNR ceiling (the clipping floor of its drive, measured in the simulator):
   `1/snr = 1/(channel · drive²) + 1/ceiling`. Thresholds (estimated SNR on a burst at that
   level, levels 0–6): −2, 1.5, 4.5, 7, 11, 15, 18 dB (level 0's is never used). After a
-  failed codeword the request drops at least one level below the burst's level. Each
+  failed codeword the request drops at least one level below the burst's level, and
+  stays below the failed level for 2 more bursts with data. The failed level is then
+  asked for once more; if it fails again, the next hold is twice as long (at most 16
+  bursts), and once it decodes the hold is back to 2. A clean burst whose SNR, predicted
+  for the failed level, is 3 dB above the one at the failure ends a hold early.
+  Informative: this is local to the receiver and does not change what goes on air. Each
   unanswered burst lowers our own level by one. The called station starts at the level
   it measured on the connect request.
 - **Retries:** an unanswered burst is resent after 1.2 s (plus a random back-off, and

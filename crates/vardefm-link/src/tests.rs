@@ -799,6 +799,78 @@ fn predicted_snr_matches_the_simulator() {
     assert!((p - 15.3).abs() < 1.0, "narrow L4 -> L5 at 14 dB CNR: {p:.1}");
 }
 
+/// The same SNR, whatever level it is predicted for.
+fn flat(db: f32) -> impl Fn(u8) -> f32 {
+    move |_| db
+}
+
+#[test]
+fn failed_level_is_held_then_probed_with_growing_hold() {
+    let mut h = LevelHold::default();
+    // The SNR always says 5, but level 5 always fails: count bursts asked at 5.
+    let mut level = 5;
+    let mut at5 = 0;
+    for _ in 0..60 {
+        let failed = level == 5;
+        at5 += failed as u32;
+        level = h.update(level, 24, failed, if failed { level - 1 } else { 5 }, flat(20.0));
+    }
+    // Holds of 2, 4, 8, 16, 16, ... clean bursts between probes.
+    assert!((4..=6).contains(&at5), "probed level 5 {at5} times in 60 bursts");
+}
+
+#[test]
+fn level_hold_lifts_after_a_clean_probe_or_a_better_snr() {
+    let mut h = LevelHold::default();
+    assert_eq!(h.update(4, 8, true, 3, flat(10.0)), 3);
+    assert_eq!(h.update(3, 8, false, 4, flat(10.0)), 3);
+    // Second clean burst lifts the hold: level 4 may be asked for again.
+    assert_eq!(h.update(3, 8, false, 4, flat(10.0)), 4);
+    // The probe decodes: no hold, and the next failure starts from the base hold.
+    assert_eq!(h.update(4, 8, false, 4, flat(10.0)), 4);
+    assert_eq!(h.update(4, 8, true, 3, flat(10.0)), 3);
+    assert_eq!(h.update(3, 8, false, 4, flat(10.0)), 3);
+    assert_eq!(h.update(3, 8, false, 4, flat(10.0)), 4);
+    // Header-only bursts neither count down nor fail.
+    let mut h = LevelHold::default();
+    h.update(4, 8, true, 3, flat(10.0));
+    assert_eq!(h.update(0, 0, false, 6, flat(10.0)), 3);
+    assert_eq!(h.update(3, 8, false, 6, flat(10.0)), 3);
+    // An SNR 3 dB above the one the held level failed at lifts it at once.
+    assert_eq!(h.update(3, 8, false, 6, flat(13.0)), 6);
+}
+
+#[test]
+fn level_hold_escape_is_relative_to_the_failure() {
+    // Level 5 fails at an SNR far above its threshold (thresholds wrong for this radio,
+    // or distortion the SNR estimate does not see). That SNR, measured again on a clean
+    // burst below, does not lift the hold.
+    let mut h = LevelHold::default();
+    assert_eq!(h.update(5, 24, true, 4, flat(30.0)), 4);
+    assert_eq!(h.update(4, 24, false, 6, flat(31.0)), 4);
+    // 3 dB above the failure does.
+    assert_eq!(h.update(4, 24, false, 6, flat(33.0)), 6);
+    // A failed burst never lifts a hold, however strong its SNR.
+    let mut h = LevelHold::default();
+    h.update(5, 24, true, 4, flat(20.0));
+    assert_eq!(h.update(5, 24, true, 4, flat(40.0)), 4);
+}
+
+#[test]
+fn level_hold_forgets_a_probe_the_snr_no_longer_supports() {
+    let mut h = LevelHold::default();
+    h.update(5, 24, true, 4, flat(20.0));
+    h.update(4, 24, false, 5, flat(20.0));
+    // Hold lifted: level 5 is probed.
+    assert_eq!(h.update(4, 24, false, 5, flat(20.0)), 5);
+    // The SNR drops: level 5 is not asked for, and the probe is forgotten.
+    assert_eq!(h.update(4, 24, false, 3, flat(15.0)), 3);
+    // Much later level 5 fails again: the hold starts from the base, not doubled.
+    h.update(5, 24, true, 4, flat(20.0));
+    assert_eq!(h.update(4, 24, false, 5, flat(20.0)), 4);
+    assert_eq!(h.update(4, 24, false, 5, flat(20.0)), 5);
+}
+
 #[test]
 fn longer_resend_of_a_stored_segment_is_kept() {
     // A segment that arrived ahead of a gap is resent at a faster level, where one
