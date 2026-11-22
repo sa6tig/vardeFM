@@ -56,6 +56,15 @@ end stations and the digipeaters of a routed session should all run 0.3.2.
   changes nothing in the modem. (#6, thanks @mustig)
 
 ### Changed
+- **A speed level that keeps failing is no longer asked for on every other burst.**
+  The rate choice remembered a codeword failure for one burst only: when the SNR said a
+  level would work but its codewords kept failing, the link alternated between that
+  level and the one below, losing about half of every other burst. A failed level is now
+  held off for 2 bursts, then tried again, with the hold doubling (up to 16 bursts) each
+  time the retry fails too. In the FM simulator, with decoding 3 dB worse than the SNR
+  suggests, throughput rises by up to 67 % (wide, 14 dB CNR). With the SNR model
+  matching the channel nothing changes. The new `level_dynamics` test (ignored, run by
+  hand) measures level switching and throughput under such mismatches.
 - **Busy detection measures only the carrier band** (422–2672 Hz narrow, 400–6000 Hz wide).
   A CTCSS tone, mains hum, a DC step or hiss above the band no longer reads as a busy
   channel, and no longer hides a signal inside the band. A keyed carrier with only a CTCSS
