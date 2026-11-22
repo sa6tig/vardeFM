@@ -1,0 +1,15 @@
+[package]
+name = "vardefm-api"
+description = "VardeFM's read-only monitor API: wire types, loopback addresses and the waterfall, wire version 1"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rustfft.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+jsonschema = { version = "0.60", default-features = false }
+vardefm-dsp.workspace = true

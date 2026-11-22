@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/vardefm-dsp", "crates/vardefm-fec", "crates/vardefm-modem", "crates/vardefm-link", "crates/vardefm-sim", "crates/vardefm-tnc", "crates/vardefm-ptt", "crates/vardefm-audio", "crates/vardefm-cli"]
+members = ["crates/vardefm-dsp", "crates/vardefm-api", "crates/vardefm-fec", "crates/vardefm-modem", "crates/vardefm-link", "crates/vardefm-sim", "crates/vardefm-tnc", "crates/vardefm-ptt", "crates/vardefm-audio", "crates/vardefm-cli"]
 
 [workspace.package]
 version = "0.3.2"
@@ -16,6 +16,7 @@ rand_distr = "0.4"
 hound = "3.5"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "1"
 vardefm-dsp = { path = "crates/vardefm-dsp" }
 vardefm-sim = { path = "crates/vardefm-sim" }
@@ -25,6 +26,7 @@ vardefm-link = { path = "crates/vardefm-link" }
 vardefm-tnc = { path = "crates/vardefm-tnc" }
 vardefm-ptt = { path = "crates/vardefm-ptt" }
 vardefm-audio = { path = "crates/vardefm-audio" }
+vardefm-api = { path = "crates/vardefm-api" }
 cpal = "0.18"
 serialport = { version = "4.10", default-features = false }
 hidapi = { version = "2.6", default-features = false, features = ["windows-native", "linux-native-basic-udev"] }
