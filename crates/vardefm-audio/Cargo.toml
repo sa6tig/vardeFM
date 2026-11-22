@@ -7,3 +7,7 @@ license.workspace = true
 
 [dependencies]
 cpal.workspace = true
+tungstenite.workspace = true
+
+[dev-dependencies]
+vardefm-modem.workspace = true
