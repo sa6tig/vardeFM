@@ -1354,16 +1354,22 @@ fn link_position_refuses_a_link_the_genie_cannot_decode() {
     }
 }
 
-/// Whether the true position of the link has room on both sides at `cnr` dB, which
-/// must be near its knee, where the timing matters: over 400 noisy trials the genie
-/// decodes about as many bursts there, and a quarter cyclic prefix either side, as at
-/// the best of the nine timings an eighth of a prefix apart within half a prefix.
-/// `Err` says which timing falls short, with the counts.
-fn room_both_sides(mode: &str, chan: &str, tilt: f32, cnr: f32) -> Result<(), String> {
+/// The least share of the best count that [`room_both_sides`] accepts at the true
+/// position and a quarter cyclic prefix either side of it.
+const ROOM_SHARE: f32 = 0.85;
+
+/// Whether the true position of the link has room on both sides at `cnr` dB: over 400
+/// noisy trials the genie decodes at least [`ROOM_SHARE`] as many bursts there, and a
+/// quarter cyclic prefix either side, as at the best of the nine timings an eighth of a
+/// prefix apart within half a prefix. `Ok` is the least of those three shares; `Err`
+/// says which timing falls short, with the counts.
+///
+/// The bound is a share of the best count, not a number of bursts, so it means the same
+/// at every CNR. The CNR must be one at which the best timing decodes half to nine
+/// tenths of the bursts, or it is refused: below that the counts are too small to tell a
+/// share of 0.85 from noise, and well above the knee every timing decodes.
+fn room_both_sides(mode: &str, chan: &str, tilt: f32, cnr: f32) -> Result<f32, String> {
     const TRIALS: u32 = 400;
-    // 6 %: about two standard deviations of a count, plus what taking the best of nine
-    // noisy counts adds to the best.
-    const SLACK: usize = 24;
     let link = Link::new(mode, chan, tilt);
     let m = &*link.rx;
     let ncp = m.ofdm.p.ncp as isize;
@@ -1378,40 +1384,45 @@ fn room_both_sides(mode: &str, chan: &str, tilt: f32, cnr: f32) -> Result<(), St
     let counts: Vec<usize> = (0..offsets.len()).map(count).collect();
     let best = *counts.iter().max().unwrap();
     let what = format!("{mode} {chan} tilt {tilt} at {cnr} dB");
-    println!("{what}: true position {truth}, offsets {offsets:?}, decoded {counts:?}");
-    // The genie must decode here at all, or the comparison proves nothing.
-    if best < TRIALS as usize / 4 {
-        return Err(format!("{what}: the best timing decodes {best}; pick another CNR"));
+    let shares: Vec<f32> = [-ncp / 4, 0, ncp / 4]
+        .iter()
+        .map(|o| counts[offsets.iter().position(|x| x == o).unwrap()] as f32 / best.max(1) as f32)
+        .collect();
+    println!("{what}: true position {truth}, decoded {counts:?} at {offsets:?}, shares {shares:.3?}");
+    if 2 * best < TRIALS as usize || 10 * best > 9 * TRIALS as usize {
+        return Err(format!("{what}: the best timing decodes {best} of {TRIALS}; pick a CNR nearer the knee"));
     }
-    for o in [-ncp / 4, 0, ncp / 4] {
-        let got = counts[offsets.iter().position(|&x| x == o).unwrap()];
-        if got + SLACK < best {
-            return Err(format!(
-                "{what}: {got} decoded {o:+} samples from the true position, {best} at best; offsets {offsets:?}, \
-                 counts {counts:?}"
-            ));
-        }
+    let least = shares.iter().copied().fold(f32::INFINITY, f32::min);
+    if least < ROOM_SHARE {
+        return Err(format!(
+            "{what}: shares {shares:.3?} of the best count a quarter prefix early, at the true position and a quarter \
+             prefix late; decoded {counts:?} at {offsets:?}"
+        ));
     }
-    Ok(())
+    Ok(least)
 }
 
-/// The true position has room on both sides ([`room_both_sides`]) on three links, each
-/// at a CNR where the genie decodes about half the bursts. A true position near either
-/// edge of the timings that decode fails. The cleanest noiseless timing alone, which
-/// was the true position before, did on narrow rx-de-only: at 5 dB a quarter prefix
-/// later decoded 253 of 400 against 293 at best.
+/// The true position has room on both sides ([`room_both_sides`]) on three links,
+/// among them the one with the least: narrow rx-de-only at 5 dB.
 ///
-/// It claims no more than that. On narrow rx-de-only decoding falls off slowly towards
-/// early timings and fast towards late ones, and further above the knee that shows: at
-/// 5 dB, where the best timing decodes 294 of 400, a quarter prefix early decodes 269,
-/// one short of the slack, and a quarter prefix late 294. So there the true position
-/// lies about an eighth of a cyclic prefix before the middle of the timings that decode nearly as many as
-/// the best, and `hit` is a little harder on a detector that lands early than its
-/// bursts warrant. Telling those timings apart takes hundreds of trials per timing,
+/// It claims no more than a share of 0.85. Over the 23 runs of [`ROOM_LINKS`] the least
+/// share is 0.94 or more on nine links, at every CNR tried. On narrow rx-de-only it is
+/// 0.935, 0.915 and 0.975 at 4.875, 5 and 5.125 dB, each time a quarter prefix early:
+/// decoding falls off slowly towards early timings there and fast towards late ones, so
+/// the true position, the middle between the two half points, lies about an eighth of
+/// a cyclic prefix before the middle of the timings that decode nearly as many as the
+/// best, and `hit` is a little harder on a detector that lands early than its bursts
+/// warrant. A bound of 0.9 would hold there by 4 bursts of 294, which another noise
+/// seed can undo; telling those timings apart takes hundreds of trials per timing,
 /// which placing every link cannot afford.
+///
+/// A true position a quarter prefix early on that link fails (0.81 half a prefix
+/// early). One a quarter prefix late does not (0.91 half a prefix late), so the test
+/// catches a position near the edge of the timings that decode, not every position
+/// off their middle.
 #[test]
 fn true_position_has_room_both_sides() {
-    for (mode, chan, cnr) in [("narrow", "matched", 4.0), ("wide", "rx-de-only", 6.0), ("narrow", "rx-de-only", 4.875)]
+    for (mode, chan, cnr) in [("narrow", "matched", 4.25), ("wide", "rx-de-only", 6.25), ("narrow", "rx-de-only", 5.0)]
     {
         room_both_sides(mode, chan, 0.0, cnr).unwrap_or_else(|e| panic!("{e}"));
     }
@@ -1429,19 +1440,33 @@ fn true_position_has_room_both_sides_on_every_link() {
     assert!(short.is_empty(), "{}", short.join("\n"));
 }
 
-/// Every link the CI tests place (mode, channel, TX tilt), with a CNR near its knee:
-/// one at which the best timing decodes 100 to 320 of 400 bursts.
-const ROOM_LINKS: [(&str, &str, f32, f32); 10] = [
-    ("narrow", "matched", 0.0, 4.0),
-    ("narrow", "tx-pre-only", 0.0, 4.0),
+/// Every link the CI tests place (mode, channel, TX tilt), each at two or three CNRs an
+/// eighth of a dB apart at which the best timing decodes half to nine tenths of the
+/// bursts, so that the bound does not rest on one CNR picked by hand.
+const ROOM_LINKS: &[(&str, &str, f32, f32)] = &[
+    ("narrow", "matched", 0.0, 4.125),
+    ("narrow", "matched", 0.0, 4.25),
+    ("narrow", "tx-pre-only", 0.0, 4.125),
+    ("narrow", "tx-pre-only", 0.0, 4.25),
     ("narrow", "rx-de-only", 0.0, 4.875),
-    ("narrow", "matched", -6.0, 4.75),
-    ("narrow", "matched", 6.0, 4.75),
-    ("wide", "matched", 0.0, 6.0),
+    ("narrow", "rx-de-only", 0.0, 5.0),
+    ("narrow", "rx-de-only", 0.0, 5.125),
+    ("narrow", "matched", -6.0, 4.875),
+    ("narrow", "matched", -6.0, 5.0),
+    ("narrow", "matched", 6.0, 4.875),
+    ("narrow", "matched", 6.0, 5.0),
+    ("wide", "matched", 0.0, 6.125),
+    ("wide", "matched", 0.0, 6.25),
+    ("wide", "tx-pre-only", 0.0, 6.875),
     ("wide", "tx-pre-only", 0.0, 7.0),
-    ("wide", "rx-de-only", 0.0, 6.0),
-    ("wide", "matched", -6.0, 7.0),
+    ("wide", "tx-pre-only", 0.0, 7.125),
+    ("wide", "rx-de-only", 0.0, 6.25),
+    ("wide", "rx-de-only", 0.0, 6.375),
+    ("wide", "matched", -6.0, 7.25),
+    ("wide", "matched", -6.0, 7.375),
+    ("wide", "matched", -6.0, 7.5),
     ("wide", "matched", 6.0, 8.5),
+    ("wide", "matched", 6.0, 8.625),
 ];
 
 /// Every radio response, and a TX tilt of ±6 dB/octave on the matched response, still
