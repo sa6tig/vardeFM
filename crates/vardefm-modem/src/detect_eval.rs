@@ -8,12 +8,12 @@
 //!   card delivers it. Where a search starts can change what Schmidl-Cox finds, so an
 //!   offline search over the whole recording would not show what the receiver does;
 //! - `hit`: the detector's first detection in the whole recording, searched from its
-//!   start, lies within ±ncp/4 samples of the true position: the timing at which
-//!   noiseless copies of the burst demodulate their header cleanest, which no detector
-//!   defines (see `link_position`). A detector that always picks another point inside
-//!   the cyclic prefix can decode every burst and still score few hits, so read `hit`
-//!   as a diagnostic only. Where a detector's noiseless detection is that far off, the
-//!   run says so.
+//!   start, lies within ±ncp/4 samples of the true position: the middle of the timings
+//!   from which noisy bursts decode at the link's knee, which no detector defines (see
+//!   `link_position`). A detector that always picks another point inside the cyclic
+//!   prefix can decode every burst and still score few hits, so read `hit` as a
+//!   diagnostic only. Where a detector's noiseless detection is that far off, the run
+//!   says so; it prints the true position and each noiseless detection in any case.
 //!
 //! `genie` decodes from the true position: a known-timing reference, not a strict
 //! bound. Another valid position inside the cyclic prefix puts the FFT windows on
@@ -62,9 +62,10 @@
 
 use super::*;
 use crate::busy_eval::CTCSS_DEVIATION_HZ;
+use std::collections::{BTreeMap, HashMap};
 use std::f32::consts::PI;
 use std::io::Write;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use vardefm_dsp::prng::Prng;
 use vardefm_dsp::CTCSS_HZ;
@@ -345,9 +346,10 @@ fn trial(link: &Link, cnr: f32, level: u8, ncw: usize, truth: usize, t: u32) -> 
 /// [`best_timing`]. The noiseless SNR has a broad top that rises slowly towards its
 /// late edge and then falls off fast, so a narrow margin picks the late end of the
 /// top, a few samples before the cliff: in narrow mode 0.5 dB put the true position
-/// 16-32 samples before where noisy bursts stop decoding. 3 dB spans the top, and its
-/// middle lies near the middle of the timings that decode near the knee
-/// (`true_position_has_room_both_sides`).
+/// 16-32 samples before where noisy bursts stop decoding. 3 dB spans the top. Its
+/// middle is still not the middle of the timings that decode in noise on every link (41
+/// samples later in narrow mode with de-emphasis alone, 28 earlier in wide mode with a
+/// TX tilt of +6 dB/octave), so it is only where [`decode_centre`] starts.
 const BEST_TIMING_MARGIN_DB: f32 = 3.0;
 
 /// Noiseless copies, each with its own payload, that [`best_timing`] averages over.
@@ -368,6 +370,8 @@ fn header_error(m: &Modem, rx: &[f32], b: usize, known: &[Vec<Complex32>]) -> Op
 /// middle of the run of timings around the best that are all within
 /// [`BEST_TIMING_MARGIN_DB`] of it. Only that run counts, not a timing elsewhere that
 /// happens to come as close (on a clipping link one can, at the edge of the search).
+/// It tells where the burst is, to within the cyclic prefix, not where noisy bursts
+/// decode best: [`decode_centre`] finds that, starting from here.
 ///
 /// `Err` if none demodulates, or if the run reaches the first or last timing searched:
 /// `nominal` leaves out the channel's group delay, so a link that delays or tilts the
@@ -417,17 +421,35 @@ fn best_timing(m: &Modem, rxs: &[Vec<f32>], nominal: usize, h: &Header) -> Resul
 /// is fixed by level and size), so noiseless copies give it for every trial.
 ///
 /// No detector defines the position, so neither `hit` nor `genie` favours one. It is
-/// the timing at which noiseless copies, without the CTCSS tone (the tone does not
-/// move the burst), demodulate their header cleanest ([`best_timing`]), searched
-/// around where preamble B starts in the sent audio. On a link whose response differs
-/// from the sender's that is the best point for decoding, whatever point a detector's
-/// fine timing prefers.
+/// the middle of the timings from which the genie decodes noisy bursts at the link's
+/// knee, without the CTCSS tone (the tone does not move the burst), found in three
+/// steps:
+/// - the timing at which noiseless copies demodulate their header cleanest
+///   ([`best_timing`]), searched around where preamble B starts in the sent audio. It
+///   finds the burst, but not the middle of what decodes: the noiseless header is
+///   cleanest late among the timings that decode on some links and early on others;
+/// - a CNR at which the genie decodes a quarter to three quarters of
+///   [`POSITION_TRIALS`] noisy bursts from there ([`knee_trials`]). Well above the knee
+///   every timing in the cyclic prefix decodes, and the counts would say nothing;
+/// - on those trials, the middle of the run of timings that decode at least half as
+///   many bursts as the best one ([`decode_centre`]).
 ///
-/// `Err` when the link cannot be measured: its best timings reach the edge of the
-/// search ([`best_timing`]), or the genie, decoding from that timing, does
-/// not decode every noiseless copy (header and every codeword). Without noise a link
-/// that loses a burst there loses it whatever the detector, so its rows would say
-/// nothing about detection. Strong TX tilts do that (from about ±18 dB/octave), and
+/// The trials are seeded and are not the ones scored ([`POSITION_TRIAL`]), so the
+/// position is the same in every run and is not fitted to the noise it is scored on.
+/// With 384 trials in place of 32 it moves by at most 4 samples in narrow mode and 1 in
+/// wide mode on the ten links the CI tests place.
+///
+/// It is the middle between the two timings where decoding falls to half, not the
+/// timing that decodes most, and not the middle of the timings that decode nearly as
+/// many as the best: where decoding falls off slowly on one side and fast on the other,
+/// those differ (see `true_position_has_room_both_sides`).
+///
+/// `Err` when the link cannot be measured: its cleanest timings reach the edge of the
+/// search ([`best_timing`]); the genie, decoding from the cleanest timing or from the
+/// true position, does not decode every noiseless copy (header and every codeword); no
+/// knee is found; or the timings that decode reach the edge of their search. Without
+/// noise a link that loses a burst loses it whatever the detector, so its rows would
+/// say nothing about detection. Strong TX tilts do that (from about ±18 dB/octave), and
 /// in wide mode pre-emphasis without de-emphasis plus +6 dB/octave clips the burst.
 fn link_position(link: &Link, level: u8, ncw: usize) -> Result<(usize, Vec<Option<usize>>), String> {
     let clean = FmChannelConfig { cnr_db: None, ..link.chan.clone() };
@@ -436,9 +458,199 @@ fn link_position(link: &Link, level: u8, ncw: usize) -> Result<(usize, Vec<Optio
     Ok((truth, found))
 }
 
+/// Whether the genie decodes `sent` from recording `rx` with preamble B at `b`: the
+/// header, then every codeword.
+fn genie_ok(m: &Modem, rx: &[f32], b: usize, sent: &Burst) -> bool {
+    header_at(m, rx, b).is_some_and(|h| burst_ok(m, rx, b, &h, sent))
+}
+
+/// First trial number of the noisy trials that place the true position. The trials
+/// that are scored count up from 0 and never reach it, so the position is not fitted to
+/// the noise it is then scored on.
+const POSITION_TRIAL: u32 = 1 << 30;
+
+/// The CNRs, dB, between which [`knee_trials`] looks for the knee, and how often it
+/// halves that range: down to an eighth of a dB.
+const KNEE_RANGE_DB: (f32, f32) = (0.0, 32.0);
+const KNEE_STEPS: u32 = 8;
+
+/// Noisy trials at each CNR that [`knee_trials`] tries, which [`decode_centre`] then
+/// counts decodes over at each timing.
+const POSITION_TRIALS: u32 = 32;
+
+/// The first trials of those, which tell whether a CNR is anywhere near the knee.
+/// Six fail to tell one time in 32 at the middle of the knee; then the search goes on
+/// to a CNR a little off the middle, which serves as well.
+const KNEE_PROBE_TRIALS: u32 = 6;
+
+/// How many cyclic prefixes either side of where it starts [`decode_centre`] searches
+/// at most.
+const CENTRE_REACH_NCP: isize = 2;
+
+/// What a trial sent and what the receiver got.
+type Recording = (Burst, Vec<f32>);
+
+/// Trial `t` of the trials that place the true position: what it sends and what the
+/// receiver gets over `clean` with noise at `cnr` dB.
+fn position_trial(tx: &Modem, clean: &FmChannelConfig, cnr: f32, level: u8, ncw: usize, t: u32) -> Recording {
+    let t = POSITION_TRIAL + t;
+    let sent = burst(level, ncw, payload_seed(t));
+    let cfg = FmChannelConfig { cnr_db: Some(cnr), seed: channel_seed(cnr, t), ..clean.clone() };
+    let rx = transmit(&cfg, &tx.modulate(&sent));
+    (sent, rx)
+}
+
+/// Noisy trials at the link's knee: [`POSITION_TRIALS`] of them at a CNR at which the
+/// genie, decoding from `at`, decodes a quarter to three quarters, found by halving
+/// [`KNEE_RANGE_DB`]. The knee is sharp: a quarter of a dB can take a link from 29 % to
+/// 83 %. If no CNR tried lands there, the trials of the one that came closest to half.
+/// `Err` if every CNR tried decodes all or none: the knee is outside the range.
+///
+/// A CNR whose first [`KNEE_PROBE_TRIALS`] trials all decode, or all fail, is taken to
+/// lie on that side of the knee without running the rest: most of the CNRs tried are far
+/// from it.
+fn knee_trials(
+    tx: &Modem,
+    rx: &Modem,
+    clean: &FmChannelConfig,
+    level: u8,
+    ncw: usize,
+    at: usize,
+) -> Result<Vec<Recording>, String> {
+    const N: u32 = POSITION_TRIALS;
+    let (mut lo, mut hi) = KNEE_RANGE_DB;
+    let mut closest: Option<(u32, Vec<Recording>)> = None;
+    for _ in 0..KNEE_STEPS {
+        let cnr = (lo + hi) / 2.0;
+        // Trials `from..to`: whether the genie decodes each, and the trial.
+        let run = |from: u32, to: u32| {
+            on_every_core(to - from, |t| {
+                let (sent, audio) = position_trial(tx, clean, cnr, level, ncw, from + t);
+                (genie_ok(rx, &audio, at, &sent), (sent, audio))
+            })
+        };
+        let decoded = |trials: &[(bool, Recording)]| trials.iter().filter(|(ok, _)| *ok).count() as u32;
+        let mut trials = run(0, KNEE_PROBE_TRIALS);
+        let probe = decoded(&trials);
+        if probe > 0 && probe < KNEE_PROBE_TRIALS {
+            trials.extend(run(KNEE_PROBE_TRIALS, N));
+            let n = decoded(&trials);
+            let trials = trials.into_iter().map(|(_, trial)| trial).collect();
+            if 4 * n >= N && 4 * n <= 3 * N {
+                return Ok(trials);
+            }
+            let off = (2 * n).abs_diff(N);
+            if n > 0 && n < N && closest.as_ref().is_none_or(|(c, _)| off < *c) {
+                closest = Some((off, trials));
+            }
+            if 2 * n < N {
+                lo = cnr;
+            } else {
+                hi = cnr;
+            }
+        } else if probe == 0 {
+            lo = cnr;
+        } else {
+            hi = cnr;
+        }
+    }
+    closest.map(|(_, trials)| trials).ok_or_else(|| {
+        format!("the genie decodes all or none of the noisy bursts at every CNR tried, {lo} dB the last: no knee found")
+    })
+}
+
+/// The middle of the timings from which the genie decodes the noisy recordings
+/// `trials` (what was sent, what was received): of the run of timings, around the one
+/// that decodes most, that all decode at least half as many. Each end of the run is
+/// where the count crosses that half, between two timings an eighth of a cyclic prefix
+/// apart.
+///
+/// The search goes from `around` outwards in steps of a quarter of a cyclic prefix,
+/// then tries the timing half a step outside each end of the run. It starts a cyclic
+/// prefix wide either side and grows by half a prefix on a side where the run reaches
+/// its edge. `Err` if the run still reaches the edge [`CENTRE_REACH_NCP`] cyclic
+/// prefixes out, or if no timing decodes a quarter of the trials: then the CNR is not
+/// at the knee, and the run would say little.
+fn decode_centre(m: &Modem, trials: &[Recording], around: usize) -> Result<usize, String> {
+    // Timings are counted in eighths of a cyclic prefix from `around`; the search
+    // steps by two of them.
+    const PER_NCP: isize = 8;
+    const STRIDE: usize = 2;
+    let step = m.ofdm.p.ncp as isize / PER_NCP;
+    let reach = CENTRE_REACH_NCP * PER_NCP;
+    let timing = |k: isize| around as isize + k * step;
+    let mut counts: BTreeMap<isize, usize> = BTreeMap::new();
+    let count = |counts: &mut BTreeMap<isize, usize>, ks: &[isize]| {
+        let per_trial = on_every_core(trials.len() as u32, |t| {
+            let (sent, rx) = &trials[t as usize];
+            ks.iter().map(|&k| timing(k) >= 0 && genie_ok(m, rx, timing(k) as usize, sent)).collect::<Vec<bool>>()
+        });
+        for (i, &k) in ks.iter().enumerate() {
+            counts.insert(k, per_trial.iter().filter(|r| r[i]).count());
+        }
+    };
+    let (mut from, mut to) = (-PER_NCP, PER_NCP);
+    count(&mut counts, &(from..=to).step_by(STRIDE).collect::<Vec<_>>());
+    let (first, last, best) = loop {
+        let (&peak, &best) = counts.iter().max_by_key(|(_, &c)| c).expect("at least one timing");
+        if 4 * best < trials.len() {
+            return Err(format!("the genie decodes at most {best} of {} noisy bursts near the knee", trials.len()));
+        }
+        let in_run = |k: &isize| 2 * counts[k] >= best;
+        let first = (from..=peak).rev().step_by(STRIDE).skip(1).take_while(in_run).last().unwrap_or(peak);
+        let last = (peak..=to).step_by(STRIDE).skip(1).take_while(in_run).last().unwrap_or(peak);
+        if (first == from && from == -reach) || (last == to && to == reach) {
+            return Err(format!(
+                "the timings that decode noisy bursts, {} to {}, reach the edge of the search, {} to {}",
+                timing(first),
+                timing(last),
+                timing(from),
+                timing(to)
+            ));
+        }
+        if first > from && last < to {
+            break (first, last, best);
+        }
+        let mut more = Vec::new();
+        if first == from {
+            from = (from - PER_NCP / 2).max(-reach);
+            more.extend((from..first).step_by(STRIDE));
+        }
+        if last == to {
+            to = (to + PER_NCP / 2).min(reach);
+            more.extend((last..=to).step_by(STRIDE).skip(1));
+        }
+        count(&mut counts, &more);
+    };
+    count(&mut counts, &[first - 1, last + 1]);
+    // Where the count crosses half the best going outwards (`out` is -1 or 1) from the
+    // end `end` of the run: between the last timing that decodes at least half and
+    // its neighbour.
+    let half = best as f32 / 2.0;
+    let cross = |end: isize, out: isize| {
+        let inside = if 2 * counts[&(end + out)] >= best { end + out } else { end };
+        let (c_in, c_out) = (counts[&inside] as f32, counts[&(inside + out)] as f32);
+        inside as f32 + out as f32 * (c_in - half) / (c_in - c_out)
+    };
+    let middle = (cross(first, -1) + cross(last, 1)) / 2.0;
+    Ok((around as f32 + middle * step as f32).round() as usize)
+}
+
+/// Where preamble B of the burst `tx` sends over `clean` would start if the channel did
+/// not delay it.
+fn nominal_position(tx: &Modem, clean: &FmChannelConfig) -> usize {
+    let p = &tx.ofdm.p;
+    (clean.lead_silence_s * clean.fs) as usize + (tx.leader_symbols() + 1) * p.symbol_len() + p.ncp
+}
+
 /// The true position of a `level` burst of `ncw` codewords that `tx` sends over the
 /// noiseless channel `clean` and `rx` receives, as [`link_position`] defines it, and
 /// the first noiseless copy. `Err` when the link cannot be measured.
+///
+/// Placing it sends some 50 to 150 noisy bursts and decodes each of the last 32 at a
+/// dozen timings, so each link is placed once per process: the result depends only on
+/// the two modems' parameters, the sender's leader, the channel and the burst's layout,
+/// which make the key.
 fn noiseless_position(
     tx: &Modem,
     rx: &Modem,
@@ -446,21 +658,33 @@ fn noiseless_position(
     level: u8,
     ncw: usize,
 ) -> Result<(usize, Vec<f32>), String> {
+    type Placed = Arc<OnceLock<Result<(usize, Vec<f32>), String>>>;
+    static PLACED: OnceLock<Mutex<HashMap<String, Placed>>> = OnceLock::new();
     assert_eq!(clean.cnr_db, None, "the true position is measured without noise");
+    let key = format!("{:?} {:?} {:?} {clean:?} {level} {ncw}", tx.ofdm.p, tx.txdelay, rx.ofdm.p);
+    // The map is held only to find the link's cell, so links are placed side by side
+    // and a second caller of one link waits for the first.
+    let cell = PLACED.get_or_init(Default::default).lock().unwrap().entry(key).or_default().clone();
+    cell.get_or_init(|| place(tx, rx, clean, level, ncw)).clone()
+}
+
+/// [`noiseless_position`], measured.
+fn place(tx: &Modem, rx: &Modem, clean: &FmChannelConfig, level: u8, ncw: usize) -> Result<(usize, Vec<f32>), String> {
     let sent: Vec<Burst> = (0..BEST_TIMING_COPIES).map(|t| burst(level, ncw, payload_seed(t))).collect();
     let mut rxs: Vec<Vec<f32>> = sent.iter().map(|b| transmit(clean, &tx.modulate(b))).collect();
-    let ofdm = &rx.ofdm;
-    let lead = (clean.lead_silence_s * clean.fs) as usize;
-    let nominal = lead + (tx.leader_symbols() + 1) * ofdm.p.symbol_len() + ofdm.p.ncp;
-    let truth = best_timing(rx, &rxs, nominal, &sent[0].header)?;
-    let decoded = sent
-        .iter()
-        .zip(&rxs)
-        .filter(|(b, a)| header_at(rx, a, truth).is_some_and(|h| burst_ok(rx, a, truth, &h, b)))
-        .count();
-    if decoded < sent.len() {
-        return Err(format!("the genie decodes {decoded} of {} noiseless bursts at the best timing", sent.len()));
-    }
+    let noiseless = |at: usize, what: &str| {
+        let decoded = sent.iter().zip(&rxs).filter(|(b, a)| genie_ok(rx, a, at, b)).count();
+        if decoded < sent.len() {
+            return Err(format!("the genie decodes {decoded} of {} noiseless bursts at {what}", sent.len()));
+        }
+        Ok(())
+    };
+    let cleanest = best_timing(rx, &rxs, nominal_position(tx, clean), &sent[0].header)?;
+    // Before the noisy trials: a link that loses the burst without noise has no knee.
+    noiseless(cleanest, "the cleanest timing")?;
+    let trials = knee_trials(tx, rx, clean, level, ncw, cleanest)?;
+    let truth = decode_centre(rx, &trials, cleanest)?;
+    noiseless(truth, "the true position")?;
     Ok((truth, rxs.swap_remove(0)))
 }
 
@@ -472,13 +696,13 @@ fn far_detections(truth: usize, found: &[Option<usize>], tol: usize) -> Vec<Stri
         .iter()
         .zip(found)
         .filter(|(_, at)| !at.is_some_and(|b| b.abs_diff(truth) <= tol))
-        .map(|(d, at)| format!("{d} finds the noiseless burst at {at:?}, the best timing is {truth}"))
+        .map(|(d, at)| format!("{d} finds the noiseless burst at {at:?}, the true position is {truth}"))
         .collect()
 }
 
 /// [`link_position`] where every detector must find the noiseless burst inside the
 /// part of the cyclic prefix that leaves room for the channel (within ncp/2 of the
-/// best timing), as in the CI tests.
+/// true position), as in the CI tests.
 fn strict_link_position(link: &Link, level: u8, ncw: usize) -> usize {
     let (truth, found) = link_position(link, level, ncw).unwrap_or_else(|e| panic!("{e}"));
     let far = far_detections(truth, &found, link.rx.ofdm.p.ncp / 2);
@@ -898,6 +1122,14 @@ fn detector_eval() {
         // A link that loses the noiseless burst skips its bursts, not the whole run.
         let truth = match link_position(&link, level, ncw) {
             Ok((truth, found)) => {
+                let mut line = format!("  true position {truth}; on the noiseless burst");
+                for (d, at) in Detector::ALL.iter().zip(&found) {
+                    match at {
+                        Some(at) => line += &format!(" | {d} {:+}", *at as i64 - truth as i64),
+                        None => line += &format!(" | {d} finds none"),
+                    }
+                }
+                println!("{line}");
                 for w in far_detections(truth, &found, m.ofdm.p.ncp / 4) {
                     println!("  warning: {w}; its hits mean little");
                 }
@@ -1028,7 +1260,7 @@ fn false_detections_counts_a_header_of_any_kind() {
 
 /// A run of best timings cut off by the edge of the search is refused, not centred on
 /// what is left of it: here the search is moved a cyclic prefix early or late, so the
-/// true position lies on its last or first timing.
+/// cleanest timing lies on its last or first timing.
 #[test]
 fn best_timing_refuses_a_run_at_the_edge_of_the_search() {
     for mode in OfdmParams::all().map(|p| p.name) {
@@ -1037,19 +1269,44 @@ fn best_timing_refuses_a_run_at_the_edge_of_the_search() {
         let clean = FmChannelConfig { cnr_db: None, ..link.chan.clone() };
         let sent = burst(1, 1, payload_seed(0));
         let rxs = vec![transmit(&clean, &link.tx.modulate(&sent))];
-        let (truth, _) = link_position(&link, 1, 1).unwrap();
+        let cleanest = best_timing(m, &rxs, nominal_position(&link.tx, &clean), &sent.header).unwrap();
         let ncp = m.ofdm.p.ncp;
-        // A search centred on the true position has the run inside it.
-        let centred = best_timing(m, &rxs, truth, &sent.header);
-        assert!(
-            centred.as_ref().is_ok_and(|b| b.abs_diff(truth) <= ncp / 8),
-            "{mode}: {centred:?}, true position {truth}"
-        );
-        for nominal in [truth - ncp, truth + ncp] {
+        // A search centred on the cleanest timing has the run inside it.
+        let centred = best_timing(m, &rxs, cleanest, &sent.header);
+        assert_eq!(centred, Ok(cleanest), "{mode}");
+        for nominal in [cleanest - ncp, cleanest + ncp] {
             let err = best_timing(m, &rxs, nominal, &sent.header).expect_err("centred a run the search cuts off");
             assert!(err.contains("edge of the search"), "{mode}: {err}");
         }
     }
+}
+
+/// The middle of the timings that decode does not depend on where its search starts,
+/// as long as the search sees the run: started a cyclic prefix early or late it grows
+/// that way and ends up where it does from the true position. Started so far off that
+/// the run reaches the limit of the search, it refuses. And a link has no knee where
+/// nothing decodes: ten cyclic prefixes from the burst.
+#[test]
+fn decode_centre_finds_the_run_from_either_side_and_refuses_one_at_the_edge() {
+    let link = Link::matched("wide");
+    let m = &*link.rx;
+    let clean = FmChannelConfig { cnr_db: None, ..link.chan.clone() };
+    let (truth, _) = link_position(&link, 1, 1).unwrap();
+    let ncp = m.ofdm.p.ncp;
+    let trials = knee_trials(&link.tx, m, &clean, 1, 1, truth).unwrap();
+    for around in [truth - ncp, truth, truth + ncp] {
+        let centre = decode_centre(m, &trials, around);
+        assert!(
+            centre.as_ref().is_ok_and(|c| c.abs_diff(truth) <= ncp / 16),
+            "from {around}: {centre:?}, true position {truth}"
+        );
+    }
+    for around in [truth - 3 * ncp / 2, truth + 3 * ncp / 2] {
+        let err = decode_centre(m, &trials, around).expect_err("centred a run the search cuts off");
+        assert!(err.contains("edge of the search"), "from {around}: {err}");
+    }
+    let err = knee_trials(&link.tx, m, &clean, 1, 1, truth + 10 * ncp).expect_err("found a knee where nothing decodes");
+    assert!(err.contains("no knee found"), "{err}");
 }
 
 #[test]
@@ -1097,55 +1354,95 @@ fn link_position_refuses_a_link_the_genie_cannot_decode() {
     }
 }
 
-/// The true position is the best place to decode from, with room on both sides: below
-/// the knee, where the timing matters, the genie decodes about as many bursts
-/// there and a quarter cyclic prefix either side as at the best of the timings within
-/// half a cyclic prefix. A true position near either edge of the timings that decode
-/// fails: with [`BEST_TIMING_MARGIN_DB`] at 0.5 dB it sat 16-32 samples before the
-/// late edge in narrow mode, and a quarter prefix later lost about a third of the
-/// bursts there (108 of 400 against 159 at best).
-///
-/// It holds on the two links tested, not on every link. On narrow rx-de-only at 5 dB
-/// the true position decodes most (293 of 400) but lies late among the timings that
-/// decode: a quarter prefix later decodes 253, a half prefix earlier still 279. So
-/// there `hit`, which allows a quarter prefix either side, is harder on a detector
-/// that lands early, as Schmidl-Cox does, than its bursts warrant.
-#[test]
-fn true_position_has_room_both_sides() {
+/// Whether the true position of the link has room on both sides at `cnr` dB, which
+/// must be near its knee, where the timing matters: over 400 noisy trials the genie
+/// decodes about as many bursts there, and a quarter cyclic prefix either side, as at
+/// the best of the nine timings an eighth of a prefix apart within half a prefix.
+/// `Err` says which timing falls short, with the counts.
+fn room_both_sides(mode: &str, chan: &str, tilt: f32, cnr: f32) -> Result<(), String> {
     const TRIALS: u32 = 400;
     // 6 %: about two standard deviations of a count, plus what taking the best of nine
     // noisy counts adds to the best.
     const SLACK: usize = 24;
-    for (mode, chan, cnr) in [("narrow", "matched", 4.0), ("wide", "rx-de-only", 6.0)] {
-        let link = Link::new(mode, chan, 0.0);
-        let m = &*link.rx;
-        let ncp = m.ofdm.p.ncp as isize;
-        let (truth, _) = link_position(&link, 1, 1).unwrap();
-        let offsets: Vec<isize> = (-4..=4).map(|k| k * ncp / 8).collect();
-        let res = on_every_core(TRIALS, |t| {
-            let sent = burst(1, 1, payload_seed(t));
-            let rx = transmit(&link.trial_channel(cnr, t), &link.tx.modulate(&sent));
-            let decodes = |o: isize| {
-                let b = (truth as isize + o) as usize;
-                header_at(m, &rx, b).is_some_and(|h| burst_ok(m, &rx, b, &h, &sent))
-            };
-            offsets.iter().map(|&o| decodes(o)).collect::<Vec<bool>>()
-        });
-        let count = |i: usize| res.iter().filter(|r| r[i]).count();
-        let counts: Vec<usize> = (0..offsets.len()).map(count).collect();
-        let best = *counts.iter().max().unwrap();
-        // The genie must decode here at all, or the comparison proves nothing.
-        assert!(best >= TRIALS as usize / 4, "{mode} {chan} {cnr} dB: best timing decodes {best}; pick another CNR");
-        for o in [-ncp / 4, 0, ncp / 4] {
-            let got = counts[offsets.iter().position(|&x| x == o).unwrap()];
-            assert!(
-                got + SLACK >= best,
-                "{mode} {chan} {cnr} dB: {got} decoded {o:+} samples from the true position, {best} at best; \
-                 offsets {offsets:?}, counts {counts:?}"
-            );
+    let link = Link::new(mode, chan, tilt);
+    let m = &*link.rx;
+    let ncp = m.ofdm.p.ncp as isize;
+    let (truth, _) = link_position(&link, 1, 1)?;
+    let offsets: Vec<isize> = (-4..=4).map(|k| k * ncp / 8).collect();
+    let res = on_every_core(TRIALS, |t| {
+        let sent = burst(1, 1, payload_seed(t));
+        let rx = transmit(&link.trial_channel(cnr, t), &link.tx.modulate(&sent));
+        offsets.iter().map(|&o| genie_ok(m, &rx, (truth as isize + o) as usize, &sent)).collect::<Vec<bool>>()
+    });
+    let count = |i: usize| res.iter().filter(|r| r[i]).count();
+    let counts: Vec<usize> = (0..offsets.len()).map(count).collect();
+    let best = *counts.iter().max().unwrap();
+    let what = format!("{mode} {chan} tilt {tilt} at {cnr} dB");
+    println!("{what}: true position {truth}, offsets {offsets:?}, decoded {counts:?}");
+    // The genie must decode here at all, or the comparison proves nothing.
+    if best < TRIALS as usize / 4 {
+        return Err(format!("{what}: the best timing decodes {best}; pick another CNR"));
+    }
+    for o in [-ncp / 4, 0, ncp / 4] {
+        let got = counts[offsets.iter().position(|&x| x == o).unwrap()];
+        if got + SLACK < best {
+            return Err(format!(
+                "{what}: {got} decoded {o:+} samples from the true position, {best} at best; offsets {offsets:?}, \
+                 counts {counts:?}"
+            ));
         }
     }
+    Ok(())
 }
+
+/// The true position has room on both sides ([`room_both_sides`]) on three links, each
+/// at a CNR where the genie decodes about half the bursts. A true position near either
+/// edge of the timings that decode fails. The cleanest noiseless timing alone, which
+/// was the true position before, did on narrow rx-de-only: at 5 dB a quarter prefix
+/// later decoded 253 of 400 against 293 at best.
+///
+/// It claims no more than that. On narrow rx-de-only decoding falls off slowly towards
+/// early timings and fast towards late ones, and further above the knee that shows: at
+/// 5 dB, where the best timing decodes 294 of 400, a quarter prefix early decodes 269,
+/// one short of the slack, and a quarter prefix late 294. So there the true position
+/// lies about an eighth of a cyclic prefix before the middle of the timings that decode nearly as many as
+/// the best, and `hit` is a little harder on a detector that lands early than its
+/// bursts warrant. Telling those timings apart takes hundreds of trials per timing,
+/// which placing every link cannot afford.
+#[test]
+fn true_position_has_room_both_sides() {
+    for (mode, chan, cnr) in [("narrow", "matched", 4.0), ("wide", "rx-de-only", 6.0), ("narrow", "rx-de-only", 4.875)]
+    {
+        room_both_sides(mode, chan, 0.0, cnr).unwrap_or_else(|e| panic!("{e}"));
+    }
+}
+
+/// [`true_position_has_room_both_sides`] on every link in [`ROOM_LINKS`]: too slow for
+/// every CI run. It names every link that falls short, not only the first.
+///
+/// `cargo test --release -p vardefm-modem true_position_has_room_both_sides_on_every_link -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn true_position_has_room_both_sides_on_every_link() {
+    let short: Vec<String> =
+        ROOM_LINKS.iter().filter_map(|&(mode, chan, tilt, cnr)| room_both_sides(mode, chan, tilt, cnr).err()).collect();
+    assert!(short.is_empty(), "{}", short.join("\n"));
+}
+
+/// Every link the CI tests place (mode, channel, TX tilt), with a CNR near its knee:
+/// one at which the best timing decodes 100 to 320 of 400 bursts.
+const ROOM_LINKS: [(&str, &str, f32, f32); 10] = [
+    ("narrow", "matched", 0.0, 4.0),
+    ("narrow", "tx-pre-only", 0.0, 4.0),
+    ("narrow", "rx-de-only", 0.0, 4.875),
+    ("narrow", "matched", -6.0, 4.75),
+    ("narrow", "matched", 6.0, 4.75),
+    ("wide", "matched", 0.0, 6.0),
+    ("wide", "tx-pre-only", 0.0, 7.0),
+    ("wide", "rx-de-only", 0.0, 6.0),
+    ("wide", "matched", -6.0, 7.0),
+    ("wide", "matched", 6.0, 8.5),
+];
 
 /// Every radio response, and a TX tilt of ±6 dB/octave on the matched response, still
 /// carries a strong burst to the genie and to every detector. The genie check makes a
